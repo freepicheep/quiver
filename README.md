@@ -1,8 +1,8 @@
 # nuance
 
-A module manager for [Nushell](https://www.nushell.sh/).
+A dependency manager for [Nushell](https://www.nushell.sh/).
 
-nuance handles dependency resolution, fetching, and lockfile management for Nushell modules distributed as git repositories.
+nuance handles dependency resolution, fetching, and lockfile management for Nushell modules and script dependencies distributed as git repositories.
 
 ## Install
 
@@ -37,6 +37,12 @@ nuance add https://github.com/user/nu-some-module
 # Or use owner/repo shorthand (defaults to github)
 nuance add user/nu-some-module
 
+# Add a script dependency (single file from a repo or gist)
+nuance add-script user/nu-toolbox scripts/quickfix.nu
+
+# Or pass a full blob URL directly
+nuance add-script https://github.com/nushell/nu_scripts/blob/main/sourced/webscraping/twitter.nu
+
 # Install all dependencies from mod.toml
 nuance install
 
@@ -46,7 +52,10 @@ nuance update
 # Remove a dependency
 nuance remove nu-some-module
 
-# List installed modules (project-local if mod.toml exists, otherwise global)
+# Remove a script dependency
+nuance remove-script quickfix
+
+# List installed dependencies (project-local if mod.toml exists, otherwise global)
 nuance list
 ```
 
@@ -58,24 +67,33 @@ A nuance project is a directory containing:
 - **`mod.nu`** — the Nushell module entry point
 - **`mod.lock`** — auto-generated lockfile pinning exact commits (commit this to version control)
 
-Running `nuance install` fetches dependencies into `.nu_modules/`.
+Running `nuance install` fetches module dependencies into `.nu_modules/` and script dependencies into `.nu_scripts/`.
 
 ## Activation
 
-To make the installed modules available to `use` in Nushell without specifying their full `.nu_modules/` paths, you need to add the project's modules directory to your `$env.NU_LIB_DIRS`.
+To make installed modules/scripts available to `use` in Nushell without full paths, add the project's dependency directories to `$env.NU_LIB_DIRS`.
 
 Nuance provides two ways to do this:
 
-### 1. Manual Overlay (Recommended)
-`nuance install` and `nuance init` automatically generate an `activate.nu` script inside the `.nu_modules` directory. This script adds `.nu_modules/` to your `$env.NU_LIB_DIRS` **and automatically imports** all installed modules into your active scope using `export use <module> *`.
+### 1. Manual Activation (Recommended)
+`nuance install` and `nuance init` generate activation scripts for both dependency kinds:
 
-You can activate it using Nushell's `overlay` command:
+- `.nu_modules/activate.nu` (module overlay): updates `$env.NU_LIB_DIRS` and imports module dependencies with `export use <name> *`
+- `.nu_scripts/activate.nu` (sourceable script loader): sources script dependencies with `source <name>.nu`
+
+Activate modules with an overlay:
 
 ```nu
 overlay use .nu_modules/activate.nu
 ```
 
-All commands from all installed modules are now available. When you're done, simply run `deactivate` (or `overlay hide activate`) to revert the environment changes and unload the modules.
+If you installed script dependencies, source their activate file:
+
+```nu
+source .nu_scripts/activate.nu
+```
+
+When you're done, run `deactivate` (or `overlay hide activate`) to unload the module overlay.
 
 ### 2. Auto-activation Hook
 If you want nuance projects to automatically update your module path when you `cd` into their directory (and remove it when you leave), add the nuance env_change hook to your `config.nu` or `env.nu`:
@@ -85,7 +103,7 @@ If you want nuance projects to automatically update your module path when you `c
 nuance hook
 ```
 
-> **Note**: Due to Nushell's static scoping rules, the auto-activation hook can only update `$env.NU_LIB_DIRS`. It cannot automatically import the module commands (you must still type `use <module> *` interactively). For fully automatic loading, use the Manual Overlay approach above.
+> **Note**: Due to Nushell's static scoping rules, the auto-activation hook only updates `$env.NU_LIB_DIRS`. It cannot auto-import module/script commands. For automatic loading, use the manual activation approach above.
 
 ## mod.toml
 
@@ -95,31 +113,39 @@ name = "my-module"
 version = "0.1.0"
 description = "a wonderful nu module anyone can use"
 
-[dependencies]
+[dependencies.modules]
 nu-utils = { git = "https://github.com/user/nu-utils", tag = "v1.0.0" }
 other-lib = { git = "https://github.com/user/other-lib", branch = "main" }
 pinned = { git = "https://github.com/user/pinned", rev = "a3f9c12" }
+
+[dependencies.scripts]
+quickfix = { git = "https://github.com/user/nu-toolbox", path = "scripts/quickfix.nu", tag = "v0.4.0" }
+from-gist = { git = "https://gist.github.com/<id>.git", path = "quickfix.nu", rev = "d34db33f" }
 ```
 
-Each dependency must specify exactly one of `tag`, `branch`, or `rev`.
+Module dependencies must specify exactly one of `tag`, `branch`, or `rev`.
+Script dependencies must include `path` and exactly one of `tag`, `branch`, or `rev`.
 
 ## Commands
 
 | Command | Description |
 |---------|-------------|
 | `nuance init` | Create a new `mod.toml` in the current directory |
-| `nuance add <source>` | Add a dependency from a URL or owner/repo shorthand (auto-detects latest tag) |
+| `nuance add <source>` | Add a module dependency from a URL or owner/repo shorthand (auto-detects latest tag) |
+| `nuance add-script <source> [path]` | Add a script dependency from a repo/gist path, or pass a full blob URL (auto-detects latest tag when no ref is implied) |
 | `nuance install` | Install dependencies from `mod.toml` |
 | `nuance install --frozen` | Install from lockfile only (CI-friendly) |
 | `nuance update` | Re-resolve all dependencies |
-| `nuance remove <name>` / `nuance rm <name>` | Remove a dependency |
-| `nuance list` / `nuance ls` | List installed modules (project-local or global) |
+| `nuance remove <name>` / `nuance rm <name>` | Remove a module dependency |
+| `nuance remove-script <name>` | Remove a script dependency |
+| `nuance list` / `nuance ls` | List installed dependencies (project) or modules (global) |
 | `nuance version` / `nuance -v` / `nuance -V` / `nuance --version` | Print nuance version |
 | `nuance hook` | Print the auto-activate hook for config.nu |
 
 ## Global config (`~/.config/nuance/config.toml`)
 
 You can set a default git provider used for `owner/repo` shorthand in `nuance add`.
+Global config currently manages module dependencies only.
 
 ```toml
 default_git_provider = "github" # default

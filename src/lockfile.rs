@@ -15,11 +15,30 @@ pub struct Lockfile {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct LockedPackage {
     pub name: String,
+    #[serde(default, skip_serializing_if = "LockedPackageKind::is_module")]
+    pub kind: LockedPackageKind,
     pub git: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tag: Option<String>,
     pub rev: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
     pub sha256: String,
+}
+
+/// The kind of installed artifact in the lockfile.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum LockedPackageKind {
+    #[default]
+    Module,
+    Script,
+}
+
+impl LockedPackageKind {
+    fn is_module(kind: &LockedPackageKind) -> bool {
+        matches!(kind, LockedPackageKind::Module)
+    }
 }
 
 impl Lockfile {
@@ -49,9 +68,11 @@ impl Lockfile {
         Ok(())
     }
 
-    /// Look up a locked package by name.
-    pub fn find_package(&self, name: &str) -> Option<&LockedPackage> {
-        self.packages.iter().find(|p| p.name == name)
+    /// Look up a locked package by name and kind.
+    pub fn find_package(&self, name: &str, kind: LockedPackageKind) -> Option<&LockedPackage> {
+        self.packages
+            .iter()
+            .find(|p| p.name == name && p.kind == kind)
     }
 }
 
@@ -65,17 +86,30 @@ mod tests {
             packages: vec![
                 LockedPackage {
                     name: "nu-git-utils".to_string(),
+                    kind: LockedPackageKind::Module,
                     git: "https://github.com/someuser/nu-git-utils".to_string(),
                     tag: Some("v0.2.0".to_string()),
                     rev: "d4e8f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8".to_string(),
+                    path: None,
                     sha256: "abc123".to_string(),
                 },
                 LockedPackage {
                     name: "nu-str-extras".to_string(),
+                    kind: LockedPackageKind::Module,
                     git: "https://github.com/someuser/nu-str-extras".to_string(),
                     tag: Some("v1.0.0".to_string()),
                     rev: "1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b".to_string(),
+                    path: None,
                     sha256: "def456".to_string(),
+                },
+                LockedPackage {
+                    name: "quickfix".to_string(),
+                    kind: LockedPackageKind::Script,
+                    git: "https://github.com/someuser/nu-scripts".to_string(),
+                    tag: Some("v0.5.0".to_string()),
+                    rev: "9a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b".to_string(),
+                    path: Some("scripts/quickfix.nu".to_string()),
+                    sha256: "ghi789".to_string(),
                 },
             ],
         }
@@ -92,11 +126,25 @@ mod tests {
     }
 
     #[test]
-    fn find_package_by_name() {
+    fn find_package_by_name_and_kind() {
         let lock = sample_lockfile();
-        let pkg = lock.find_package("nu-git-utils").unwrap();
+        let pkg = lock
+            .find_package("nu-git-utils", LockedPackageKind::Module)
+            .unwrap();
         assert_eq!(pkg.rev, "d4e8f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8");
-        assert!(lock.find_package("nonexistent").is_none());
+        assert_eq!(pkg.path, None);
+        assert!(
+            lock.find_package("quickfix", LockedPackageKind::Script)
+                .is_some()
+        );
+        assert!(
+            lock.find_package("quickfix", LockedPackageKind::Module)
+                .is_none()
+        );
+        assert!(
+            lock.find_package("nonexistent", LockedPackageKind::Module)
+                .is_none()
+        );
     }
 
     #[test]
@@ -116,5 +164,28 @@ sha256 = "abc123"
         assert_eq!(lock.version, 1);
         assert_eq!(lock.packages.len(), 1);
         assert_eq!(lock.packages[0].name, "nu-git-utils");
+        assert_eq!(lock.packages[0].kind, LockedPackageKind::Module);
+    }
+
+    #[test]
+    fn parse_script_format() {
+        let toml = r#"
+version = 1
+
+[[package]]
+name = "quickfix"
+kind = "script"
+git = "https://github.com/someuser/nu-scripts"
+tag = "v0.5.0"
+rev = "9a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b"
+path = "scripts/quickfix.nu"
+sha256 = "ghi789"
+"#;
+        let lock = Lockfile::from_str(toml).unwrap();
+        assert_eq!(lock.packages[0].kind, LockedPackageKind::Script);
+        assert_eq!(
+            lock.packages[0].path.as_deref(),
+            Some("scripts/quickfix.nu")
+        );
     }
 }

@@ -4,8 +4,8 @@ use std::path::Path;
 use crate::checksum;
 use crate::error::{NuanceError, Result};
 use crate::git::{self, RefKind};
-use crate::lockfile::LockedPackage;
-use crate::manifest::{DependencySpec, Manifest};
+use crate::lockfile::{LockedPackage, LockedPackageKind};
+use crate::manifest::{DependencySpec, Manifest, ScriptDependencySpec};
 
 /// A fully resolved dependency.
 #[derive(Debug, Clone)]
@@ -16,13 +16,14 @@ pub struct ResolvedDep {
     pub rev: String,
 }
 
-/// Resolve all dependencies (including transitive) from a root manifest.
-///
-/// Returns a flat map of package name → resolved dependency.
-/// Errors on conflicts (same name, different source or rev).
-pub fn resolve(root_dir: &Path) -> Result<Vec<ResolvedDep>> {
-    let manifest = Manifest::from_dir(root_dir)?;
-    resolve_from_deps(&manifest.dependencies)
+/// A fully resolved script dependency.
+#[derive(Debug, Clone)]
+pub struct ResolvedScriptDep {
+    pub name: String,
+    pub git: String,
+    pub path: String,
+    pub tag: Option<String>,
+    pub rev: String,
 }
 
 /// Resolve dependencies from a pre-built dependency map (used by global install).
@@ -43,11 +44,55 @@ pub fn resolve_from_deps(deps: &HashMap<String, DependencySpec>) -> Result<Vec<R
 pub fn resolve_from_lock(locked: &[LockedPackage]) -> Vec<ResolvedDep> {
     locked
         .iter()
+        .filter(|p| p.kind == LockedPackageKind::Module)
         .map(|p| ResolvedDep {
             name: p.name.clone(),
             git: p.git.clone(),
             tag: p.tag.clone(),
             rev: p.rev.clone(),
+        })
+        .collect()
+}
+
+/// Resolve scripts from a pre-built script dependency map.
+pub fn resolve_scripts_from_deps(
+    deps: &HashMap<String, ScriptDependencySpec>,
+) -> Result<Vec<ResolvedScriptDep>> {
+    let mut resolved = Vec::new();
+
+    for (name, spec) in deps {
+        eprintln!("  Fetching script {name} from {}...", spec.git);
+        let repo_path = git::clone_or_fetch(&spec.git)?;
+
+        let kind = RefKind::from_spec(&spec.tag, &spec.rev, &spec.branch);
+        let rev = git::resolve_ref(&repo_path, spec.ref_spec(), kind)?;
+
+        resolved.push(ResolvedScriptDep {
+            name: name.clone(),
+            git: spec.git.clone(),
+            path: spec.path.clone(),
+            tag: spec.tag.clone(),
+            rev,
+        });
+    }
+
+    resolved.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(resolved)
+}
+
+/// Resolve scripts from an existing lockfile without re-fetching.
+pub fn resolve_scripts_from_lock(locked: &[LockedPackage]) -> Vec<ResolvedScriptDep> {
+    locked
+        .iter()
+        .filter(|p| p.kind == LockedPackageKind::Script)
+        .filter_map(|p| {
+            p.path.as_ref().map(|path| ResolvedScriptDep {
+                name: p.name.clone(),
+                git: p.git.clone(),
+                path: path.clone(),
+                tag: p.tag.clone(),
+                rev: p.rev.clone(),
+            })
         })
         .collect()
 }
@@ -94,9 +139,9 @@ fn resolve_deps(
         git::export_to(&repo_path, &rev, &tmp)?;
 
         if let Ok(dep_manifest) = Manifest::from_dir(&tmp) {
-            if !dep_manifest.dependencies.is_empty() {
+            if !dep_manifest.dependencies.modules.is_empty() {
                 eprintln!("  Resolving transitive dependencies for {name}...");
-                resolve_deps(&dep_manifest.dependencies, resolved)?;
+                resolve_deps(&dep_manifest.dependencies.modules, resolved)?;
             }
         }
 
@@ -110,6 +155,11 @@ fn resolve_deps(
 /// Compute the SHA-256 checksum of an exported dependency directory.
 pub fn compute_checksum(dir: &Path) -> Result<String> {
     checksum::hash_directory(dir)
+}
+
+/// Compute the SHA-256 checksum of a single file.
+pub fn compute_checksum_file(path: &Path) -> Result<String> {
+    checksum::hash_file(path)
 }
 
 #[cfg(test)]
