@@ -61,6 +61,8 @@ fn run(command: Commands) -> Result<()> {
                 cmd_remove(&cwd, name)
             }
         }
+        Commands::List => cmd_list(&cwd),
+        Commands::Version => cmd_version(),
         Commands::Hook => cmd_hook(),
     }
 }
@@ -311,6 +313,60 @@ $env.config.hooks.env_change.PWD = (
     Ok(())
 }
 
+fn cmd_version() -> Result<()> {
+    println!("nuance {}", env!("CARGO_PKG_VERSION"));
+    Ok(())
+}
+
+fn cmd_list(cwd: &Path) -> Result<()> {
+    let (scope, modules_dir) = if cwd.join("mod.toml").exists() {
+        ("project", cwd.join(".nu_modules"))
+    } else {
+        let config = GlobalConfig::load_or_default()?;
+        ("global", config.modules_dir()?)
+    };
+
+    let modules = list_installed_module_names(&modules_dir)?;
+
+    if modules.is_empty() {
+        eprintln!(
+            "No installed {scope} modules found in {}",
+            modules_dir.display()
+        );
+        return Ok(());
+    }
+
+    eprintln!("Installed {scope} modules from {}", modules_dir.display());
+    for module in modules {
+        eprintln!("{module}");
+    }
+
+    Ok(())
+}
+
+fn list_installed_module_names(modules_dir: &Path) -> Result<Vec<String>> {
+    if !modules_dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut modules = Vec::new();
+
+    for entry in std::fs::read_dir(modules_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+
+        if let Some(name) = entry.file_name().to_str() {
+            modules.push(name.to_string());
+        }
+    }
+
+    modules.sort();
+    Ok(modules)
+}
+
 fn normalize_dependency_source(input: &str, provider_base_url: Option<&str>) -> Result<String> {
     let trimmed = input.trim();
 
@@ -400,6 +456,8 @@ fn auto_detect_dep_spec(
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn config_with_provider(provider: &str) -> GlobalConfig {
         GlobalConfig {
@@ -407,6 +465,21 @@ mod tests {
             default_git_provider: provider.to_string(),
             dependencies: HashMap::new(),
         }
+    }
+
+    fn make_temp_dir(label: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "nuance_main_test_{}_{}_{}",
+            label,
+            std::process::id(),
+            unique
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
     }
 
     #[test]
@@ -446,5 +519,27 @@ mod tests {
     fn normalize_dependency_source_requires_provider_for_shorthand() {
         let err = normalize_dependency_source("owner/repo", None).unwrap_err();
         assert!(err.to_string().contains("default git provider"));
+    }
+
+    #[test]
+    fn list_installed_module_names_returns_sorted_directories_only() {
+        let modules_dir = make_temp_dir("list_modules");
+        std::fs::create_dir_all(modules_dir.join("nu-zeta")).unwrap();
+        std::fs::create_dir_all(modules_dir.join("nu-alpha")).unwrap();
+        std::fs::write(modules_dir.join("activate.nu"), "# generated").unwrap();
+
+        let modules = list_installed_module_names(&modules_dir).unwrap();
+
+        assert_eq!(modules, vec!["nu-alpha".to_string(), "nu-zeta".to_string()]);
+
+        let _ = std::fs::remove_dir_all(modules_dir);
+    }
+
+    #[test]
+    fn list_installed_module_names_handles_missing_directory() {
+        let root_dir = make_temp_dir("list_missing");
+        let modules = list_installed_module_names(&root_dir.join("missing")).unwrap();
+        assert!(modules.is_empty());
+        let _ = std::fs::remove_dir_all(root_dir);
     }
 }

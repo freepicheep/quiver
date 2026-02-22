@@ -1,9 +1,23 @@
-use clap::{Parser, Subcommand};
+use clap::{ArgAction, Parser, Subcommand};
 
 /// nuance — A module manager for Nushell
 #[derive(Parser, Debug)]
-#[command(name = "nuance", version, about = "A module manager for Nushell")]
+#[command(
+    name = "nuance",
+    version,
+    about = "A module manager for Nushell",
+    disable_version_flag = true
+)]
 pub struct Cli {
+    #[arg(
+        short = 'v',
+        short_alias = 'V',
+        long = "version",
+        action = ArgAction::Version,
+        help = "Print version"
+    )]
+    pub version: Option<bool>,
+
     #[command(subcommand)]
     pub command: Commands,
 }
@@ -62,6 +76,7 @@ pub enum Commands {
     },
 
     /// Remove a package from mod.toml and .nu_modules/
+    #[command(visible_alias = "rm")]
     Remove {
         /// Remove from global config instead of local mod.toml
         #[arg(short = 'g', long)]
@@ -71,10 +86,59 @@ pub enum Commands {
         name: String,
     },
 
+    /// List installed modules (project-local if mod.toml exists, otherwise global)
+    #[command(visible_alias = "ls")]
+    List,
+
+    /// Print the installed nuance version
+    Version,
+
     /// Print the Nushell env_change hook for auto-activating nuance projects
     Hook,
 }
 
 pub fn parse() -> Cli {
     Cli::parse()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::error::ErrorKind;
+
+    #[test]
+    fn remove_alias_parses() {
+        let cli = Cli::try_parse_from(["nuance", "rm", "nu-utils"]).unwrap();
+        match cli.command {
+            Commands::Remove { global, name } => {
+                assert!(!global);
+                assert_eq!(name, "nu-utils");
+            }
+            _ => panic!("expected remove command"),
+        }
+    }
+
+    #[test]
+    fn list_alias_parses() {
+        let cli = Cli::try_parse_from(["nuance", "ls"]).unwrap();
+        assert!(matches!(cli.command, Commands::List));
+    }
+
+    #[test]
+    fn version_subcommand_parses() {
+        let cli = Cli::try_parse_from(["nuance", "version"]).unwrap();
+        assert!(matches!(cli.command, Commands::Version));
+    }
+
+    #[test]
+    fn short_v_displays_version() {
+        let err = Cli::try_parse_from(["nuance", "-v"]).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::DisplayVersion);
+    }
+
+    #[test]
+    fn short_upper_v_displays_version() {
+        let err = Cli::try_parse_from(["nuance", "-V"]).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::DisplayVersion);
+    }
 }

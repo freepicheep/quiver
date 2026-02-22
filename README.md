@@ -45,6 +45,9 @@ nuance update
 
 # Remove a dependency
 nuance remove nu-some-module
+
+# List installed modules (project-local if mod.toml exists, otherwise global)
+nuance list
 ```
 
 ## How It Works
@@ -109,7 +112,9 @@ Each dependency must specify exactly one of `tag`, `branch`, or `rev`.
 | `nuance install` | Install dependencies from `mod.toml` |
 | `nuance install --frozen` | Install from lockfile only (CI-friendly) |
 | `nuance update` | Re-resolve all dependencies |
-| `nuance remove <name>` | Remove a dependency |
+| `nuance remove <name>` / `nuance rm <name>` | Remove a dependency |
+| `nuance list` / `nuance ls` | List installed modules (project-local or global) |
+| `nuance version` / `nuance -v` / `nuance -V` / `nuance --version` | Print nuance version |
 | `nuance hook` | Print the auto-activate hook for config.nu |
 
 ## Global config (`~/.config/nuance/config.toml`)
