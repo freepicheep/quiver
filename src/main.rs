@@ -133,14 +133,21 @@ fn cmd_init(
     std::fs::write(&mod_toml, content)?;
     eprintln!("Created mod.toml for '{pkg_name}'");
 
-    // Also create mod.nu if it doesn't exist
-    let mod_nu = dir.join("mod.nu");
+    // Create <current-dir-name>/mod.nu if it doesn't exist.
+    let module_dir_name = dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(pkg_name.as_str());
+    let module_dir = dir.join(module_dir_name);
+    std::fs::create_dir_all(&module_dir)?;
+
+    let mod_nu = module_dir.join("mod.nu");
     if !mod_nu.exists() {
         std::fs::write(
             &mod_nu,
             "# Module entry point\n# Export your commands here with: export use <submodule>\n",
         )?;
-        eprintln!("Created mod.nu");
+        eprintln!("Created {}", mod_nu.display());
     }
 
     Ok(())
@@ -1138,5 +1145,50 @@ mod tests {
     fn script_name_from_path_uses_file_stem() {
         let name = script_name_from_path("scripts/quickfix.nu").unwrap();
         assert_eq!(name, "quickfix");
+    }
+
+    #[test]
+    fn init_creates_mod_nu_in_subdir_named_after_current_dir() {
+        let project_dir = make_temp_dir("init_subdir");
+
+        cmd_init(&project_dir, None, "0.1.0".to_string(), None).unwrap();
+
+        let dir_name = project_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap()
+            .to_string();
+        assert!(project_dir.join("mod.toml").exists());
+        assert!(project_dir.join(&dir_name).join("mod.nu").exists());
+        assert!(!project_dir.join("mod.nu").exists());
+
+        let _ = std::fs::remove_dir_all(project_dir);
+    }
+
+    #[test]
+    fn init_respects_explicit_name_but_uses_current_dir_for_mod_nu_subdir() {
+        let project_dir = make_temp_dir("init_named_subdir");
+
+        cmd_init(
+            &project_dir,
+            Some("custom-module-name".to_string()),
+            "0.1.0".to_string(),
+            None,
+        )
+        .unwrap();
+
+        let manifest_text = std::fs::read_to_string(project_dir.join("mod.toml")).unwrap();
+        let manifest = Manifest::from_str(&manifest_text).unwrap();
+        assert_eq!(manifest.package.name, "custom-module-name");
+
+        let dir_name = project_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap()
+            .to_string();
+        assert!(project_dir.join(&dir_name).join("mod.nu").exists());
+        assert!(!project_dir.join("mod.nu").exists());
+
+        let _ = std::fs::remove_dir_all(project_dir);
     }
 }

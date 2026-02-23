@@ -73,7 +73,7 @@ nuance list
 A nuance project is a directory containing:
 
 - **`mod.toml`** — declares package metadata and dependencies
-- **`mod.nu`** — the Nushell module entry point
+- **`<project-dir-name>/mod.nu`** — the Nushell module entry point
 - **`mod.lock`** — auto-generated lockfile pinning exact commits (commit this to version control)
 
 Running `nuance install` fetches module dependencies into `.nu_modules/` and script dependencies into `.nu_scripts/`.
@@ -139,7 +139,7 @@ Script dependencies must include `path` and exactly one of `tag`, `branch`, or `
 
 | Command | Description |
 |---------|-------------|
-| `nuance init` | Create a new `mod.toml` in the current directory |
+| `nuance init` | Create a new `mod.toml` and scaffold `<project-dir-name>/mod.nu` in the current directory |
 | `nuance add <source>` | Add a module dependency from a URL or owner/repo shorthand (auto-detects latest tag) |
 | `nuance add-script [-g] [--autoload] <source> [path]` | Add a script dependency locally (`mod.toml`) or globally (`config.toml`) |
 | `nuance install` | Install dependencies from `mod.toml` |
