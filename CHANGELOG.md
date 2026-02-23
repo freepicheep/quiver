@@ -1,5 +1,7 @@
 # Unreleased
 
+# Version 0.2.0 (2026-02-23)
+
 ## Added
 
 - Added first-class script dependencies via `[dependencies.scripts]` with
