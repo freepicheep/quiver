@@ -1161,9 +1161,11 @@ version = "0.1.0"
 
         let script_activate =
             std::fs::read_to_string(project_dir.join(".nu_scripts").join("activate.nu")).unwrap();
-        assert!(!script_activate
-            .lines()
-            .any(|line| line.starts_with("source ")));
+        assert!(
+            !script_activate
+                .lines()
+                .any(|line| line.starts_with("source "))
+        );
 
         let _ = std::fs::remove_dir_all(project_dir);
     }

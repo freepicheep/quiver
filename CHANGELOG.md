@@ -1,5 +1,17 @@
 # Unreleased
 
+Nothing.
+
+# Version 0.2.1 (2026-02-23)
+
+## Added
+- Improved project scaffolding by placing `mod.nu` in a subdirectory.
+- Updated hook and instructions for using modules in the scaffolded `mod.nu`.
+
+## Fixed
+- Script removal functionality.
+- Capitalization in README.
+
 # Version 0.2.0 (2026-02-23)
 
 ## Added
