@@ -1,5 +1,5 @@
-use std::collections::HashMap;
-use std::path::Path;
+use std::collections::{HashMap, HashSet};
+use std::path::{Component, Path, PathBuf};
 
 use crate::config::{self, GlobalConfig};
 use crate::error::{NuanceError, Result};
@@ -7,6 +7,7 @@ use crate::git;
 use crate::lockfile::{LockedPackage, LockedPackageKind, Lockfile};
 use crate::manifest::{Manifest, ScriptDependencySpec};
 use crate::resolver::{self, ResolvedDep, ResolvedScriptDep};
+use walkdir::WalkDir;
 
 /// The name of the directory where local dependencies are installed.
 const MODULES_DIR: &str = ".nu_modules";
@@ -23,6 +24,12 @@ impl LocalLockfileStaleness {
     fn is_stale(self) -> bool {
         self.modules || self.scripts
     }
+}
+
+#[derive(Debug, Default)]
+struct NupmMetadataHints {
+    package_name: Option<String>,
+    entry_hint: Option<String>,
 }
 
 /// Run a full local install: resolve → fetch → checksum → place → lock.
@@ -222,6 +229,7 @@ fn install_resolved_global(
     std::fs::create_dir_all(scripts_autoload_dir)?;
 
     let mut locked_packages = Vec::new();
+    let mut module_use_paths = Vec::new();
     let mut regular_script_count = 0usize;
     let mut autoload_script_count = 0usize;
 
@@ -231,7 +239,8 @@ fn install_resolved_global(
             dep.name,
             &dep.rev[..12.min(dep.rev.len())]
         );
-        install_dep(dep, modules_dir)?;
+        let module_use_path = install_dep(dep, modules_dir)?;
+        module_use_paths.push(module_use_path);
 
         let dest = modules_dir.join(&dep.name);
         let sha256 = resolver::compute_checksum(&dest)?;
@@ -315,7 +324,7 @@ fn install_resolved_global(
     write_activate_overlay(
         modules_dir,
         modules_display_name,
-        modules.iter().map(|dep| dep.name.as_str()),
+        module_use_paths.iter().map(|path| path.as_str()),
         false,
     )?;
     Ok(())
@@ -335,6 +344,7 @@ fn install_resolved(
 ) -> Result<()> {
     std::fs::create_dir_all(modules_dir)?;
     let mut locked_packages = Vec::new();
+    let mut module_use_paths = Vec::new();
 
     for dep in modules {
         eprintln!(
@@ -342,7 +352,8 @@ fn install_resolved(
             dep.name,
             &dep.rev[..12.min(dep.rev.len())]
         );
-        install_dep(dep, modules_dir)?;
+        let module_use_path = install_dep(dep, modules_dir)?;
+        module_use_paths.push(module_use_path);
 
         let dest = modules_dir.join(&dep.name);
         let sha256 = resolver::compute_checksum(&dest)?;
@@ -419,7 +430,7 @@ fn install_resolved(
     write_activate_overlay(
         modules_dir,
         display_name,
-        modules.iter().map(|dep| dep.name.as_str()),
+        module_use_paths.iter().map(|path| path.as_str()),
         include_scripts_in_overlay,
     )?;
     if write_script_activate_file && !scripts.is_empty() {
@@ -505,11 +516,11 @@ where
 }
 
 /// Install a single resolved dependency into the modules directory.
-fn install_dep(dep: &ResolvedDep, modules_dir: &Path) -> Result<()> {
+fn install_dep(dep: &ResolvedDep, modules_dir: &Path) -> Result<String> {
     let repo_path = git::clone_or_fetch(&dep.git)?;
     let dest = modules_dir.join(&dep.name);
     git::export_to(&repo_path, &dep.rev, &dest)?;
-    Ok(())
+    discover_module_use_path(&dest, &dep.name)
 }
 
 /// Install a single resolved script dependency into the scripts directory.
@@ -535,6 +546,265 @@ fn install_script_dep(dep: &ResolvedScriptDep, scripts_dir: &Path) -> Result<()>
     std::fs::copy(&src, &dest)?;
     let _ = std::fs::remove_dir_all(&tmp);
     Ok(())
+}
+
+fn discover_module_use_path(module_root: &Path, dep_name: &str) -> Result<String> {
+    let metadata = read_nupm_metadata_hints(module_root)?;
+    let mut candidates = Vec::new();
+    let mut seen = HashSet::new();
+
+    if let Some(entry_hint) = metadata.entry_hint.as_deref() {
+        if let Some(subdir) = module_subpath_from_hint(module_root, entry_hint) {
+            push_unique_path(&mut candidates, &mut seen, subdir);
+        }
+    }
+
+    if let Some(package_name) = metadata.package_name.as_deref() {
+        if let Some(subdir) = normalized_relative_path(Path::new(package_name)) {
+            if module_root.join(&subdir).join("mod.nu").is_file() {
+                push_unique_path(&mut candidates, &mut seen, subdir);
+            }
+        }
+    }
+
+    if module_root.join("mod.nu").is_file() {
+        push_unique_path(&mut candidates, &mut seen, PathBuf::new());
+    }
+
+    let dep_name_subdir = PathBuf::from(dep_name);
+    if module_root.join(&dep_name_subdir).join("mod.nu").is_file() {
+        push_unique_path(&mut candidates, &mut seen, dep_name_subdir);
+    }
+
+    let mut discovered = find_mod_nu_dirs(module_root);
+    discovered.sort_by(|a, b| {
+        rank_candidate_dir(a, metadata.package_name.as_deref(), dep_name)
+            .cmp(&rank_candidate_dir(
+                b,
+                metadata.package_name.as_deref(),
+                dep_name,
+            ))
+            .then(path_to_forward_slashes(a).cmp(&path_to_forward_slashes(b)))
+    });
+
+    for subdir in discovered {
+        push_unique_path(&mut candidates, &mut seen, subdir);
+    }
+
+    if let Some(best) = candidates.first() {
+        return Ok(module_use_path(dep_name, best));
+    }
+
+    eprintln!(
+        "Warning: could not locate mod.nu for module '{dep_name}' after install; defaulting to '{dep_name}'."
+    );
+    Ok(dep_name.to_string())
+}
+
+fn read_nupm_metadata_hints(module_root: &Path) -> Result<NupmMetadataHints> {
+    let nupm_path = module_root.join("nupm.nuon");
+    if !nupm_path.is_file() {
+        return Ok(NupmMetadataHints::default());
+    }
+
+    let content = std::fs::read_to_string(&nupm_path)?;
+    Ok(NupmMetadataHints {
+        package_name: extract_nuon_value(&content, &["name", "package_name"]),
+        entry_hint: extract_nuon_value(
+            &content,
+            &[
+                "module",
+                "module_path",
+                "module-dir",
+                "entry",
+                "entrypoint",
+                "main",
+            ],
+        ),
+    })
+}
+
+fn extract_nuon_value(content: &str, keys: &[&str]) -> Option<String> {
+    for raw_line in content.lines() {
+        let line = raw_line.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        for separator in [':', '='] {
+            if let Some((lhs, rhs)) = line.split_once(separator) {
+                let key = lhs.trim().trim_matches('"').trim_matches('\'');
+                if keys
+                    .iter()
+                    .any(|expected| key.eq_ignore_ascii_case(expected))
+                {
+                    if let Some(value) = parse_nuon_scalar(rhs) {
+                        return Some(value);
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn parse_nuon_scalar(raw_value: &str) -> Option<String> {
+    let value = raw_value.trim().trim_end_matches(',').trim();
+    if value.is_empty() {
+        return None;
+    }
+
+    let mut chars = value.chars();
+    match chars.next() {
+        Some('"') | Some('\'') => {
+            let quote = value.chars().next().unwrap_or('"');
+            let mut parsed = String::new();
+            let mut escaped = false;
+
+            for ch in value[1..].chars() {
+                if escaped {
+                    parsed.push(ch);
+                    escaped = false;
+                    continue;
+                }
+
+                if ch == '\\' {
+                    escaped = true;
+                    continue;
+                }
+
+                if ch == quote {
+                    return if parsed.is_empty() {
+                        None
+                    } else {
+                        Some(parsed)
+                    };
+                }
+
+                parsed.push(ch);
+            }
+
+            None
+        }
+        _ => {
+            let token = value
+                .split(|c: char| c.is_whitespace() || matches!(c, ',' | '}' | ']'))
+                .next()
+                .unwrap_or("")
+                .trim()
+                .trim_matches('"')
+                .trim_matches('\'');
+
+            if token.is_empty() {
+                None
+            } else {
+                Some(token.to_string())
+            }
+        }
+    }
+}
+
+fn module_subpath_from_hint(module_root: &Path, hint: &str) -> Option<PathBuf> {
+    let normalized_hint = hint.trim().replace('\\', "/");
+    if normalized_hint.is_empty() {
+        return None;
+    }
+
+    let hint_path = normalized_relative_path(Path::new(&normalized_hint))?;
+    let subdir = if hint_path.file_name().and_then(|name| name.to_str()) == Some("mod.nu") {
+        hint_path
+            .parent()
+            .map_or_else(PathBuf::new, Path::to_path_buf)
+    } else {
+        hint_path
+    };
+
+    if module_root.join(&subdir).join("mod.nu").is_file() {
+        Some(subdir)
+    } else {
+        None
+    }
+}
+
+fn normalized_relative_path(path: &Path) -> Option<PathBuf> {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(segment) => normalized.push(segment),
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    Some(normalized)
+}
+
+fn find_mod_nu_dirs(module_root: &Path) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+
+    for entry in WalkDir::new(module_root)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(std::result::Result::ok)
+    {
+        if !entry.file_type().is_file() || entry.file_name() != "mod.nu" {
+            continue;
+        }
+
+        if let Ok(relative_file) = entry.path().strip_prefix(module_root) {
+            let parent = relative_file.parent().unwrap_or_else(|| Path::new(""));
+            if let Some(normalized) = normalized_relative_path(parent) {
+                dirs.push(normalized);
+            }
+        }
+    }
+
+    dirs
+}
+
+fn rank_candidate_dir(path: &Path, package_name: Option<&str>, dep_name: &str) -> (u8, usize) {
+    let basename = path.file_name().and_then(|name| name.to_str());
+    let priority = if path.as_os_str().is_empty() {
+        0
+    } else if package_name.is_some_and(|name| basename == Some(name)) {
+        1
+    } else if basename == Some(dep_name) {
+        2
+    } else {
+        3
+    };
+
+    (priority, path_depth(path))
+}
+
+fn path_depth(path: &Path) -> usize {
+    path.components()
+        .filter(|component| matches!(component, Component::Normal(_)))
+        .count()
+}
+
+fn push_unique_path(candidates: &mut Vec<PathBuf>, seen: &mut HashSet<PathBuf>, path: PathBuf) {
+    if seen.insert(path.clone()) {
+        candidates.push(path);
+    }
+}
+
+fn module_use_path(dep_name: &str, subdir: &Path) -> String {
+    if subdir.as_os_str().is_empty() {
+        dep_name.to_string()
+    } else {
+        format!("{dep_name}/{}", path_to_forward_slashes(subdir))
+    }
+}
+
+fn path_to_forward_slashes(path: &Path) -> String {
+    path.components()
+        .filter_map(|component| match component {
+            Component::Normal(part) => Some(part.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 /// Determine whether module/script sections are stale relative to the local lockfile.
@@ -710,6 +980,44 @@ mod tests {
         assert!(activate.contains("source quickfix.nu"));
         assert!(activate.contains("source zeta.nu"));
         let _ = std::fs::remove_dir_all(scripts_dir);
+    }
+
+    #[test]
+    fn discovers_nested_module_path_from_nupm_metadata() {
+        let module_root = make_temp_dir("nupm_nested");
+        let nested_dir = module_root.join("nu-salesforce");
+        std::fs::create_dir_all(&nested_dir).unwrap();
+        std::fs::write(nested_dir.join("mod.nu"), "# nested module").unwrap();
+        std::fs::write(module_root.join("nupm.nuon"), "{ name: \"nu-salesforce\" }").unwrap();
+
+        let use_path = discover_module_use_path(&module_root, "nu-salesforce").unwrap();
+        assert_eq!(use_path, "nu-salesforce/nu-salesforce");
+
+        let _ = std::fs::remove_dir_all(module_root);
+    }
+
+    #[test]
+    fn discovers_root_module_path_without_nupm_metadata() {
+        let module_root = make_temp_dir("root_module");
+        std::fs::write(module_root.join("mod.nu"), "# root module").unwrap();
+
+        let use_path = discover_module_use_path(&module_root, "nu-foo").unwrap();
+        assert_eq!(use_path, "nu-foo");
+
+        let _ = std::fs::remove_dir_all(module_root);
+    }
+
+    #[test]
+    fn discovers_nested_module_path_without_nupm_metadata() {
+        let module_root = make_temp_dir("nested_module_without_nupm");
+        let nested_dir = module_root.join("nu-tools");
+        std::fs::create_dir_all(&nested_dir).unwrap();
+        std::fs::write(nested_dir.join("mod.nu"), "# nested module").unwrap();
+
+        let use_path = discover_module_use_path(&module_root, "nu-tools").unwrap();
+        assert_eq!(use_path, "nu-tools/nu-tools");
+
+        let _ = std::fs::remove_dir_all(module_root);
     }
 
     #[test]

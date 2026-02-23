@@ -15,6 +15,10 @@
   `[dependencies.modules]`.
 - Updated `activate.nu` generation and `nuance hook` output to support both
   module and script dependency paths.
+- Updated module install/activation to detect real module entry paths (including
+  nupm-style nested layouts) by reading `nupm.nuon` metadata hints and scanning
+  for `mod.nu`, then generating `export use` statements with the discovered
+  path (for example `nu-salesforce/nu-salesforce`).
 
 # Version 0.1.1 (2026-02-21)
 
