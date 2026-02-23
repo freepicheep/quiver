@@ -1,8 +1,8 @@
-# nuance
+# Nuance
 
 A dependency manager for [Nushell](https://www.nushell.sh/).
 
-nuance handles dependency resolution, fetching, and lockfile management for Nushell modules and script dependencies distributed as git repositories.
+Nuance handles dependency resolution, fetching, and lockfile management for Nushell modules and script dependencies distributed as git repositories.
 
 ## Install
 
