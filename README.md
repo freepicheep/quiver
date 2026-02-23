@@ -46,6 +46,15 @@ nuance add-script https://github.com/nushell/nu_scripts/blob/main/sourced/webscr
 # Install all dependencies from mod.toml
 nuance install
 
+# Add a global script dependency (prompts for autoload placement)
+nuance add-script -g user/nu-toolbox scripts/quickfix.nu
+
+# Skip the prompt and install directly into autoload
+nuance add-script -g --autoload user/nu-toolbox scripts/quickfix.nu
+
+# Install all global dependencies from ~/.config/nuance/config.toml
+nuance install -g
+
 # Re-resolve everything (ignore lockfile)
 nuance update
 
@@ -132,23 +141,47 @@ Script dependencies must include `path` and exactly one of `tag`, `branch`, or `
 |---------|-------------|
 | `nuance init` | Create a new `mod.toml` in the current directory |
 | `nuance add <source>` | Add a module dependency from a URL or owner/repo shorthand (auto-detects latest tag) |
-| `nuance add-script <source> [path]` | Add a script dependency from a repo/gist path, or pass a full blob URL (auto-detects latest tag when no ref is implied) |
+| `nuance add-script [-g] [--autoload] <source> [path]` | Add a script dependency locally (`mod.toml`) or globally (`config.toml`) |
 | `nuance install` | Install dependencies from `mod.toml` |
+| `nuance install -g` | Install global dependencies from `~/.config/nuance/config.toml` |
 | `nuance install --frozen` | Install from lockfile only (CI-friendly) |
 | `nuance update` | Re-resolve all dependencies |
 | `nuance remove <name>` / `nuance rm <name>` | Remove a module dependency |
-| `nuance remove-script <name>` | Remove a script dependency |
-| `nuance list` / `nuance ls` | List installed dependencies (project) or modules (global) |
+| `nuance remove-script [-g] <name>` | Remove a script dependency locally or globally |
+| `nuance list` / `nuance ls` | List installed dependencies (project) or modules/scripts (global) |
 | `nuance version` / `nuance -v` / `nuance -V` / `nuance --version` | Print nuance version |
 | `nuance hook` | Print the auto-activate hook for config.nu |
 
 ## Global config (`~/.config/nuance/config.toml`)
 
 You can set a default git provider used for `owner/repo` shorthand in `nuance add`.
-Global config currently manages module dependencies only.
+Global config manages global module dependencies and global script dependencies.
+
+Global scripts install into:
+
+- `~/.config/nushell/vendor/nuance/scripts/` (Linux)
+- `~/Library/Application Support/nushell/vendor/nuance/scripts/` (macOS)
+
+Global scripts marked for autoload install into:
+
+- `~/.config/nushell/vendor/nuance/scripts/autoload/` (Linux)
+- `~/Library/Application Support/nushell/vendor/nuance/scripts/autoload/` (macOS)
+
+When you run `nuance add-script -g`, nuance always prompts whether to install into autoload.
+Pass `--autoload` to skip the prompt and install directly to autoload.
 
 ```toml
 default_git_provider = "github" # default
+
+# optional overrides
+# modules_dir = "/custom/modules"
+# scripts_dir = "/custom/scripts"
+
+[dependencies]
+nu-utils = { git = "https://github.com/user/nu-utils", tag = "v1.0.0" }
+
+[scripts]
+quickfix = { git = "https://github.com/user/nu-toolbox", path = "scripts/quickfix.nu", tag = "v0.4.0", autoload = true }
 ```
 
 Supported provider aliases are `github`, `gitlab`, `codeberg`, and `bitbucket`.

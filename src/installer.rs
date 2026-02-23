@@ -1,10 +1,11 @@
+use std::collections::HashMap;
 use std::path::Path;
 
 use crate::config::{self, GlobalConfig};
 use crate::error::{NuanceError, Result};
 use crate::git;
 use crate::lockfile::{LockedPackage, LockedPackageKind, Lockfile};
-use crate::manifest::Manifest;
+use crate::manifest::{Manifest, ScriptDependencySpec};
 use crate::resolver::{self, ResolvedDep, ResolvedScriptDep};
 
 /// The name of the directory where local dependencies are installed.
@@ -108,6 +109,8 @@ pub fn install(project_dir: &Path, frozen: bool) -> Result<()> {
         Some(SCRIPTS_DIR),
         &lock_path,
         MODULES_DIR,
+        !resolved_scripts.is_empty(),
+        true,
     )
 }
 
@@ -122,14 +125,18 @@ pub fn update(project_dir: &Path) -> Result<()> {
 }
 
 /// Run a global install: resolve from `~/.config/nuance/config.toml` and install
-/// modules to the global modules directory.
+/// modules/scripts to the configured global directories.
 pub fn install_global(frozen: bool) -> Result<()> {
     let config = GlobalConfig::load()?;
     let modules_dir = config.modules_dir()?;
+    let scripts_dir = config.scripts_dir()?;
+    let scripts_autoload_dir = config.scripts_autoload_dir()?;
     let lock_path = config::global_lock_path()?;
     let display_dir = modules_dir.display().to_string();
+    let scripts_display_dir = scripts_dir.display().to_string();
+    let scripts_autoload_display_dir = scripts_autoload_dir.display().to_string();
 
-    if config.dependencies.is_empty() {
+    if config.dependencies.is_empty() && config.scripts.is_empty() {
         eprintln!("No dependencies declared in global config.");
         write_activate_overlay(
             &modules_dir,
@@ -140,7 +147,7 @@ pub fn install_global(frozen: bool) -> Result<()> {
         return Ok(());
     }
 
-    let resolved_modules = if frozen {
+    let (resolved_modules, resolved_scripts) = if frozen {
         if !lock_path.exists() {
             return Err(crate::error::NuanceError::Lockfile(
                 "config.lock not found (required with --frozen)".to_string(),
@@ -148,25 +155,170 @@ pub fn install_global(frozen: bool) -> Result<()> {
         }
         let lockfile = Lockfile::from_path(&lock_path)?;
         eprintln!("Using locked global dependencies (--frozen).");
-        resolver::resolve_from_lock(&lockfile.packages)
+        (
+            resolver::resolve_from_lock(&lockfile.packages),
+            resolver::resolve_scripts_from_lock(&lockfile.packages),
+        )
     } else if lock_path.exists() && !is_global_lockfile_stale(&config, &lock_path)? {
         let lockfile = Lockfile::from_path(&lock_path)?;
         eprintln!("Using existing global lockfile.");
-        resolver::resolve_from_lock(&lockfile.packages)
+        (
+            resolver::resolve_from_lock(&lockfile.packages),
+            resolver::resolve_scripts_from_lock(&lockfile.packages),
+        )
     } else {
-        eprintln!("Resolving global dependencies...");
-        resolver::resolve_from_deps(&config.dependencies)?
+        let modules = if config.dependencies.is_empty() {
+            Vec::new()
+        } else {
+            eprintln!("Resolving global module dependencies...");
+            resolver::resolve_from_deps(&config.dependencies)?
+        };
+        let scripts = if config.scripts.is_empty() {
+            Vec::new()
+        } else {
+            eprintln!("Resolving global script dependencies...");
+            resolver::resolve_scripts_from_deps(&global_script_specs(&config))?
+        };
+        (modules, scripts)
     };
 
-    install_resolved(
+    install_resolved_global(
+        &config,
         &resolved_modules,
-        &[],
+        &resolved_scripts,
         &modules_dir,
-        None,
-        None,
+        &scripts_dir,
+        &scripts_autoload_dir,
         &lock_path,
         &display_dir,
+        &scripts_display_dir,
+        &scripts_autoload_display_dir,
     )
+}
+
+fn global_script_specs(config: &GlobalConfig) -> HashMap<String, ScriptDependencySpec> {
+    config
+        .scripts
+        .iter()
+        .map(|(name, spec)| (name.clone(), spec.to_script_dependency_spec()))
+        .collect()
+}
+
+/// Install resolved global dependencies and write `config.lock`.
+fn install_resolved_global(
+    config: &GlobalConfig,
+    modules: &[ResolvedDep],
+    scripts: &[ResolvedScriptDep],
+    modules_dir: &Path,
+    scripts_dir: &Path,
+    scripts_autoload_dir: &Path,
+    lock_path: &Path,
+    modules_display_name: &str,
+    scripts_display_name: &str,
+    scripts_autoload_display_name: &str,
+) -> Result<()> {
+    std::fs::create_dir_all(modules_dir)?;
+    std::fs::create_dir_all(scripts_dir)?;
+    std::fs::create_dir_all(scripts_autoload_dir)?;
+
+    let mut locked_packages = Vec::new();
+    let mut regular_script_count = 0usize;
+    let mut autoload_script_count = 0usize;
+
+    for dep in modules {
+        eprintln!(
+            "  Installing {}@{}...",
+            dep.name,
+            &dep.rev[..12.min(dep.rev.len())]
+        );
+        install_dep(dep, modules_dir)?;
+
+        let dest = modules_dir.join(&dep.name);
+        let sha256 = resolver::compute_checksum(&dest)?;
+
+        locked_packages.push(LockedPackage {
+            name: dep.name.clone(),
+            kind: LockedPackageKind::Module,
+            git: dep.git.clone(),
+            tag: dep.tag.clone(),
+            rev: dep.rev.clone(),
+            path: None,
+            sha256,
+        });
+    }
+
+    for dep in scripts {
+        eprintln!(
+            "  Installing script {}@{}...",
+            dep.name,
+            &dep.rev[..12.min(dep.rev.len())]
+        );
+
+        let install_to_autoload = config.script_is_autoload(&dep.name);
+        let (target_dir, stale_dir) = if install_to_autoload {
+            autoload_script_count += 1;
+            (scripts_autoload_dir, scripts_dir)
+        } else {
+            regular_script_count += 1;
+            (scripts_dir, scripts_autoload_dir)
+        };
+
+        let stale_path = stale_dir.join(format!("{}.nu", dep.name));
+        if stale_path.exists() {
+            std::fs::remove_file(&stale_path)?;
+        }
+
+        install_script_dep(dep, target_dir)?;
+
+        let dest = target_dir.join(format!("{}.nu", dep.name));
+        let sha256 = resolver::compute_checksum_file(&dest)?;
+
+        locked_packages.push(LockedPackage {
+            name: dep.name.clone(),
+            kind: LockedPackageKind::Script,
+            git: dep.git.clone(),
+            tag: dep.tag.clone(),
+            rev: dep.rev.clone(),
+            path: Some(dep.path.clone()),
+            sha256,
+        });
+    }
+
+    locked_packages.sort_by(|a, b| a.kind.cmp(&b.kind).then(a.name.cmp(&b.name)));
+
+    let lockfile = Lockfile {
+        version: 1,
+        packages: locked_packages,
+    };
+    lockfile.write_to(lock_path)?;
+
+    let module_count = modules.len();
+    let module_suffix = if module_count == 1 { "" } else { "s" };
+    let scripts_suffix = if regular_script_count == 1 { "" } else { "s" };
+    let autoload_suffix = if autoload_script_count == 1 { "" } else { "s" };
+
+    eprintln!();
+    if module_count > 0 {
+        eprintln!("Installed {module_count} module{module_suffix} into {modules_display_name}/");
+    }
+    if regular_script_count > 0 {
+        eprintln!(
+            "Installed {regular_script_count} script{scripts_suffix} into {scripts_display_name}/"
+        );
+    }
+    if autoload_script_count > 0 {
+        eprintln!(
+            "Installed {autoload_script_count} autoload script{autoload_suffix} into {scripts_autoload_display_name}/"
+        );
+    }
+
+    write_activate_overlay(
+        modules_dir,
+        modules_display_name,
+        modules.iter().map(|dep| dep.name.as_str()),
+        false,
+    )?;
+    Ok(())
 }
 
 /// Install a list of resolved dependencies into a target directory and write the lockfile.
@@ -178,6 +330,8 @@ fn install_resolved(
     scripts_display_name: Option<&str>,
     lock_path: &Path,
     display_name: &str,
+    include_scripts_in_overlay: bool,
+    write_script_activate_file: bool,
 ) -> Result<()> {
     std::fs::create_dir_all(modules_dir)?;
     let mut locked_packages = Vec::new();
@@ -266,9 +420,9 @@ fn install_resolved(
         modules_dir,
         display_name,
         modules.iter().map(|dep| dep.name.as_str()),
-        scripts_dir.is_some() && !scripts.is_empty(),
+        include_scripts_in_overlay,
     )?;
-    if !scripts.is_empty() {
+    if write_script_activate_file && !scripts.is_empty() {
         if let (Some(scripts_dir), Some(scripts_display_name)) = (scripts_dir, scripts_display_name)
         {
             write_script_activate(
@@ -449,9 +603,27 @@ fn is_global_lockfile_stale(config: &GlobalConfig, lock_path: &Path) -> Result<b
         }
     }
 
-    for pkg in &lockfile.packages {
-        if pkg.kind != LockedPackageKind::Module || !config.dependencies.contains_key(&pkg.name) {
+    for name in config.scripts.keys() {
+        if lockfile
+            .find_package(name, LockedPackageKind::Script)
+            .is_none()
+        {
             return Ok(true);
+        }
+    }
+
+    for pkg in &lockfile.packages {
+        match pkg.kind {
+            LockedPackageKind::Module => {
+                if !config.dependencies.contains_key(&pkg.name) {
+                    return Ok(true);
+                }
+            }
+            LockedPackageKind::Script => {
+                if !config.scripts.contains_key(&pkg.name) || pkg.path.is_none() {
+                    return Ok(true);
+                }
+            }
         }
     }
 
@@ -461,6 +633,7 @@ fn is_global_lockfile_stale(config: &GlobalConfig, lock_path: &Path) -> Result<b
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -642,5 +815,110 @@ version = "0.1.0"
         assert!(activate.contains("export alias deactivate = overlay hide activate"));
 
         let _ = std::fs::remove_dir_all(project_dir);
+    }
+
+    #[test]
+    fn global_lockfile_staleness_detects_missing_script_entry() {
+        let root = make_temp_dir("global_lock_missing_script");
+        let lock_path = root.join("config.lock");
+        std::fs::write(
+            &lock_path,
+            r#"version = 1
+
+[[package]]
+name = "nu-utils"
+git = "https://github.com/example/nu-utils"
+tag = "v1.0.0"
+rev = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+sha256 = "aaa"
+"#,
+        )
+        .unwrap();
+
+        let config = GlobalConfig {
+            modules_dir: None,
+            scripts_dir: None,
+            default_git_provider: "github".to_string(),
+            dependencies: HashMap::from([(
+                "nu-utils".to_string(),
+                crate::manifest::DependencySpec {
+                    git: "https://github.com/example/nu-utils".to_string(),
+                    tag: Some("v1.0.0".to_string()),
+                    rev: None,
+                    branch: None,
+                },
+            )]),
+            scripts: HashMap::from([(
+                "quickfix".to_string(),
+                crate::config::GlobalScriptDependencySpec {
+                    git: "https://github.com/example/nu-scripts".to_string(),
+                    path: "scripts/quickfix.nu".to_string(),
+                    tag: Some("v1.0.0".to_string()),
+                    rev: None,
+                    branch: None,
+                    autoload: false,
+                },
+            )]),
+        };
+
+        assert!(is_global_lockfile_stale(&config, &lock_path).unwrap());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn global_lockfile_staleness_accepts_matching_module_and_script_entries() {
+        let root = make_temp_dir("global_lock_fresh");
+        let lock_path = root.join("config.lock");
+        std::fs::write(
+            &lock_path,
+            r#"version = 1
+
+[[package]]
+name = "nu-utils"
+git = "https://github.com/example/nu-utils"
+tag = "v1.0.0"
+rev = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+sha256 = "aaa"
+
+[[package]]
+name = "quickfix"
+kind = "script"
+git = "https://github.com/example/nu-scripts"
+path = "scripts/quickfix.nu"
+tag = "v1.0.0"
+rev = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+sha256 = "bbb"
+"#,
+        )
+        .unwrap();
+
+        let config = GlobalConfig {
+            modules_dir: None,
+            scripts_dir: None,
+            default_git_provider: "github".to_string(),
+            dependencies: HashMap::from([(
+                "nu-utils".to_string(),
+                crate::manifest::DependencySpec {
+                    git: "https://github.com/example/nu-utils".to_string(),
+                    tag: Some("v1.0.0".to_string()),
+                    rev: None,
+                    branch: None,
+                },
+            )]),
+            scripts: HashMap::from([(
+                "quickfix".to_string(),
+                crate::config::GlobalScriptDependencySpec {
+                    git: "https://github.com/example/nu-scripts".to_string(),
+                    path: "scripts/quickfix.nu".to_string(),
+                    tag: Some("v1.0.0".to_string()),
+                    rev: None,
+                    branch: None,
+                    autoload: true,
+                },
+            )]),
+        };
+
+        assert!(!is_global_lockfile_stale(&config, &lock_path).unwrap());
+        let _ = std::fs::remove_dir_all(root);
     }
 }

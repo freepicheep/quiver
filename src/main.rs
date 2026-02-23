@@ -9,9 +9,10 @@ mod manifest;
 mod resolver;
 
 use std::path::Path;
+use std::{io, io::Write};
 
 use cli::Commands;
-use config::GlobalConfig;
+use config::{GlobalConfig, GlobalScriptDependencySpec};
 use error::Result;
 use manifest::{DependencySpec, Manifest, Package, ScriptDependencySpec};
 
@@ -55,13 +56,26 @@ fn run(command: Commands) -> Result<()> {
             }
         }
         Commands::AddScript {
+            global,
+            autoload,
             url,
             path,
             name,
             tag,
             rev,
             branch,
-        } => cmd_add_script(&cwd, url, path, name, tag, rev, branch),
+        } => {
+            if global {
+                cmd_add_global_script(url, path, name, tag, rev, branch, autoload)
+            } else {
+                if autoload {
+                    return Err(error::NuanceError::Other(
+                        "--autoload can only be used with --global".to_string(),
+                    ));
+                }
+                cmd_add_script(&cwd, url, path, name, tag, rev, branch)
+            }
+        }
         Commands::Remove { global, name } => {
             if global {
                 cmd_remove_global(name)
@@ -69,7 +83,13 @@ fn run(command: Commands) -> Result<()> {
                 cmd_remove(&cwd, name)
             }
         }
-        Commands::RemoveScript { name } => cmd_remove_script(&cwd, name),
+        Commands::RemoveScript { global, name } => {
+            if global {
+                cmd_remove_global_script(name)
+            } else {
+                cmd_remove_script(&cwd, name)
+            }
+        }
         Commands::List => cmd_list(&cwd),
         Commands::Version => cmd_version(),
         Commands::Hook => cmd_hook(),
@@ -247,6 +267,65 @@ fn cmd_add_script(
     installer::install(dir, false)
 }
 
+fn cmd_add_global_script(
+    url: String,
+    path: Option<String>,
+    name: Option<String>,
+    tag: Option<String>,
+    rev: Option<String>,
+    branch: Option<String>,
+    autoload: bool,
+) -> Result<()> {
+    let mut config = GlobalConfig::load()?;
+    let provider_base = if is_git_url(url.trim()) {
+        None
+    } else {
+        Some(config.default_git_provider_base_url()?)
+    };
+    let source = normalize_script_source(&url, path, provider_base.as_deref())?;
+
+    let mut tag = tag;
+    let mut rev = rev;
+    let mut branch = branch;
+    if tag.is_none() && rev.is_none() && branch.is_none() {
+        if let Some(ref_spec) = source.inferred_ref.as_deref() {
+            let (inferred_tag, inferred_rev, inferred_branch) =
+                infer_ref_fields_from_spec(&source.url, ref_spec)?;
+            tag = inferred_tag;
+            rev = inferred_rev;
+            branch = inferred_branch;
+        }
+    }
+
+    let dep_name = match name {
+        Some(explicit) => explicit,
+        None => script_name_from_path(&source.path)?,
+    };
+
+    if config.dependencies.contains_key(&dep_name) || config.scripts.contains_key(&dep_name) {
+        return Err(error::NuanceError::Config(format!(
+            "dependency '{dep_name}' already exists in global config"
+        )));
+    }
+
+    let script_spec = auto_detect_script_dep_spec(&source.url, &source.path, tag, rev, branch)?;
+    script_spec.validate(&dep_name)?;
+
+    let autoload = if autoload {
+        true
+    } else {
+        prompt_for_global_script_autoload_choice()?
+    };
+    config.scripts.insert(
+        dep_name.clone(),
+        GlobalScriptDependencySpec::from_script_dependency_spec(script_spec, autoload),
+    );
+    config.save()?;
+
+    eprintln!("Added script '{dep_name}' to global config");
+    installer::install_global(false)
+}
+
 fn cmd_add_global(
     url: String,
     tag: Option<String>,
@@ -267,7 +346,7 @@ fn cmd_add_global(
     })?;
 
     // Check if already added
-    if config.dependencies.contains_key(&pkg_name) {
+    if config.dependencies.contains_key(&pkg_name) || config.scripts.contains_key(&pkg_name) {
         return Err(error::NuanceError::Config(format!(
             "dependency '{pkg_name}' already exists in global config"
         )));
@@ -359,6 +438,47 @@ fn cmd_remove_script(dir: &Path, name: String) -> Result<()> {
 
     eprintln!("Regenerating activate.nu...");
     installer::install(dir, false)?;
+
+    Ok(())
+}
+
+fn cmd_remove_global_script(name: String) -> Result<()> {
+    let mut config = GlobalConfig::load()?;
+
+    if config.scripts.remove(&name).is_none() {
+        return Err(error::NuanceError::Config(format!(
+            "script dependency '{name}' not found in global config"
+        )));
+    }
+
+    config.save()?;
+    eprintln!("Removed script '{name}' from global config");
+
+    let scripts_dir = config.scripts_dir()?;
+    let scripts_autoload_dir = config.scripts_autoload_dir()?;
+    let script_path = scripts_dir.join(format!("{name}.nu"));
+    if script_path.exists() {
+        std::fs::remove_file(&script_path)?;
+        eprintln!("Removed {}", script_path.display());
+    }
+    let autoload_script_path = scripts_autoload_dir.join(format!("{name}.nu"));
+    if autoload_script_path.exists() {
+        std::fs::remove_file(&autoload_script_path)?;
+        eprintln!("Removed {}", autoload_script_path.display());
+    }
+
+    let lock_path = config::global_lock_path()?;
+    if lock_path.exists() {
+        let mut lockfile = lockfile::Lockfile::from_path(&lock_path)?;
+        lockfile
+            .packages
+            .retain(|p| !(p.name == name && p.kind == lockfile::LockedPackageKind::Script));
+        lockfile.write_to(&lock_path)?;
+        eprintln!("Updated global lockfile");
+    }
+
+    eprintln!("Regenerating global install state...");
+    installer::install_global(false)?;
 
     Ok(())
 }
@@ -467,19 +587,44 @@ fn cmd_list(cwd: &Path) -> Result<()> {
     } else {
         let config = GlobalConfig::load_or_default()?;
         let modules_dir = config.modules_dir()?;
+        let scripts_dir = config.scripts_dir()?;
+        let scripts_autoload_dir = config.scripts_autoload_dir()?;
         let modules = list_installed_module_names(&modules_dir)?;
+        let scripts = list_installed_script_names(&scripts_dir)?;
+        let autoload_scripts = list_installed_script_names(&scripts_autoload_dir)?;
 
-        if modules.is_empty() {
+        if modules.is_empty() && scripts.is_empty() && autoload_scripts.is_empty() {
             eprintln!(
-                "No installed global modules found in {}",
-                modules_dir.display()
+                "No installed global dependencies found in {}, {}, or {}",
+                modules_dir.display(),
+                scripts_dir.display(),
+                scripts_autoload_dir.display()
             );
             return Ok(());
         }
 
-        eprintln!("Installed global modules from {}", modules_dir.display());
-        for module in modules {
-            eprintln!("{module}");
+        if !modules.is_empty() {
+            eprintln!("Installed global modules from {}", modules_dir.display());
+            for module in modules {
+                eprintln!("{module}");
+            }
+        }
+
+        if !scripts.is_empty() {
+            eprintln!("Installed global scripts from {}", scripts_dir.display());
+            for script in scripts {
+                eprintln!("{script}");
+            }
+        }
+
+        if !autoload_scripts.is_empty() {
+            eprintln!(
+                "Installed global autoload scripts from {}",
+                scripts_autoload_dir.display()
+            );
+            for script in autoload_scripts {
+                eprintln!("{script}");
+            }
         }
     }
 
@@ -802,6 +947,29 @@ fn script_name_from_path(path: &str) -> Result<String> {
     Ok(stem.to_string())
 }
 
+fn prompt_for_global_script_autoload_choice() -> Result<bool> {
+    loop {
+        eprint!("Install this global script into autoload? [y/N]: ");
+        io::stderr().flush()?;
+
+        let mut answer = String::new();
+        let read = io::stdin().read_line(&mut answer)?;
+        if read == 0 {
+            return Err(error::NuanceError::Other(
+                "no prompt input received; pass --autoload to skip the prompt".to_string(),
+            ));
+        }
+
+        match answer.trim().to_ascii_lowercase().as_str() {
+            "y" | "yes" => return Ok(true),
+            "n" | "no" | "" => return Ok(false),
+            _ => {
+                eprintln!("Please answer y/yes or n/no.");
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -812,8 +980,10 @@ mod tests {
     fn config_with_provider(provider: &str) -> GlobalConfig {
         GlobalConfig {
             modules_dir: None,
+            scripts_dir: None,
             default_git_provider: provider.to_string(),
             dependencies: HashMap::new(),
+            scripts: HashMap::new(),
         }
     }
 
