@@ -42,6 +42,7 @@ pub fn install(project_dir: &Path, frozen: bool) -> Result<()> {
     if manifest.dependencies.is_empty() {
         eprintln!("No dependencies declared in mod.toml.");
         write_activate_overlay(&modules_dir, MODULES_DIR, std::iter::empty::<&str>(), false)?;
+        write_script_activate(&scripts_dir, SCRIPTS_DIR, std::iter::empty::<&str>())?;
         return Ok(());
     }
 
@@ -433,7 +434,7 @@ fn install_resolved(
         module_use_paths.iter().map(|path| path.as_str()),
         include_scripts_in_overlay,
     )?;
-    if write_script_activate_file && !scripts.is_empty() {
+    if write_script_activate_file {
         if let (Some(scripts_dir), Some(scripts_display_name)) = (scripts_dir, scripts_display_name)
         {
             write_script_activate(
@@ -983,6 +984,42 @@ mod tests {
     }
 
     #[test]
+    fn writes_script_activate_without_scripts() {
+        let scripts_dir = make_temp_dir("scripts_activate_empty");
+
+        write_script_activate(&scripts_dir, ".nu_scripts", std::iter::empty::<&str>()).unwrap();
+
+        let activate = std::fs::read_to_string(scripts_dir.join("activate.nu")).unwrap();
+        assert!(!activate.lines().any(|line| line.starts_with("source ")));
+        let _ = std::fs::remove_dir_all(scripts_dir);
+    }
+
+    #[test]
+    fn install_resolved_writes_empty_script_activate_when_no_scripts() {
+        let root = make_temp_dir("install_resolved_empty_scripts");
+        let modules_dir = root.join(".nu_modules");
+        let scripts_dir = root.join(".nu_scripts");
+        let lock_path = root.join("mod.lock");
+
+        install_resolved(
+            &[],
+            &[],
+            &modules_dir,
+            Some(&scripts_dir),
+            Some(".nu_scripts"),
+            &lock_path,
+            ".nu_modules",
+            false,
+            true,
+        )
+        .unwrap();
+
+        let activate = std::fs::read_to_string(scripts_dir.join("activate.nu")).unwrap();
+        assert!(!activate.lines().any(|line| line.starts_with("source ")));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn discovers_nested_module_path_from_nupm_metadata() {
         let module_root = make_temp_dir("nupm_nested");
         let nested_dir = module_root.join("nu-salesforce");
@@ -1121,6 +1158,12 @@ version = "0.1.0"
             std::fs::read_to_string(project_dir.join(".nu_modules").join("activate.nu")).unwrap();
         assert!(!activate.lines().any(|line| line.starts_with("export use ")));
         assert!(activate.contains("export alias deactivate = overlay hide activate"));
+
+        let script_activate =
+            std::fs::read_to_string(project_dir.join(".nu_scripts").join("activate.nu")).unwrap();
+        assert!(!script_activate
+            .lines()
+            .any(|line| line.starts_with("source ")));
 
         let _ = std::fs::remove_dir_all(project_dir);
     }

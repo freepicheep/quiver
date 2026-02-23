@@ -73,7 +73,7 @@ nuance list
 A nuance project is a directory containing:
 
 - **`mod.toml`** — declares package metadata and dependencies
-- **`mod.nu`** — the Nushell module entry point
+- **`<project-dir-name>/mod.nu`** — the Nushell module entry point
 - **`mod.lock`** — auto-generated lockfile pinning exact commits (commit this to version control)
 
 Running `nuance install` fetches module dependencies into `.nu_modules/` and script dependencies into `.nu_scripts/`.
@@ -105,12 +105,15 @@ source .nu_scripts/activate.nu
 When you're done, run `deactivate` (or `overlay hide activate`) to unload the module overlay.
 
 ### 2. Auto-activation Hook
-If you want nuance projects to automatically update your module path when you `cd` into their directory (and remove it when you leave), add the nuance env_change hook to your `config.nu` or `env.nu`:
 
-```bash
-# Run this and append the output to your config
-nuance hook
+If you want nuance projects to automatically update your module path when you `cd` into their directory (and remove it when you leave), add the following to your `config.nu` or `env.nu`:
+
+```nu
+mkdir ($nu.default-config-dir | path join "vendor" "autoload")
+nuance hook | save -f ($nu.default-config-dir | path join "vendor" "autoload" "nuance_hook.nu")
 ```
+
+You can also simply run these commands without adding them to your config or env file. You just won't receive any modifications of the hook until you run the commands again, but your shell startup time will be faster.
 
 > **Note**: Due to Nushell's static scoping rules, the auto-activation hook only updates `$env.NU_LIB_DIRS`. It cannot auto-import module/script commands. For automatic loading, use the manual activation approach above.
 
@@ -139,7 +142,7 @@ Script dependencies must include `path` and exactly one of `tag`, `branch`, or `
 
 | Command | Description |
 |---------|-------------|
-| `nuance init` | Create a new `mod.toml` in the current directory |
+| `nuance init` | Create a new `mod.toml` and scaffold `<project-dir-name>/mod.nu` in the current directory |
 | `nuance add <source>` | Add a module dependency from a URL or owner/repo shorthand (auto-detects latest tag) |
 | `nuance add-script [-g] [--autoload] <source> [path]` | Add a script dependency locally (`mod.toml`) or globally (`config.toml`) |
 | `nuance install` | Install dependencies from `mod.toml` |
