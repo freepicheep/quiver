@@ -41,7 +41,7 @@ pub enum Commands {
 
     /// Resolve and install dependencies from mod.toml
     Install {
-        /// Install global modules (from ~/.config/nuance/config.toml)
+        /// Install global modules/scripts (from ~/.config/nuance/config.toml)
         #[arg(short = 'g', long)]
         global: bool,
 
@@ -53,7 +53,7 @@ pub enum Commands {
     /// Re-resolve all dependencies (ignore existing lockfile)
     Update,
 
-    /// Add a package from a git URL or owner/repo shorthand
+    /// Add a module dependency from a git URL or owner/repo shorthand
     Add {
         /// Add to global config instead of local mod.toml
         #[arg(short = 'g', long)]
@@ -75,7 +75,42 @@ pub enum Commands {
         branch: Option<String>,
     },
 
-    /// Remove a package from mod.toml and .nu_modules/
+    /// Add a script from a git URL or owner/repo shorthand
+    AddScript {
+        /// Add to global config instead of local mod.toml
+        #[arg(short = 'g', long)]
+        global: bool,
+
+        /// Install global script into autoload without prompting
+        #[arg(long)]
+        autoload: bool,
+
+        /// Git URL/owner-repo source, or a full blob URL
+        url: String,
+
+        /// Repository-relative path to the script file to install.
+        ///
+        /// Optional when `url` is a full blob URL
+        path: Option<String>,
+
+        /// Local script name (defaults to script file stem)
+        #[arg(long)]
+        name: Option<String>,
+
+        /// Pin to a specific tag
+        #[arg(long)]
+        tag: Option<String>,
+
+        /// Pin to a specific commit SHA
+        #[arg(long)]
+        rev: Option<String>,
+
+        /// Track a branch
+        #[arg(long)]
+        branch: Option<String>,
+    },
+
+    /// Remove a module dependency from mod.toml and .nu_modules/
     #[command(visible_alias = "rm")]
     Remove {
         /// Remove from global config instead of local mod.toml
@@ -86,7 +121,17 @@ pub enum Commands {
         name: String,
     },
 
-    /// List installed modules (project-local if mod.toml exists, otherwise global)
+    /// Remove a script dependency from local mod.toml/.nu_scripts or global config
+    RemoveScript {
+        /// Remove from global config instead of local config
+        #[arg(short = 'g', long)]
+        global: bool,
+
+        /// Script dependency name to remove
+        name: String,
+    },
+
+    /// List installed dependencies (project-local if mod.toml exists, otherwise global modules/scripts)
     #[command(visible_alias = "ls")]
     List,
 
@@ -128,6 +173,102 @@ mod tests {
     fn version_subcommand_parses() {
         let cli = Cli::try_parse_from(["nuance", "version"]).unwrap();
         assert!(matches!(cli.command, Commands::Version));
+    }
+
+    #[test]
+    fn add_script_parses() {
+        let cli = Cli::try_parse_from([
+            "nuance",
+            "add-script",
+            "user/repo",
+            "scripts/quickfix.nu",
+            "--name",
+            "quickfix",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::AddScript {
+                global,
+                autoload,
+                url,
+                path,
+                name,
+                ..
+            } => {
+                assert!(!global);
+                assert!(!autoload);
+                assert_eq!(url, "user/repo");
+                assert_eq!(path.as_deref(), Some("scripts/quickfix.nu"));
+                assert_eq!(name.as_deref(), Some("quickfix"));
+            }
+            _ => panic!("expected add-script command"),
+        }
+    }
+
+    #[test]
+    fn add_script_global_parses() {
+        let cli = Cli::try_parse_from([
+            "nuance",
+            "add-script",
+            "--global",
+            "--autoload",
+            "user/repo",
+            "scripts/quickfix.nu",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::AddScript {
+                global, autoload, ..
+            } => {
+                assert!(global);
+                assert!(autoload);
+            }
+            _ => panic!("expected add-script command"),
+        }
+    }
+
+    #[test]
+    fn add_script_blob_url_without_explicit_path_parses() {
+        let cli = Cli::try_parse_from([
+            "nuance",
+            "add-script",
+            "https://github.com/nushell/nu_scripts/blob/main/sourced/webscraping/twitter.nu",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::AddScript { url, path, .. } => {
+                assert_eq!(
+                    url,
+                    "https://github.com/nushell/nu_scripts/blob/main/sourced/webscraping/twitter.nu"
+                );
+                assert!(path.is_none());
+            }
+            _ => panic!("expected add-script command"),
+        }
+    }
+
+    #[test]
+    fn remove_script_parses() {
+        let cli = Cli::try_parse_from(["nuance", "remove-script", "quickfix"]).unwrap();
+        match cli.command {
+            Commands::RemoveScript { global, name } => {
+                assert!(!global);
+                assert_eq!(name, "quickfix");
+            }
+            _ => panic!("expected remove-script command"),
+        }
+    }
+
+    #[test]
+    fn remove_script_global_parses() {
+        let cli = Cli::try_parse_from(["nuance", "remove-script", "-g", "quickfix"]).unwrap();
+        match cli.command {
+            Commands::RemoveScript { global, name } => {
+                assert!(global);
+                assert_eq!(name, "quickfix");
+            }
+            _ => panic!("expected remove-script command"),
+        }
     }
 
     #[test]

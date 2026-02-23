@@ -33,6 +33,14 @@ pub fn hash_directory(dir: &Path) -> Result<String> {
     Ok(hex::encode(hasher.finalize()))
 }
 
+/// Compute SHA-256 over a single file's contents.
+pub fn hash_file(path: &Path) -> Result<String> {
+    let mut hasher = Sha256::new();
+    let contents = std::fs::read(path)?;
+    hasher.update(&contents);
+    Ok(hex::encode(hasher.finalize()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -64,6 +72,24 @@ mod tests {
 
         fs::write(dir.join("file.txt"), "version2").unwrap();
         let h2 = hash_directory(&dir).unwrap();
+
+        assert_ne!(h1, h2);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_hash_changes_with_content() {
+        let dir = std::env::temp_dir().join("nuance_test_checksum_file");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("script.nu");
+
+        fs::write(&file, "print 'a'").unwrap();
+        let h1 = hash_file(&file).unwrap();
+
+        fs::write(&file, "print 'b'").unwrap();
+        let h2 = hash_file(&file).unwrap();
 
         assert_ne!(h1, h2);
 
