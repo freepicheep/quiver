@@ -105,12 +105,15 @@ source .nu_scripts/activate.nu
 When you're done, run `deactivate` (or `overlay hide activate`) to unload the module overlay.
 
 ### 2. Auto-activation Hook
-If you want nuance projects to automatically update your module path when you `cd` into their directory (and remove it when you leave), add the nuance env_change hook to your `config.nu` or `env.nu`:
 
-```bash
-# Run this and append the output to your config
-nuance hook
+If you want nuance projects to automatically update your module path when you `cd` into their directory (and remove it when you leave), add the following to your `config.nu` or `env.nu`:
+
+```nu
+mkdir ($nu.default-config-dir | path join "vendor" "autoload")
+nuance hook | save -f ($nu.default-config-dir | path join "vendor" "autoload" "nuance_hook.nu")
 ```
+
+You can also simply run these commands without adding them to your config or env file. You just won't receive any modifications of the hook until you run the commands again, but your shell startup time will be faster.
 
 > **Note**: Due to Nushell's static scoping rules, the auto-activation hook only updates `$env.NU_LIB_DIRS`. It cannot auto-import module/script commands. For automatic loading, use the manual activation approach above.
 
