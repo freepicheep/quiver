@@ -71,17 +71,17 @@ mod tests {
     }
 
     #[test]
-    fn file_hash_changes_with_content() {
+    fn single_file_directory_hash_changes_with_content() {
         let dir = std::env::temp_dir().join("quiver_test_checksum_file");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let file = dir.join("script.nu");
 
         fs::write(&file, "print 'a'").unwrap();
-        let h1 = hash_file(&file).unwrap();
+        let h1 = hash_directory(&dir).unwrap();
 
         fs::write(&file, "print 'b'").unwrap();
-        let h2 = hash_file(&file).unwrap();
+        let h2 = hash_directory(&dir).unwrap();
 
         assert_ne!(h1, h2);
 
