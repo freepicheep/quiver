@@ -69,7 +69,7 @@ A quiver project is a directory containing:
 - **`<project-dir-name>/mod.nu`** - the Nushell module entry point
 - **`quiver.lock`** - auto-generated lockfile pinning exact commits (commit this to version control)
 
-Running `qv install` fetches module dependencies into `.nu_modules/`.
+Running `qv install` fetches module dependencies into `.nu-env/modules/`.
 
 ## Activation
 
@@ -78,12 +78,12 @@ To make installed modules available to `use` in Nushell without full paths, add 
 ### 1. Manual Activation (Recommended)
 `qv install` and `qv init` generate:
 
-- `.nu_modules/activate.nu` (module overlay): updates `$env.NU_LIB_DIRS` and imports module dependencies with `export use <name> *`
+- `.nu-env/activate.nu` (module overlay): updates `$env.NU_LIB_DIRS` and imports module dependencies with `export use <name> *`
 
 Activate modules with an overlay:
 
 ```nu
-overlay use .nu_modules/activate.nu
+overlay use .nu-env/activate.nu
 ```
 
 When you're done, run `deactivate` (or `overlay hide activate`) to unload the module overlay.
