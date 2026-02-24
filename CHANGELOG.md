@@ -1,5 +1,9 @@
 # Unreleased
 
+# Version 0.2.2 (2026-02-24)
+
+**Nuance is now Quiver, with the executable being `qv`.** 
+
 ## Removed
 - Removed script dependency installation from quiver.
 - Removed `add-script` / `remove-script` commands and `.nu_scripts` activation flow.
