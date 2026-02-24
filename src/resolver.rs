@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::checksum;
-use crate::error::{NuanceError, Result};
+use crate::error::{QuiverError, Result};
 use crate::git::{self, RefKind};
 use crate::lockfile::{LockedPackage, LockedPackageKind};
 use crate::manifest::{DependencySpec, Manifest};
@@ -60,7 +60,7 @@ fn resolve_deps(
         // Check for conflicts
         if let Some(existing) = resolved.get(name) {
             if existing.rev != rev || existing.git != spec.git {
-                return Err(NuanceError::Conflict {
+                return Err(QuiverError::Conflict {
                     name: name.clone(),
                     rev_a: existing.rev.clone(),
                     rev_b: rev,

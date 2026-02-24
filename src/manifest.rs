@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
 
-use crate::error::{NuanceError, Result};
+use crate::error::{QuiverError, Result};
 
 /// The top-level `nupackage.toml` manifest.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,12 +98,12 @@ fn validate_ref_fields(
     let count = [tag, rev, branch].iter().filter(|v| v.is_some()).count();
 
     if count == 0 {
-        return Err(NuanceError::Manifest(format!(
+        return Err(QuiverError::Manifest(format!(
             "{kind} '{name}': must specify one of 'tag', 'rev', or 'branch'"
         )));
     }
     if count > 1 {
-        return Err(NuanceError::Manifest(format!(
+        return Err(QuiverError::Manifest(format!(
             "{kind} '{name}': specify only one of 'tag', 'rev', or 'branch'"
         )));
     }
@@ -115,7 +115,7 @@ impl Manifest {
     pub fn from_dir(dir: &Path) -> Result<Self> {
         let path = dir.join("nupackage.toml");
         if !path.exists() {
-            return Err(NuanceError::NoManifest(dir.to_path_buf()));
+            return Err(QuiverError::NoManifest(dir.to_path_buf()));
         }
         let content = std::fs::read_to_string(&path)?;
         Self::from_str(&content)
@@ -131,12 +131,12 @@ impl Manifest {
     /// Validate the manifest contents.
     fn validate(&self) -> Result<()> {
         if self.package.name.is_empty() {
-            return Err(NuanceError::Manifest(
+            return Err(QuiverError::Manifest(
                 "package name cannot be empty".to_string(),
             ));
         }
         if self.package.version.is_empty() {
-            return Err(NuanceError::Manifest(
+            return Err(QuiverError::Manifest(
                 "package version cannot be empty".to_string(),
             ));
         }

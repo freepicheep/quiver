@@ -2,12 +2,12 @@ use std::path::{Path, PathBuf};
 
 use git2::{FetchOptions, RemoteCallbacks, Repository, build::RepoBuilder};
 
-use crate::error::{NuanceError, Result};
+use crate::error::{QuiverError, Result};
 
 /// Returns the global cache directory for git repos: `~/.cache/quiver/git/`.
 pub fn cache_dir() -> Result<PathBuf> {
     let cache = dirs::cache_dir()
-        .ok_or_else(|| NuanceError::Other("could not determine cache directory".to_string()))?;
+        .ok_or_else(|| QuiverError::Other("could not determine cache directory".to_string()))?;
     Ok(cache.join("quiver").join("git"))
 }
 
@@ -58,7 +58,7 @@ pub fn resolve_ref(repo_path: &Path, spec: &str, kind: RefKind) -> Result<String
         RefKind::Rev => {
             // Direct commit SHA — validate it exists
             let oid = git2::Oid::from_str(spec)
-                .map_err(|_| NuanceError::Other(format!("invalid commit SHA: {spec}")))?;
+                .map_err(|_| QuiverError::Other(format!("invalid commit SHA: {spec}")))?;
             let _commit = repo.find_commit(oid)?;
             Ok(spec.to_string())
         }
@@ -83,7 +83,7 @@ pub fn resolve_ref(repo_path: &Path, spec: &str, kind: RefKind) -> Result<String
 pub fn export_to(repo_path: &Path, sha: &str, dest: &Path) -> Result<()> {
     let repo = Repository::open(repo_path)?;
     let oid = git2::Oid::from_str(sha)
-        .map_err(|_| NuanceError::Other(format!("invalid commit SHA: {sha}")))?;
+        .map_err(|_| QuiverError::Other(format!("invalid commit SHA: {sha}")))?;
     let commit = repo.find_commit(oid)?;
     let tree = commit.tree()?;
 
@@ -190,7 +190,7 @@ pub fn default_branch(repo_path: &Path) -> Result<String> {
         }
     }
 
-    Err(NuanceError::Other(
+    Err(QuiverError::Other(
         "could not determine default branch".to_string(),
     ))
 }

@@ -76,7 +76,7 @@ fn cmd_init(
 ) -> Result<()> {
     let nupackage_toml = dir.join("nupackage.toml");
     if nupackage_toml.exists() {
-        return Err(error::NuanceError::Manifest(
+        return Err(error::QuiverError::Manifest(
             "nupackage.toml already exists in this directory".to_string(),
         ));
     }
@@ -159,12 +159,12 @@ fn cmd_add(
 
     // Derive package name from URL
     let pkg_name = git::repo_name_from_url(&url).ok_or_else(|| {
-        error::NuanceError::Other(format!("could not determine package name from URL: {url}"))
+        error::QuiverError::Other(format!("could not determine package name from URL: {url}"))
     })?;
 
     // Check if already added
     if manifest.dependencies.modules.contains_key(&pkg_name) {
-        return Err(error::NuanceError::Manifest(format!(
+        return Err(error::QuiverError::Manifest(format!(
             "dependency '{pkg_name}' already exists in nupackage.toml"
         )));
     }
@@ -204,12 +204,12 @@ fn cmd_add_global(
 
     // Derive package name from URL
     let pkg_name = git::repo_name_from_url(&url).ok_or_else(|| {
-        error::NuanceError::Other(format!("could not determine package name from URL: {url}"))
+        error::QuiverError::Other(format!("could not determine package name from URL: {url}"))
     })?;
 
     // Check if already added
     if config.dependencies.contains_key(&pkg_name) {
-        return Err(error::NuanceError::Config(format!(
+        return Err(error::QuiverError::Config(format!(
             "dependency '{pkg_name}' already exists in global config"
         )));
     }
@@ -234,7 +234,7 @@ fn cmd_remove(dir: &Path, name: String) -> Result<()> {
 
     // Check the module dep exists
     if manifest.dependencies.modules.remove(&name).is_none() {
-        return Err(error::NuanceError::Manifest(format!(
+        return Err(error::QuiverError::Manifest(format!(
             "module dependency '{name}' not found in nupackage.toml"
         )));
     }
@@ -274,7 +274,7 @@ fn cmd_remove_global(name: String) -> Result<()> {
 
     // Check the dep exists
     if config.dependencies.remove(&name).is_none() {
-        return Err(error::NuanceError::Config(format!(
+        return Err(error::QuiverError::Config(format!(
             "dependency '{name}' not found in global config"
         )));
     }
@@ -411,7 +411,7 @@ fn normalize_dependency_source(input: &str, provider_base_url: Option<&str>) -> 
     let trimmed = input.trim();
 
     if trimmed.is_empty() {
-        return Err(error::NuanceError::Other(
+        return Err(error::QuiverError::Other(
             "dependency source cannot be empty".to_string(),
         ));
     }
@@ -422,14 +422,14 @@ fn normalize_dependency_source(input: &str, provider_base_url: Option<&str>) -> 
 
     if is_repo_shorthand(trimmed) {
         let provider_base = provider_base_url.ok_or_else(|| {
-            error::NuanceError::Other(
+            error::QuiverError::Other(
                 "a default git provider is required for owner/repo shorthand".to_string(),
             )
         })?;
         return Ok(format!("{provider_base}/{trimmed}"));
     }
 
-    Err(error::NuanceError::Other(format!(
+    Err(error::QuiverError::Other(format!(
         "invalid dependency source '{input}'; expected a git URL or owner/repo shorthand"
     )))
 }

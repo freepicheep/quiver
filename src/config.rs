@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crate::error::{NuanceError, Result};
+use crate::error::{QuiverError, Result};
 use crate::manifest::DependencySpec;
 
 const DEFAULT_GIT_PROVIDER: &str = "github";
@@ -96,7 +96,7 @@ impl GlobalConfig {
     fn load_from_path(path: &Path) -> Result<Self> {
         let content = std::fs::read_to_string(&path)?;
         let config: GlobalConfig = toml::from_str(&content)
-            .map_err(|e| NuanceError::Config(format!("failed to parse {}: {e}", path.display())))?;
+            .map_err(|e| QuiverError::Config(format!("failed to parse {}: {e}", path.display())))?;
         Ok(config)
     }
 
@@ -109,7 +109,7 @@ impl GlobalConfig {
         }
 
         let content = toml::to_string_pretty(self)
-            .map_err(|e| NuanceError::Config(format!("failed to serialize config: {e}")))?;
+            .map_err(|e| QuiverError::Config(format!("failed to serialize config: {e}")))?;
         std::fs::write(&path, content)?;
         Ok(())
     }
@@ -129,7 +129,7 @@ impl GlobalConfig {
     /// Resolve the configured default git provider to a base URL.
     pub fn default_git_provider_base_url(&self) -> Result<String> {
         normalize_provider_base_url(&self.default_git_provider).ok_or_else(|| {
-            NuanceError::Config(format!(
+            QuiverError::Config(format!(
                 "unsupported default_git_provider '{}'; use one of github, gitlab, codeberg, bitbucket, or a custom host like git.example.com",
                 self.default_git_provider
             ))
@@ -140,7 +140,7 @@ impl GlobalConfig {
 /// Returns the global config directory: `~/.config/quiver/`.
 pub fn global_config_dir() -> Result<PathBuf> {
     let home = dirs::home_dir()
-        .ok_or_else(|| NuanceError::Config("could not determine home directory".to_string()))?;
+        .ok_or_else(|| QuiverError::Config("could not determine home directory".to_string()))?;
     Ok(home.join(".config").join("quiver"))
 }
 
@@ -161,7 +161,7 @@ pub fn global_lock_path() -> Result<PathBuf> {
 ///      `~/.config/nushell/vendor/quiver/modules/` on Linux.
 pub fn global_modules_dir() -> Result<PathBuf> {
     let config = dirs::config_dir()
-        .ok_or_else(|| NuanceError::Config("could not determine config directory".to_string()))?;
+        .ok_or_else(|| QuiverError::Config("could not determine config directory".to_string()))?;
     Ok(config
         .join("nushell")
         .join("vendor")

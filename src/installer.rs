@@ -34,7 +34,7 @@ pub fn install(project_dir: &Path, frozen: bool) -> Result<()> {
     let resolved_modules = if frozen {
         // --frozen: use lockfile only
         if !lock_path.exists() {
-            return Err(crate::error::NuanceError::Lockfile(
+            return Err(crate::error::QuiverError::Lockfile(
                 "quiver.lock not found (required with --frozen)".to_string(),
             ));
         }
@@ -91,7 +91,7 @@ pub fn install_global(frozen: bool) -> Result<()> {
 
     let resolved_modules = if frozen {
         if !lock_path.exists() {
-            return Err(crate::error::NuanceError::Lockfile(
+            return Err(crate::error::QuiverError::Lockfile(
                 "config.lock not found (required with --frozen)".to_string(),
             ));
         }

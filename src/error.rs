@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 #[derive(thiserror::Error, Debug)]
-pub enum NuanceError {
+pub enum QuiverError {
     #[error("manifest error: {0}")]
     Manifest(String),
 
@@ -37,4 +37,4 @@ pub enum NuanceError {
     Other(String),
 }
 
-pub type Result<T> = std::result::Result<T, NuanceError>;
+pub type Result<T> = std::result::Result<T, QuiverError>;
