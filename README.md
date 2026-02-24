@@ -82,7 +82,7 @@ A quiver project is a directory containing:
 
 - **`nupackage.toml`** — declares package metadata and dependencies
 - **`<project-dir-name>/mod.nu`** — the Nushell module entry point
-- **`mod.lock`** — auto-generated lockfile pinning exact commits (commit this to version control)
+- **`quiver.lock`** — auto-generated lockfile pinning exact commits (commit this to version control)
 
 Running `qv install` fetches module dependencies into `.nu_modules/` and script dependencies into `.nu_scripts/`.
 

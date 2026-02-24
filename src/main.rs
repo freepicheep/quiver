@@ -400,14 +400,14 @@ fn cmd_remove(dir: &Path, name: String) -> Result<()> {
     }
 
     // Update lockfile: remove the package entry
-    let lock_path = dir.join("mod.lock");
+    let lock_path = dir.join("quiver.lock");
     if lock_path.exists() {
         let mut lockfile = lockfile::Lockfile::from_path(&lock_path)?;
         lockfile
             .packages
             .retain(|p| !(p.name == name && p.kind == lockfile::LockedPackageKind::Module));
         lockfile.write_to(&lock_path)?;
-        eprintln!("Updated mod.lock");
+        eprintln!("Updated quiver.lock");
     }
 
     // Regenerate activate.nu from the updated manifest and lockfile state.
@@ -436,14 +436,14 @@ fn cmd_remove_script(dir: &Path, name: String) -> Result<()> {
         eprintln!("Removed {}", script_path.display());
     }
 
-    let lock_path = dir.join("mod.lock");
+    let lock_path = dir.join("quiver.lock");
     if lock_path.exists() {
         let mut lockfile = lockfile::Lockfile::from_path(&lock_path)?;
         lockfile
             .packages
             .retain(|p| !(p.name == name && p.kind == lockfile::LockedPackageKind::Script));
         lockfile.write_to(&lock_path)?;
-        eprintln!("Updated mod.lock");
+        eprintln!("Updated quiver.lock");
     }
 
     eprintln!("Regenerating activate.nu...");

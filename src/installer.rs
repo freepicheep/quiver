@@ -35,7 +35,7 @@ struct NupmMetadataHints {
 /// Run a full local install: resolve → fetch → checksum → place → lock.
 pub fn install(project_dir: &Path, frozen: bool) -> Result<()> {
     let manifest = Manifest::from_dir(project_dir)?;
-    let lock_path = project_dir.join("mod.lock");
+    let lock_path = project_dir.join("quiver.lock");
     let modules_dir = project_dir.join(MODULES_DIR);
     let scripts_dir = project_dir.join(SCRIPTS_DIR);
 
@@ -51,7 +51,7 @@ pub fn install(project_dir: &Path, frozen: bool) -> Result<()> {
         // --frozen: use lockfile only
         if !lock_path.exists() {
             return Err(crate::error::NuanceError::Lockfile(
-                "mod.lock not found (required with --frozen)".to_string(),
+                "quiver.lock not found (required with --frozen)".to_string(),
             ));
         }
         let lockfile = Lockfile::from_path(&lock_path)?;
@@ -124,7 +124,7 @@ pub fn install(project_dir: &Path, frozen: bool) -> Result<()> {
 
 /// Run an update: always re-resolve, ignoring existing lockfile.
 pub fn update(project_dir: &Path) -> Result<()> {
-    let lock_path = project_dir.join("mod.lock");
+    let lock_path = project_dir.join("quiver.lock");
     // Remove existing lockfile to force re-resolution
     if lock_path.exists() {
         std::fs::remove_file(&lock_path)?;
@@ -999,7 +999,7 @@ mod tests {
         let root = make_temp_dir("install_resolved_empty_scripts");
         let modules_dir = root.join(".nu_modules");
         let scripts_dir = root.join(".nu_scripts");
-        let lock_path = root.join("mod.lock");
+        let lock_path = root.join("quiver.lock");
 
         install_resolved(
             &[],

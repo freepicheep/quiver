@@ -3,7 +3,7 @@ use std::path::Path;
 
 use crate::error::Result;
 
-/// The `mod.lock` lockfile.
+/// The `quiver.lock` lockfile.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Lockfile {
     pub version: u32,
