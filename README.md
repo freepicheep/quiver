@@ -1,8 +1,16 @@
-# Nuance
+<!-- LOGO -->
+<h1>
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/5bd69aeb-3c42-4a5e-8281-65b18748a43c" alt="Logo" width="128">
+  <br>Quiver
+</h1>
+  <p align="center">
+    A fast dependency manager for [Nushell](https://www.nushell.sh/).
+    <br />
+  </p>
+</p>
 
-A dependency manager for [Nushell](https://www.nushell.sh/).
-
-Nuance handles dependency resolution, fetching, and lockfile management for Nushell modules and script dependencies distributed as git repositories.
+Quiver handles dependency resolution, fetching, and lockfile management for Nushell modules and script dependencies distributed as git repositories.
 
 ## Install
 
@@ -82,7 +90,7 @@ Running `qv install` fetches module dependencies into `.nu_modules/` and script 
 
 To make installed modules/scripts available to `use` in Nushell without full paths, add the project's dependency directories to `$env.NU_LIB_DIRS`.
 
-Nuance provides two ways to do this:
+Quiver provides two ways to do this:
 
 ### 1. Manual Activation (Recommended)
 `qv install` and `qv init` generate activation scripts for both dependency kinds:
@@ -157,7 +165,7 @@ Script dependencies must include `path` and exactly one of `tag`, `branch`, or `
 
 ## Global config (`~/.config/quiver/config.toml`)
 
-You can set a default git provider used for `owner/repo` shorthand in `quiver add`.
+You can set a default git provider used for `owner/repo` shorthand in `qv add`.
 Global config manages global module dependencies and global script dependencies.
 
 Global scripts install into:
