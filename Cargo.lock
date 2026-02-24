@@ -482,21 +482,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
 
 [[package]]
-name = "nuance"
-version = "0.2.1"
-dependencies = [
- "clap",
- "dirs",
- "git2",
- "hex",
- "serde",
- "sha2",
- "thiserror",
- "toml",
- "walkdir",
-]
-
-[[package]]
 name = "once_cell_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -554,6 +539,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8fd00f0bb2e90d81d1044c2b32617f68fcb9fa3bb7640c23e9c748e53fb30934"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "quiver"
+version = "0.2.1"
+dependencies = [
+ "clap",
+ "dirs",
+ "git2",
+ "hex",
+ "serde",
+ "sha2",
+ "thiserror",
+ "toml",
+ "walkdir",
 ]
 
 [[package]]

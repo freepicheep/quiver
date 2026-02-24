@@ -134,8 +134,8 @@ fn resolve_deps(
         );
 
         // Check for transitive dependencies
-        // Export the dep to a temp dir to read its mod.toml
-        let tmp = std::env::temp_dir().join("nuance_resolve").join(name);
+        // Export the dep to a temp dir to read its nupackage.toml
+        let tmp = std::env::temp_dir().join("quiver_resolve").join(name);
         git::export_to(&repo_path, &rev, &tmp)?;
 
         if let Ok(dep_manifest) = Manifest::from_dir(&tmp) {

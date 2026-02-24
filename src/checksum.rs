@@ -48,7 +48,7 @@ mod tests {
 
     #[test]
     fn hash_is_deterministic() {
-        let dir = std::env::temp_dir().join("nuance_test_checksum");
+        let dir = std::env::temp_dir().join("quiver_test_checksum");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(dir.join("sub")).unwrap();
         fs::write(dir.join("a.txt"), "hello").unwrap();
@@ -64,7 +64,7 @@ mod tests {
 
     #[test]
     fn hash_changes_with_content() {
-        let dir = std::env::temp_dir().join("nuance_test_checksum2");
+        let dir = std::env::temp_dir().join("quiver_test_checksum2");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("file.txt"), "version1").unwrap();
@@ -80,7 +80,7 @@ mod tests {
 
     #[test]
     fn file_hash_changes_with_content() {
-        let dir = std::env::temp_dir().join("nuance_test_checksum_file");
+        let dir = std::env::temp_dir().join("quiver_test_checksum_file");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let file = dir.join("script.nu");

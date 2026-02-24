@@ -47,7 +47,7 @@ fn normalize_provider_base_url(provider: &str) -> Option<String> {
     None
 }
 
-/// The global nuance config file: `~/.config/nuance/config.toml`.
+/// The global quiver config file: `~/.config/quiver/config.toml`.
 ///
 /// Tracks globally-installed modules/scripts and optional path overrides.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -167,7 +167,7 @@ impl GlobalConfig {
     /// Returns the directory where global modules should be installed.
     ///
     /// Uses the `modules_dir` override if set, otherwise falls back to
-    /// `~/.config/nushell/vendor/nuance/modules/`.
+    /// `~/.config/nushell/vendor/quiver/modules/`.
     pub fn modules_dir(&self) -> Result<PathBuf> {
         if let Some(ref custom) = self.modules_dir {
             Ok(PathBuf::from(custom))
@@ -179,7 +179,7 @@ impl GlobalConfig {
     /// Returns the directory where global scripts should be installed.
     ///
     /// Uses the `scripts_dir` override if set, otherwise falls back to
-    /// `~/.config/nushell/vendor/nuance/scripts/`.
+    /// `~/.config/nushell/vendor/quiver/scripts/`.
     pub fn scripts_dir(&self) -> Result<PathBuf> {
         if let Some(ref custom) = self.scripts_dir {
             Ok(PathBuf::from(custom))
@@ -218,57 +218,57 @@ impl GlobalConfig {
     }
 }
 
-/// Returns the global config directory: `~/.config/nuance/`.
+/// Returns the global config directory: `~/.config/quiver/`.
 pub fn global_config_dir() -> Result<PathBuf> {
     let home = dirs::home_dir()
         .ok_or_else(|| NuanceError::Config("could not determine home directory".to_string()))?;
-    Ok(home.join(".config").join("nuance"))
+    Ok(home.join(".config").join("quiver"))
 }
 
-/// Returns the path to the global config file: `~/.config/nuance/config.toml`.
+/// Returns the path to the global config file: `~/.config/quiver/config.toml`.
 pub fn global_config_path() -> Result<PathBuf> {
     Ok(global_config_dir()?.join("config.toml"))
 }
 
-/// Returns the path to the global lockfile: `~/.config/nuance/config.lock`.
+/// Returns the path to the global lockfile: `~/.config/quiver/config.lock`.
 pub fn global_lock_path() -> Result<PathBuf> {
     Ok(global_config_dir()?.join("config.lock"))
 }
 
 /// Returns the default global modules directory, using the platform config
-/// directory (where Nushell stores its config) + `vendor/nuance/modules/`.
+/// directory (where Nushell stores its config) + `vendor/quiver/modules/`.
 ///
-/// e.g. `~/Library/Application Support/nushell/vendor/nuance/modules/` on macOS,
-///      `~/.config/nushell/vendor/nuance/modules/` on Linux.
+/// e.g. `~/Library/Application Support/nushell/vendor/quiver/modules/` on macOS,
+///      `~/.config/nushell/vendor/quiver/modules/` on Linux.
 pub fn global_modules_dir() -> Result<PathBuf> {
     let config = dirs::config_dir()
         .ok_or_else(|| NuanceError::Config("could not determine config directory".to_string()))?;
     Ok(config
         .join("nushell")
         .join("vendor")
-        .join("nuance")
+        .join("quiver")
         .join("modules"))
 }
 
 /// Returns the default global scripts directory, using the platform config
-/// directory + `nushell/vendor/nuance/scripts/`.
+/// directory + `nushell/vendor/quiver/scripts/`.
 ///
-/// e.g. `~/Library/Application Support/nushell/vendor/nuance/scripts/` on macOS,
-///      `~/.config/nushell/vendor/nuance/scripts/` on Linux.
+/// e.g. `~/Library/Application Support/nushell/vendor/quiver/scripts/` on macOS,
+///      `~/.config/nushell/vendor/quiver/scripts/` on Linux.
 pub fn global_scripts_dir() -> Result<PathBuf> {
     let config = dirs::config_dir()
         .ok_or_else(|| NuanceError::Config("could not determine config directory".to_string()))?;
     Ok(config
         .join("nushell")
         .join("vendor")
-        .join("nuance")
+        .join("quiver")
         .join("scripts"))
 }
 
 /// Returns the default global autoload scripts directory.
 ///
-/// e.g. `~/Library/Application Support/nushell/vendor/nuance/scripts/autoload/` on macOS,
-///      `~/.config/nushell/vendor/nuance/scripts/autoload/` on Linux.
+/// e.g. `~/Library/Application Support/nushell/vendor/quiver/scripts/autoload/` on macOS,
+///      `~/.config/nushell/vendor/quiver/scripts/autoload/` on Linux.
 pub fn global_scripts_autoload_dir() -> Result<PathBuf> {
     Ok(global_scripts_dir()?.join("autoload"))
 }
@@ -376,8 +376,8 @@ mod tests {
             scripts: HashMap::new(),
         };
         let dir = config.modules_dir().unwrap();
-        // Should end with nushell/vendor/nuance/modules
-        assert!(dir.ends_with("nushell/vendor/nuance/modules"));
+        // Should end with nushell/vendor/quiver/modules
+        assert!(dir.ends_with("nushell/vendor/quiver/modules"));
     }
 
     #[test]
@@ -390,7 +390,7 @@ mod tests {
             scripts: HashMap::new(),
         };
         let dir = config.scripts_dir().unwrap();
-        assert!(dir.ends_with("nushell/vendor/nuance/scripts"));
+        assert!(dir.ends_with("nushell/vendor/quiver/scripts"));
     }
 
     #[test]
@@ -403,7 +403,7 @@ mod tests {
             scripts: HashMap::new(),
         };
         let dir = config.scripts_autoload_dir().unwrap();
-        assert!(dir.ends_with("nushell/vendor/nuance/scripts/autoload"));
+        assert!(dir.ends_with("nushell/vendor/quiver/scripts/autoload"));
     }
 
     #[test]
@@ -425,19 +425,19 @@ mod tests {
     fn config_dir_paths() {
         // These should not error on any platform with a home directory
         let dir = global_config_dir().unwrap();
-        assert!(dir.ends_with("nuance"));
+        assert!(dir.ends_with("quiver"));
 
         let path = global_config_path().unwrap();
-        assert!(path.ends_with("nuance/config.toml"));
+        assert!(path.ends_with("quiver/config.toml"));
 
         let lock = global_lock_path().unwrap();
-        assert!(lock.ends_with("nuance/config.lock"));
+        assert!(lock.ends_with("quiver/config.lock"));
     }
 
     #[test]
     fn missing_provider_defaults_to_github() {
         let toml = r#"
-modules_dir = "/tmp/nuance-modules"
+modules_dir = "/tmp/quiver-modules"
 
 [dependencies]
 "#;
@@ -491,7 +491,7 @@ modules_dir = "/tmp/nuance-modules"
     #[test]
     fn missing_scripts_defaults_to_empty() {
         let toml = r#"
-modules_dir = "/tmp/nuance-modules"
+modules_dir = "/tmp/quiver-modules"
 
 [dependencies]
 "#;
