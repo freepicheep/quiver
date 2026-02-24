@@ -118,8 +118,8 @@ fn cmd_init(
         std::fs::write(
             &mod_nu,
             r#"# Module entry point
-            # Export your commands here with: export use <submodule>
-            # Use installed modules with: use ../.nu_modules/module-name/module-name *
+# Export your commands here with: export use <submodule>
+# Use installed modules with: use ../.nu-env/modules/module-name/module-name *
             "#,
         )?;
         eprintln!("Created {}", mod_nu.display());
@@ -244,11 +244,11 @@ fn cmd_remove(dir: &Path, name: String) -> Result<()> {
     std::fs::write(dir.join("nupackage.toml"), content)?;
     eprintln!("Removed module '{name}' from nupackage.toml");
 
-    // Remove from .nu_modules/
-    let module_dir = dir.join(".nu_modules").join(&name);
+    // Remove from .nu-env/modules/
+    let module_dir = dir.join(".nu-env").join("modules").join(&name);
     if module_dir.exists() {
         std::fs::remove_dir_all(&module_dir)?;
-        eprintln!("Removed .nu_modules/{name}/");
+        eprintln!("Removed .nu-env/modules/{name}/");
     }
 
     // Update lockfile: remove the package entry
@@ -324,12 +324,12 @@ $env.config.hooks.env_change.PWD = (
 
         # Remove previous directory's modules if it was a quiver project
         if ($before | is-not-empty) and ($before | path join "nupackage.toml" | path exists) {
-            let old_modules = ($before | path join ".nu_modules")
+            let old_modules = ($before | path join ".nu-env" "modules")
             $env.NU_LIB_DIRS = ($env.NU_LIB_DIRS | default [] | where {|it| $it != $old_modules })
         }
         # Add new directory's modules if it is a quiver project
         if ($after | is-not-empty) and ($after | path join "nupackage.toml" | path exists) {
-            let new_modules = ($after | path join ".nu_modules")
+            let new_modules = ($after | path join ".nu-env" "modules")
             if ($new_modules | path exists) and ($new_modules not-in ($env.NU_LIB_DIRS | default [])) {
                 $env.NU_LIB_DIRS = ($env.NU_LIB_DIRS | default [] | append $new_modules)
             }
@@ -347,7 +347,7 @@ fn cmd_version() -> Result<()> {
 
 fn cmd_list(cwd: &Path) -> Result<()> {
     if cwd.join("nupackage.toml").exists() {
-        let modules_dir = cwd.join(".nu_modules");
+        let modules_dir = cwd.join(".nu-env").join("modules");
         let modules = list_installed_module_names(&modules_dir)?;
 
         if modules.is_empty() {
