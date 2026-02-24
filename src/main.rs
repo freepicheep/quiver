@@ -9,6 +9,7 @@ mod manifest;
 mod resolver;
 
 use std::path::Path;
+use std::process::Command;
 
 use cli::Commands;
 use config::GlobalConfig;
@@ -92,10 +93,10 @@ fn cmd_init(
         package: Package {
             name: pkg_name.clone(),
             version,
-            description,
-            license: None,
-            authors: None,
-            nu_version: None,
+            description: Some(description.unwrap_or_default()),
+            license: Some(String::new()),
+            authors: Some(Vec::new()),
+            nu_version: Some(detect_nu_version().unwrap_or_default()),
         },
         dependencies: Default::default(),
     };
@@ -488,6 +489,21 @@ fn auto_detect_dep_spec(
             rev,
             branch,
         })
+    }
+}
+
+fn detect_nu_version() -> Option<String> {
+    let output = Command::new("nu").arg("--version").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let version = stdout.trim();
+    if version.is_empty() {
+        None
+    } else {
+        Some(version.to_string())
     }
 }
 
