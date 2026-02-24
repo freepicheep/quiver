@@ -5,23 +5,13 @@ use crate::checksum;
 use crate::error::{NuanceError, Result};
 use crate::git::{self, RefKind};
 use crate::lockfile::{LockedPackage, LockedPackageKind};
-use crate::manifest::{DependencySpec, Manifest, ScriptDependencySpec};
+use crate::manifest::{DependencySpec, Manifest};
 
 /// A fully resolved dependency.
 #[derive(Debug, Clone)]
 pub struct ResolvedDep {
     pub name: String,
     pub git: String,
-    pub tag: Option<String>,
-    pub rev: String,
-}
-
-/// A fully resolved script dependency.
-#[derive(Debug, Clone)]
-pub struct ResolvedScriptDep {
-    pub name: String,
-    pub git: String,
-    pub path: String,
     pub tag: Option<String>,
     pub rev: String,
 }
@@ -50,49 +40,6 @@ pub fn resolve_from_lock(locked: &[LockedPackage]) -> Vec<ResolvedDep> {
             git: p.git.clone(),
             tag: p.tag.clone(),
             rev: p.rev.clone(),
-        })
-        .collect()
-}
-
-/// Resolve scripts from a pre-built script dependency map.
-pub fn resolve_scripts_from_deps(
-    deps: &HashMap<String, ScriptDependencySpec>,
-) -> Result<Vec<ResolvedScriptDep>> {
-    let mut resolved = Vec::new();
-
-    for (name, spec) in deps {
-        eprintln!("  Fetching script {name} from {}...", spec.git);
-        let repo_path = git::clone_or_fetch(&spec.git)?;
-
-        let kind = RefKind::from_spec(&spec.tag, &spec.rev, &spec.branch);
-        let rev = git::resolve_ref(&repo_path, spec.ref_spec(), kind)?;
-
-        resolved.push(ResolvedScriptDep {
-            name: name.clone(),
-            git: spec.git.clone(),
-            path: spec.path.clone(),
-            tag: spec.tag.clone(),
-            rev,
-        });
-    }
-
-    resolved.sort_by(|a, b| a.name.cmp(&b.name));
-    Ok(resolved)
-}
-
-/// Resolve scripts from an existing lockfile without re-fetching.
-pub fn resolve_scripts_from_lock(locked: &[LockedPackage]) -> Vec<ResolvedScriptDep> {
-    locked
-        .iter()
-        .filter(|p| p.kind == LockedPackageKind::Script)
-        .filter_map(|p| {
-            p.path.as_ref().map(|path| ResolvedScriptDep {
-                name: p.name.clone(),
-                git: p.git.clone(),
-                path: path.clone(),
-                tag: p.tag.clone(),
-                rev: p.rev.clone(),
-            })
         })
         .collect()
 }
@@ -157,11 +104,6 @@ pub fn compute_checksum(dir: &Path) -> Result<String> {
     checksum::hash_directory(dir)
 }
 
-/// Compute the SHA-256 checksum of a single file.
-pub fn compute_checksum_file(path: &Path) -> Result<String> {
-    checksum::hash_file(path)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -192,9 +134,8 @@ mod tests {
         );
 
         // This would try to fetch from git which we can't do in a unit test,
-        // so we test the conflict logic directly
-        // In a real scenario, resolve_deps would detect the conflict after resolving
-        // For now, just verify the data structure works
+        // so we test the conflict logic directly.
         assert!(resolved.contains_key("my-dep"));
+        assert!(deps.contains_key("my-dep"));
     }
 }

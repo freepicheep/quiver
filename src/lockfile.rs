@@ -27,12 +27,16 @@ pub struct LockedPackage {
 }
 
 /// The kind of installed artifact in the lockfile.
+///
+/// Today only modules are installed. Unknown kinds are preserved for forward
+/// compatibility and ignored by module-only install paths.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum LockedPackageKind {
     #[default]
     Module,
-    Script,
+    #[serde(other)]
+    Other,
 }
 
 impl LockedPackageKind {
@@ -102,15 +106,6 @@ mod tests {
                     path: None,
                     sha256: "def456".to_string(),
                 },
-                LockedPackage {
-                    name: "quickfix".to_string(),
-                    kind: LockedPackageKind::Script,
-                    git: "https://github.com/someuser/nu-scripts".to_string(),
-                    tag: Some("v0.5.0".to_string()),
-                    rev: "9a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b".to_string(),
-                    path: Some("scripts/quickfix.nu".to_string()),
-                    sha256: "ghi789".to_string(),
-                },
             ],
         }
     }
@@ -133,14 +128,6 @@ mod tests {
             .unwrap();
         assert_eq!(pkg.rev, "d4e8f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8");
         assert_eq!(pkg.path, None);
-        assert!(
-            lock.find_package("quickfix", LockedPackageKind::Script)
-                .is_some()
-        );
-        assert!(
-            lock.find_package("quickfix", LockedPackageKind::Module)
-                .is_none()
-        );
         assert!(
             lock.find_package("nonexistent", LockedPackageKind::Module)
                 .is_none()
@@ -168,24 +155,19 @@ sha256 = "abc123"
     }
 
     #[test]
-    fn parse_script_format() {
+    fn parse_unknown_kind_as_other() {
         let toml = r#"
 version = 1
 
 [[package]]
-name = "quickfix"
-kind = "script"
-git = "https://github.com/someuser/nu-scripts"
+name = "future-artifact"
+kind = "plugin"
+git = "https://github.com/someuser/future"
 tag = "v0.5.0"
 rev = "9a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b"
-path = "scripts/quickfix.nu"
 sha256 = "ghi789"
 "#;
         let lock = Lockfile::from_str(toml).unwrap();
-        assert_eq!(lock.packages[0].kind, LockedPackageKind::Script);
-        assert_eq!(
-            lock.packages[0].path.as_deref(),
-            Some("scripts/quickfix.nu")
-        );
+        assert_eq!(lock.packages[0].kind, LockedPackageKind::Other);
     }
 }

@@ -33,14 +33,6 @@ pub fn hash_directory(dir: &Path) -> Result<String> {
     Ok(hex::encode(hasher.finalize()))
 }
 
-/// Compute SHA-256 over a single file's contents.
-pub fn hash_file(path: &Path) -> Result<String> {
-    let mut hasher = Sha256::new();
-    let contents = std::fs::read(path)?;
-    hasher.update(&contents);
-    Ok(hex::encode(hasher.finalize()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

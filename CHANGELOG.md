@@ -1,6 +1,12 @@
 # Unreleased
 
-Nothing.
+## Removed
+- Removed script dependency installation from quiver.
+- Removed `add-script` / `remove-script` commands and `.nu_scripts` activation flow.
+
+## Changed
+- Simplified install, list, hook, and global config flows to module-only behavior.
+- Kept lockfile artifact kind support forward-compatible for future dependency kinds (for example plugins).
 
 # Version 0.2.1 (2026-02-23)
 

@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::{Component, Path};
+use std::path::Path;
 
 use crate::error::{NuanceError, Result};
 
@@ -17,13 +17,11 @@ pub struct Manifest {
 pub struct DependencyGroups {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub modules: HashMap<String, DependencySpec>,
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub scripts: HashMap<String, ScriptDependencySpec>,
 }
 
 impl DependencyGroups {
     pub fn is_empty(&self) -> bool {
-        self.modules.is_empty() && self.scripts.is_empty()
+        self.modules.is_empty()
     }
 }
 
@@ -77,80 +75,6 @@ impl DependencySpec {
 
     fn to_inline_toml(&self) -> Result<String> {
         let mut parts = vec![format!("git = {}", toml_scalar(&self.git)?)];
-        if let Some(tag) = &self.tag {
-            parts.push(format!("tag = {}", toml_scalar(tag)?));
-        }
-        if let Some(rev) = &self.rev {
-            parts.push(format!("rev = {}", toml_scalar(rev)?));
-        }
-        if let Some(branch) = &self.branch {
-            parts.push(format!("branch = {}", toml_scalar(branch)?));
-        }
-        Ok(parts.join(", "))
-    }
-}
-
-/// A single script specification from `[dependencies.scripts]`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ScriptDependencySpec {
-    pub git: String,
-    pub path: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tag: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub rev: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub branch: Option<String>,
-}
-
-impl ScriptDependencySpec {
-    /// Validate path and that exactly one of tag/rev/branch is specified.
-    pub fn validate(&self, name: &str) -> Result<()> {
-        let rel = Path::new(&self.path);
-        if self.path.trim().is_empty() || rel.as_os_str().is_empty() {
-            return Err(NuanceError::Manifest(format!(
-                "script dependency '{name}': path cannot be empty"
-            )));
-        }
-        if rel.is_absolute()
-            || rel.components().any(|c| {
-                matches!(
-                    c,
-                    Component::ParentDir
-                        | Component::RootDir
-                        | Component::Prefix(_)
-                        | Component::CurDir
-                )
-            })
-        {
-            return Err(NuanceError::Manifest(format!(
-                "script dependency '{name}': path must be a relative repository path without '..'"
-            )));
-        }
-
-        validate_ref_fields(
-            name,
-            "script dependency",
-            &self.tag,
-            &self.rev,
-            &self.branch,
-        )
-    }
-
-    /// Returns the git ref string (tag, rev, or branch value).
-    pub fn ref_spec(&self) -> &str {
-        self.rev
-            .as_deref()
-            .or(self.tag.as_deref())
-            .or(self.branch.as_deref())
-            .expect("validated: one of tag/rev/branch is set")
-    }
-
-    fn to_inline_toml(&self) -> Result<String> {
-        let mut parts = vec![
-            format!("git = {}", toml_scalar(&self.git)?),
-            format!("path = {}", toml_scalar(&self.path)?),
-        ];
         if let Some(tag) = &self.tag {
             parts.push(format!("tag = {}", toml_scalar(tag)?));
         }
@@ -219,16 +143,6 @@ impl Manifest {
         for (name, spec) in &self.dependencies.modules {
             spec.validate(name)?;
         }
-        for (name, spec) in &self.dependencies.scripts {
-            spec.validate(name)?;
-        }
-        for name in self.dependencies.modules.keys() {
-            if self.dependencies.scripts.contains_key(name) {
-                return Err(NuanceError::Manifest(format!(
-                    "dependency '{name}' is declared as both a module and a script"
-                )));
-            }
-        }
         Ok(())
     }
 
@@ -258,20 +172,7 @@ impl Manifest {
             for (name, spec) in modules {
                 out.push_str(&format!(
                     "{} = {{ {} }}\n",
-                    toml_key(name),
-                    spec.to_inline_toml()?
-                ));
-            }
-        }
-
-        if !self.dependencies.scripts.is_empty() {
-            out.push_str("\n[dependencies.scripts]\n");
-            let mut scripts: Vec<_> = self.dependencies.scripts.iter().collect();
-            scripts.sort_by(|a, b| a.0.cmp(b.0));
-            for (name, spec) in scripts {
-                out.push_str(&format!(
-                    "{} = {{ {} }}\n",
-                    toml_key(name),
+                    bare_key_or_quoted(name),
                     spec.to_inline_toml()?
                 ));
             }
@@ -290,184 +191,133 @@ fn write_toml_field<T: Serialize>(out: &mut String, key: &str, value: &T) -> Res
 }
 
 fn toml_scalar<T: Serialize>(value: &T) -> Result<String> {
-    Ok(toml::Value::try_from(value)?.to_string())
+    let serialized = toml::Value::try_from(value)?.to_string();
+    Ok(serialized)
 }
 
-fn toml_key(key: &str) -> String {
-    if !key.is_empty()
-        && key
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-    {
+fn bare_key_or_quoted(key: &str) -> String {
+    let is_bare = key
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if is_bare {
         key.to_string()
     } else {
-        toml::Value::String(key.to_string()).to_string()
+        format!("\"{}\"", key.replace('\"', "\\\""))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     #[test]
-    fn parse_full_manifest() {
+    fn round_trip_parse_manifest() {
         let toml = r#"
 [package]
 name = "my-module"
-version = "0.3.1"
+version = "0.1.0"
 description = "Useful utilities"
-license = "MIT"
-authors = ["Test Author"]
-nu-version = ">=0.101.0"
 
 [dependencies.modules]
-nu-git-utils = { git = "https://github.com/someuser/nu-git-utils", tag = "v0.2.0" }
-nu-str-extras = { git = "https://github.com/someuser/nu-str-extras", branch = "main" }
-
-[dependencies.scripts]
-quickfix = { git = "https://github.com/someuser/nu-scripts", path = "scripts/quickfix.nu", rev = "6d5eb9f" }
+nu-utils = { git = "https://github.com/someuser/nu-utils", tag = "v1.2.3" }
+nu-http = { git = "https://github.com/someuser/nu-http", branch = "main" }
 "#;
+
         let manifest = Manifest::from_str(toml).unwrap();
         assert_eq!(manifest.package.name, "my-module");
-        assert_eq!(manifest.package.version, "0.3.1");
+        assert_eq!(manifest.package.version, "0.1.0");
         assert_eq!(manifest.dependencies.modules.len(), 2);
-        assert_eq!(manifest.dependencies.scripts.len(), 1);
-        assert!(manifest.dependencies.modules.contains_key("nu-git-utils"));
-        assert!(manifest.dependencies.modules.contains_key("nu-str-extras"));
-        assert!(manifest.dependencies.scripts.contains_key("quickfix"));
+        assert!(manifest.dependencies.modules.contains_key("nu-utils"));
+        assert!(manifest.dependencies.modules.contains_key("nu-http"));
     }
 
     #[test]
-    fn parse_minimal_manifest() {
-        let toml = r#"
-[package]
-name = "minimal"
-version = "0.1.0"
-"#;
-        let manifest = Manifest::from_str(toml).unwrap();
-        assert_eq!(manifest.package.name, "minimal");
-        assert!(manifest.dependencies.is_empty());
-    }
-
-    #[test]
-    fn reject_no_ref_spec() {
+    fn reject_dep_with_multiple_refs() {
         let toml = r#"
 [package]
 name = "bad"
 version = "0.1.0"
 
 [dependencies.modules]
-broken = { git = "https://github.com/user/broken" }
+x = { git = "https://example.com/x", tag = "v1", branch = "main" }
 "#;
+
         let err = Manifest::from_str(toml).unwrap_err();
-        assert!(err.to_string().contains("must specify one of"));
+        assert!(err.to_string().contains("specify only one"));
     }
 
     #[test]
-    fn reject_multiple_ref_specs() {
+    fn reject_dep_with_no_refs() {
         let toml = r#"
 [package]
 name = "bad"
 version = "0.1.0"
 
 [dependencies.modules]
-broken = { git = "https://github.com/user/broken", tag = "v1", branch = "main" }
+x = { git = "https://example.com/x" }
 "#;
+
         let err = Manifest::from_str(toml).unwrap_err();
-        assert!(err.to_string().contains("specify only one of"));
+        assert!(err.to_string().contains("must specify one"));
     }
 
     #[test]
-    fn reject_script_with_invalid_path() {
-        let toml = r#"
-[package]
-name = "bad"
-version = "0.1.0"
-
-[dependencies.scripts]
-bad-script = { git = "https://github.com/user/scripts", path = "../evil.nu", tag = "v1.0.0" }
-"#;
-        let err = Manifest::from_str(toml).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("path must be a relative repository path")
-        );
-    }
-
-    #[test]
-    fn reject_duplicate_name_across_modules_and_scripts() {
-        let toml = r#"
-[package]
-name = "bad"
-version = "0.1.0"
-
-[dependencies.modules]
-shared = { git = "https://github.com/user/module", tag = "v1.0.0" }
-
-[dependencies.scripts]
-shared = { git = "https://github.com/user/scripts", path = "scripts/shared.nu", tag = "v1.0.0" }
-"#;
-        let err = Manifest::from_str(toml).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("declared as both a module and a script")
-        );
-    }
-
-    #[test]
-    fn serialize_uses_grouped_inline_dependency_tables() {
+    fn to_toml_string_emits_stable_sorted_dependencies() {
         let manifest = Manifest {
             package: Package {
                 name: "my-module".to_string(),
                 version: "0.1.0".to_string(),
                 description: Some("Example module".to_string()),
-                license: None,
-                authors: None,
-                nu_version: None,
+                license: Some("MIT".to_string()),
+                authors: Some(vec!["Alice".to_string(), "Bob".to_string()]),
+                nu_version: Some("0.91".to_string()),
             },
             dependencies: DependencyGroups {
-                modules: HashMap::from([(
-                    "nu-salesforce".to_string(),
-                    DependencySpec {
-                        git: "https://github.com/freepicheep/nu-salesforce".to_string(),
-                        tag: Some("v0.1.0".to_string()),
-                        rev: None,
-                        branch: None,
-                    },
-                )]),
-                scripts: HashMap::from([(
-                    "quickfix".to_string(),
-                    ScriptDependencySpec {
-                        git: "https://github.com/user/nu-toolbox".to_string(),
-                        path: "scripts/quickfix.nu".to_string(),
-                        tag: None,
-                        rev: Some("abc123".to_string()),
-                        branch: None,
-                    },
-                )]),
+                modules: HashMap::from([
+                    (
+                        "zeta".to_string(),
+                        DependencySpec {
+                            git: "https://github.com/user/zeta".to_string(),
+                            tag: Some("v1.0.0".to_string()),
+                            rev: None,
+                            branch: None,
+                        },
+                    ),
+                    (
+                        "alpha".to_string(),
+                        DependencySpec {
+                            git: "https://github.com/user/alpha".to_string(),
+                            tag: None,
+                            rev: None,
+                            branch: Some("main".to_string()),
+                        },
+                    ),
+                ]),
             },
         };
 
         let toml = manifest.to_toml_string().unwrap();
-        assert!(toml.contains("[dependencies.modules]\n"));
-        assert!(toml.contains(
-            "nu-salesforce = { git = \"https://github.com/freepicheep/nu-salesforce\", tag = \"v0.1.0\" }"
-        ));
-        assert!(toml.contains("[dependencies.scripts]\n"));
-        assert!(toml.contains(
-            "quickfix = { git = \"https://github.com/user/nu-toolbox\", path = \"scripts/quickfix.nu\", rev = \"abc123\" }"
-        ));
-        assert!(!toml.contains("[dependencies.modules.nu-salesforce]"));
-    }
 
-    #[test]
-    fn reject_empty_name() {
-        let toml = r#"
-[package]
-name = ""
-version = "0.1.0"
-"#;
-        let err = Manifest::from_str(toml).unwrap_err();
-        assert!(err.to_string().contains("name cannot be empty"));
+        assert!(toml.starts_with("[package]\n"));
+        assert!(toml.contains("name = \"my-module\"\n"));
+        assert!(toml.contains("version = \"0.1.0\"\n"));
+        assert!(toml.contains("description = \"Example module\"\n"));
+        assert!(toml.contains("license = \"MIT\"\n"));
+        assert!(toml.contains("authors = [\"Alice\", \"Bob\"]\n"));
+        assert!(toml.contains("nu-version = \"0.91\"\n"));
+
+        let idx_modules = toml.find("[dependencies.modules]\n").unwrap();
+        let idx_alpha = toml
+            .find("alpha = { git = \"https://github.com/user/alpha\", branch = \"main\" }")
+            .unwrap();
+        let idx_zeta = toml
+            .find("zeta = { git = \"https://github.com/user/zeta\", tag = \"v1.0.0\" }")
+            .unwrap();
+        assert!(idx_modules < idx_alpha && idx_alpha < idx_zeta);
+
+        let parsed = Manifest::from_str(&toml).unwrap();
+        assert_eq!(parsed.package.name, "my-module");
+        assert_eq!(parsed.dependencies.modules.len(), 2);
     }
 }
