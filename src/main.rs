@@ -102,10 +102,10 @@ fn cmd_init(
     version: String,
     description: Option<String>,
 ) -> Result<()> {
-    let mod_toml = dir.join("mod.toml");
-    if mod_toml.exists() {
+    let nupackage_toml = dir.join("nupackage.toml");
+    if nupackage_toml.exists() {
         return Err(error::NuanceError::Manifest(
-            "mod.toml already exists in this directory".to_string(),
+            "nupackage.toml already exists in this directory".to_string(),
         ));
     }
 
@@ -130,8 +130,8 @@ fn cmd_init(
     };
 
     let content = manifest.to_toml_string()?;
-    std::fs::write(&mod_toml, content)?;
-    eprintln!("Created mod.toml for '{pkg_name}'");
+    std::fs::write(&nupackage_toml, content)?;
+    eprintln!("Created nupackage.toml for '{pkg_name}'");
 
     // Create <current-dir-name>/mod.nu if it doesn't exist.
     let module_dir_name = dir
@@ -195,7 +195,7 @@ fn cmd_add(
         || manifest.dependencies.scripts.contains_key(&pkg_name)
     {
         return Err(error::NuanceError::Manifest(format!(
-            "dependency '{pkg_name}' already exists in mod.toml"
+            "dependency '{pkg_name}' already exists in nupackage.toml"
         )));
     }
 
@@ -210,9 +210,9 @@ fn cmd_add(
         .modules
         .insert(pkg_name.clone(), dep_spec);
     let content = manifest.to_toml_string()?;
-    std::fs::write(dir.join("mod.toml"), content)?;
+    std::fs::write(dir.join("nupackage.toml"), content)?;
 
-    eprintln!("Added module '{pkg_name}' to mod.toml");
+    eprintln!("Added module '{pkg_name}' to nupackage.toml");
 
     // Run install
     installer::install(dir, false)
@@ -258,7 +258,7 @@ fn cmd_add_script(
         || manifest.dependencies.scripts.contains_key(&dep_name)
     {
         return Err(error::NuanceError::Manifest(format!(
-            "dependency '{dep_name}' already exists in mod.toml"
+            "dependency '{dep_name}' already exists in nupackage.toml"
         )));
     }
 
@@ -271,9 +271,9 @@ fn cmd_add_script(
         .insert(dep_name.clone(), script_spec);
 
     let content = manifest.to_toml_string()?;
-    std::fs::write(dir.join("mod.toml"), content)?;
+    std::fs::write(dir.join("nupackage.toml"), content)?;
 
-    eprintln!("Added script '{dep_name}' to mod.toml");
+    eprintln!("Added script '{dep_name}' to nupackage.toml");
     installer::install(dir, false)
 }
 
@@ -383,14 +383,14 @@ fn cmd_remove(dir: &Path, name: String) -> Result<()> {
     // Check the module dep exists
     if manifest.dependencies.modules.remove(&name).is_none() {
         return Err(error::NuanceError::Manifest(format!(
-            "module dependency '{name}' not found in mod.toml"
+            "module dependency '{name}' not found in nupackage.toml"
         )));
     }
 
     // Write updated manifest
     let content = manifest.to_toml_string()?;
-    std::fs::write(dir.join("mod.toml"), content)?;
-    eprintln!("Removed module '{name}' from mod.toml");
+    std::fs::write(dir.join("nupackage.toml"), content)?;
+    eprintln!("Removed module '{name}' from nupackage.toml");
 
     // Remove from .nu_modules/
     let module_dir = dir.join(".nu_modules").join(&name);
@@ -400,14 +400,14 @@ fn cmd_remove(dir: &Path, name: String) -> Result<()> {
     }
 
     // Update lockfile: remove the package entry
-    let lock_path = dir.join("mod.lock");
+    let lock_path = dir.join("quiver.lock");
     if lock_path.exists() {
         let mut lockfile = lockfile::Lockfile::from_path(&lock_path)?;
         lockfile
             .packages
             .retain(|p| !(p.name == name && p.kind == lockfile::LockedPackageKind::Module));
         lockfile.write_to(&lock_path)?;
-        eprintln!("Updated mod.lock");
+        eprintln!("Updated quiver.lock");
     }
 
     // Regenerate activate.nu from the updated manifest and lockfile state.
@@ -422,13 +422,13 @@ fn cmd_remove_script(dir: &Path, name: String) -> Result<()> {
 
     if manifest.dependencies.scripts.remove(&name).is_none() {
         return Err(error::NuanceError::Manifest(format!(
-            "script dependency '{name}' not found in mod.toml"
+            "script dependency '{name}' not found in nupackage.toml"
         )));
     }
 
     let content = manifest.to_toml_string()?;
-    std::fs::write(dir.join("mod.toml"), content)?;
-    eprintln!("Removed script '{name}' from mod.toml");
+    std::fs::write(dir.join("nupackage.toml"), content)?;
+    eprintln!("Removed script '{name}' from nupackage.toml");
 
     let script_path = dir.join(".nu_scripts").join(format!("{name}.nu"));
     if script_path.exists() {
@@ -436,14 +436,14 @@ fn cmd_remove_script(dir: &Path, name: String) -> Result<()> {
         eprintln!("Removed {}", script_path.display());
     }
 
-    let lock_path = dir.join("mod.lock");
+    let lock_path = dir.join("quiver.lock");
     if lock_path.exists() {
         let mut lockfile = lockfile::Lockfile::from_path(&lock_path)?;
         lockfile
             .packages
             .retain(|p| !(p.name == name && p.kind == lockfile::LockedPackageKind::Script));
         lockfile.write_to(&lock_path)?;
-        eprintln!("Updated mod.lock");
+        eprintln!("Updated quiver.lock");
     }
 
     eprintln!("Regenerating activate.nu...");
@@ -534,10 +534,10 @@ fn cmd_remove_global(name: String) -> Result<()> {
 }
 
 fn cmd_hook() -> Result<()> {
-    let hook_script = r#"# nuance auto-activate hook
+    let hook_script = r#"# quiver auto-activate hook
 # Add this to your Nushell environment by running:
 #   mkdir ($nu.default-config-dir | path join "vendor" "autoload")
-#   nuance hook | save -f ($nu.default-config-dir | path join "vendor" "autoload" "nuance_hook.nu")
+#   qv hook | save -f ($nu.default-config-dir | path join "vendor" "autoload" "quiver_hook.nu")
 # Once saved, it will be automatically sourced when you start Nushell.
 # You can add the above to your config.nu if you want any updates to the hook, but that may slow start time.
 
@@ -546,14 +546,14 @@ $env.config.hooks.env_change.PWD = (
         let before = ($before | default "")
         let after = ($after | default "")
 
-        # Remove previous directory's modules/scripts if it was a nuance project
-        if ($before | is-not-empty) and ($before | path join "mod.toml" | path exists) {
+        # Remove previous directory's modules/scripts if it was a quiver project
+        if ($before | is-not-empty) and ($before | path join "nupackage.toml" | path exists) {
             let old_modules = ($before | path join ".nu_modules")
             let old_scripts = ($before | path join ".nu_scripts")
             $env.NU_LIB_DIRS = ($env.NU_LIB_DIRS | default [] | where {|it| $it != $old_modules and $it != $old_scripts })
         }
-        # Add new directory's modules/scripts if it is a nuance project
-        if ($after | is-not-empty) and ($after | path join "mod.toml" | path exists) {
+        # Add new directory's modules/scripts if it is a quiver project
+        if ($after | is-not-empty) and ($after | path join "nupackage.toml" | path exists) {
             let new_modules = ($after | path join ".nu_modules")
             let new_scripts = ($after | path join ".nu_scripts")
             if ($new_modules | path exists) and ($new_modules not-in ($env.NU_LIB_DIRS | default [])) {
@@ -570,12 +570,12 @@ $env.config.hooks.env_change.PWD = (
 }
 
 fn cmd_version() -> Result<()> {
-    println!("nuance {}", env!("CARGO_PKG_VERSION"));
+    println!("quiver {}", env!("CARGO_PKG_VERSION"));
     Ok(())
 }
 
 fn cmd_list(cwd: &Path) -> Result<()> {
-    if cwd.join("mod.toml").exists() {
+    if cwd.join("nupackage.toml").exists() {
         let modules_dir = cwd.join(".nu_modules");
         let scripts_dir = cwd.join(".nu_scripts");
         let modules = list_installed_module_names(&modules_dir)?;
@@ -737,7 +737,7 @@ fn normalize_script_source(
 
     let path = input_path.ok_or_else(|| {
         error::NuanceError::Other(
-            "missing script path; use `nuance add-script <repo> <path>` or pass a full blob URL"
+            "missing script path; use `quiver add-script <repo> <path>` or pass a full blob URL"
                 .to_string(),
         )
     })?;
@@ -1012,7 +1012,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         let dir = std::env::temp_dir().join(format!(
-            "nuance_main_test_{}_{}_{}",
+            "quiver_main_test_{}_{}_{}",
             label,
             std::process::id(),
             unique
@@ -1170,7 +1170,7 @@ mod tests {
             .and_then(|n| n.to_str())
             .unwrap()
             .to_string();
-        assert!(project_dir.join("mod.toml").exists());
+        assert!(project_dir.join("nupackage.toml").exists());
         assert!(project_dir.join(&dir_name).join("mod.nu").exists());
         assert!(!project_dir.join("mod.nu").exists());
 
@@ -1189,7 +1189,7 @@ mod tests {
         )
         .unwrap();
 
-        let manifest_text = std::fs::read_to_string(project_dir.join("mod.toml")).unwrap();
+        let manifest_text = std::fs::read_to_string(project_dir.join("nupackage.toml")).unwrap();
         let manifest = Manifest::from_str(&manifest_text).unwrap();
         assert_eq!(manifest.package.name, "custom-module-name");
 

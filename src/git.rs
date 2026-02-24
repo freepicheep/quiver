@@ -4,11 +4,11 @@ use git2::{FetchOptions, RemoteCallbacks, Repository, build::RepoBuilder};
 
 use crate::error::{NuanceError, Result};
 
-/// Returns the global cache directory for git repos: `~/.cache/nuance/git/`.
+/// Returns the global cache directory for git repos: `~/.cache/quiver/git/`.
 pub fn cache_dir() -> Result<PathBuf> {
     let cache = dirs::cache_dir()
         .ok_or_else(|| NuanceError::Other("could not determine cache directory".to_string()))?;
-    Ok(cache.join("nuance").join("git"))
+    Ok(cache.join("quiver").join("git"))
 }
 
 /// Convert a git URL into a safe directory name for caching.

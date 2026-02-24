@@ -1,9 +1,10 @@
 use clap::{ArgAction, Parser, Subcommand};
 
-/// nuance — A module manager for Nushell
+/// Quiver — A module manager for Nushell
 #[derive(Parser, Debug)]
 #[command(
-    name = "nuance",
+    name = "quiver",
+    bin_name = "qv",
     version,
     about = "A module manager for Nushell",
     disable_version_flag = true
@@ -24,7 +25,7 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
-    /// Create a new mod.toml in the current directory
+    /// Create a new nupackage.toml in the current directory
     Init {
         /// Package name (defaults to current directory name)
         #[arg(long)]
@@ -39,9 +40,9 @@ pub enum Commands {
         description: Option<String>,
     },
 
-    /// Resolve and install dependencies from mod.toml
+    /// Resolve and install dependencies from nupackage.toml
     Install {
-        /// Install global modules/scripts (from ~/.config/nuance/config.toml)
+        /// Install global modules/scripts (from ~/.config/quiver/config.toml)
         #[arg(short = 'g', long)]
         global: bool,
 
@@ -55,7 +56,7 @@ pub enum Commands {
 
     /// Add a module dependency from a git URL or owner/repo shorthand
     Add {
-        /// Add to global config instead of local mod.toml
+        /// Add to global config instead of local nupackage.toml
         #[arg(short = 'g', long)]
         global: bool,
 
@@ -77,7 +78,7 @@ pub enum Commands {
 
     /// Add a script from a git URL or owner/repo shorthand
     AddScript {
-        /// Add to global config instead of local mod.toml
+        /// Add to global config instead of local nupackage.toml
         #[arg(short = 'g', long)]
         global: bool,
 
@@ -110,10 +111,10 @@ pub enum Commands {
         branch: Option<String>,
     },
 
-    /// Remove a module dependency from mod.toml and .nu_modules/
+    /// Remove a module dependency from nupackage.toml and .nu_modules/
     #[command(visible_alias = "rm")]
     Remove {
-        /// Remove from global config instead of local mod.toml
+        /// Remove from global config instead of local nupackage.toml
         #[arg(short = 'g', long)]
         global: bool,
 
@@ -121,7 +122,7 @@ pub enum Commands {
         name: String,
     },
 
-    /// Remove a script dependency from local mod.toml/.nu_scripts or global config
+    /// Remove a script dependency from local nupackage.toml/.nu_scripts or global config
     RemoveScript {
         /// Remove from global config instead of local config
         #[arg(short = 'g', long)]
@@ -131,14 +132,14 @@ pub enum Commands {
         name: String,
     },
 
-    /// List installed dependencies (project-local if mod.toml exists, otherwise global modules/scripts)
+    /// List installed dependencies (project-local if nupackage.toml exists, otherwise global modules/scripts)
     #[command(visible_alias = "ls")]
     List,
 
-    /// Print the installed nuance version
+    /// Print the installed quiver version
     Version,
 
-    /// Print the Nushell env_change hook for auto-activating nuance projects
+    /// Print the Nushell env_change hook for auto-activating quiver projects
     Hook,
 }
 
@@ -153,7 +154,7 @@ mod tests {
 
     #[test]
     fn remove_alias_parses() {
-        let cli = Cli::try_parse_from(["nuance", "rm", "nu-utils"]).unwrap();
+        let cli = Cli::try_parse_from(["quiver", "rm", "nu-utils"]).unwrap();
         match cli.command {
             Commands::Remove { global, name } => {
                 assert!(!global);
@@ -165,20 +166,20 @@ mod tests {
 
     #[test]
     fn list_alias_parses() {
-        let cli = Cli::try_parse_from(["nuance", "ls"]).unwrap();
+        let cli = Cli::try_parse_from(["quiver", "ls"]).unwrap();
         assert!(matches!(cli.command, Commands::List));
     }
 
     #[test]
     fn version_subcommand_parses() {
-        let cli = Cli::try_parse_from(["nuance", "version"]).unwrap();
+        let cli = Cli::try_parse_from(["quiver", "version"]).unwrap();
         assert!(matches!(cli.command, Commands::Version));
     }
 
     #[test]
     fn add_script_parses() {
         let cli = Cli::try_parse_from([
-            "nuance",
+            "quiver",
             "add-script",
             "user/repo",
             "scripts/quickfix.nu",
@@ -208,7 +209,7 @@ mod tests {
     #[test]
     fn add_script_global_parses() {
         let cli = Cli::try_parse_from([
-            "nuance",
+            "quiver",
             "add-script",
             "--global",
             "--autoload",
@@ -230,7 +231,7 @@ mod tests {
     #[test]
     fn add_script_blob_url_without_explicit_path_parses() {
         let cli = Cli::try_parse_from([
-            "nuance",
+            "quiver",
             "add-script",
             "https://github.com/nushell/nu_scripts/blob/main/sourced/webscraping/twitter.nu",
         ])
@@ -249,7 +250,7 @@ mod tests {
 
     #[test]
     fn remove_script_parses() {
-        let cli = Cli::try_parse_from(["nuance", "remove-script", "quickfix"]).unwrap();
+        let cli = Cli::try_parse_from(["quiver", "remove-script", "quickfix"]).unwrap();
         match cli.command {
             Commands::RemoveScript { global, name } => {
                 assert!(!global);
@@ -261,7 +262,7 @@ mod tests {
 
     #[test]
     fn remove_script_global_parses() {
-        let cli = Cli::try_parse_from(["nuance", "remove-script", "-g", "quickfix"]).unwrap();
+        let cli = Cli::try_parse_from(["quiver", "remove-script", "-g", "quickfix"]).unwrap();
         match cli.command {
             Commands::RemoveScript { global, name } => {
                 assert!(global);
@@ -273,13 +274,13 @@ mod tests {
 
     #[test]
     fn short_v_displays_version() {
-        let err = Cli::try_parse_from(["nuance", "-v"]).unwrap_err();
+        let err = Cli::try_parse_from(["quiver", "-v"]).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::DisplayVersion);
     }
 
     #[test]
     fn short_upper_v_displays_version() {
-        let err = Cli::try_parse_from(["nuance", "-V"]).unwrap_err();
+        let err = Cli::try_parse_from(["quiver", "-V"]).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::DisplayVersion);
     }
 }

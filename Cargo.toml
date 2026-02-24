@@ -1,11 +1,11 @@
 [package]
-name = "nuance"
+name = "quiver"
 version = "0.2.1"
 edition = "2024"
 description = "A module and script manager for Nushell"
 license = "MIT"
-repository = "https://github.com/freepicheep/nuance"
-homepage = "https://github.com/freepicheep/nuance"
+repository = "https://github.com/freepicheep/quiver"
+homepage = "https://github.com/freepicheep/quiver"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
@@ -22,3 +22,7 @@ walkdir = "2"
 [profile.dist]
 inherits = "release"
 lto = "thin"
+
+[[bin]]
+name = "qv"
+path = "src/main.rs"

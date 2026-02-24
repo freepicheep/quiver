@@ -21,7 +21,7 @@ pub enum NuanceError {
     #[error("config error: {0}")]
     Config(String),
 
-    #[error("no mod.toml found in {0}")]
+    #[error("no nupackage.toml found in {0}")]
     NoManifest(PathBuf),
 
     #[error("io error: {0}")]

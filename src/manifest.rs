@@ -4,7 +4,7 @@ use std::path::{Component, Path};
 
 use crate::error::{NuanceError, Result};
 
-/// The top-level `mod.toml` manifest.
+/// The top-level `nupackage.toml` manifest.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Manifest {
     pub package: Package,
@@ -12,7 +12,7 @@ pub struct Manifest {
     pub dependencies: DependencyGroups,
 }
 
-/// Dependency groups declared in `mod.toml`.
+/// Dependency groups declared in `nupackage.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct DependencyGroups {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
@@ -187,9 +187,9 @@ fn validate_ref_fields(
 }
 
 impl Manifest {
-    /// Read and parse a `mod.toml` from the given directory.
+    /// Read and parse a `nupackage.toml` from the given directory.
     pub fn from_dir(dir: &Path) -> Result<Self> {
-        let path = dir.join("mod.toml");
+        let path = dir.join("nupackage.toml");
         if !path.exists() {
             return Err(NuanceError::NoManifest(dir.to_path_buf()));
         }
