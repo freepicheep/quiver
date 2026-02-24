@@ -15,7 +15,7 @@ hex = "0.4"
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
 thiserror = "2"
-toml = "0.8"
+toml = "1.0.3"
 walkdir = "2"
 
 # The profile that 'dist' will build with
