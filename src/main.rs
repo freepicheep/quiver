@@ -9,6 +9,7 @@ mod manifest;
 mod resolver;
 
 use std::path::Path;
+use std::io::{self, Write};
 use std::process::Command;
 
 use cli::Commands;
@@ -65,6 +66,7 @@ fn run(command: Commands) -> Result<()> {
         Commands::List => cmd_list(&cwd),
         Commands::Version => cmd_version(),
         Commands::Hook => cmd_hook(),
+        Commands::Lsp { editor } => cmd_lsp(&cwd, editor),
     }
 }
 
@@ -124,6 +126,14 @@ fn cmd_init(
         )?;
         eprintln!("Created {}", mod_nu.display());
     }
+
+    // Generate .nu-env/ with activate.nu, env.nu, and bin/nu symlink
+    let nu_env_dir = dir.join(".nu-env");
+    let modules_dir = nu_env_dir.join("modules");
+    std::fs::create_dir_all(&modules_dir)?;
+    installer::write_env_nu(&nu_env_dir, &modules_dir)?;
+    installer::create_nu_symlink(&nu_env_dir)?;
+    installer::write_activate_overlay(&nu_env_dir, dir)?;
 
     Ok(())
 }
@@ -342,6 +352,178 @@ $env.config.hooks.env_change.PWD = (
 
 fn cmd_version() -> Result<()> {
     println!("quiver {}", env!("CARGO_PKG_VERSION"));
+    Ok(())
+}
+
+fn cmd_lsp(cwd: &Path, editors: Vec<String>) -> Result<()> {
+    let all_editors = ["helix", "zed"];
+
+    let selected: Vec<String> = if editors.is_empty() {
+        // Interactive picker
+        pick_editors(&all_editors)?
+    } else {
+        // Validate provided editor names
+        for e in &editors {
+            let lower = e.to_lowercase();
+            if !all_editors.contains(&lower.as_str()) {
+                return Err(error::QuiverError::Other(format!(
+                    "unknown editor '{}'; supported: {}",
+                    e,
+                    all_editors.join(", ")
+                )));
+            }
+        }
+        editors.iter().map(|e| e.to_lowercase()).collect()
+    };
+
+    if selected.is_empty() {
+        eprintln!("No editors selected.");
+        return Ok(());
+    }
+
+    for editor in &selected {
+        match editor.as_str() {
+            "helix" => write_helix_lsp_config(cwd)?,
+            "zed" => write_zed_lsp_config(cwd)?,
+            _ => {}
+        }
+    }
+
+    Ok(())
+}
+
+/// Interactive checkbox picker rendered to stderr.
+fn pick_editors(options: &[&str]) -> Result<Vec<String>> {
+    use std::io::Read;
+
+    let mut selected = vec![false; options.len()];
+    let mut cursor = 0usize;
+
+    // Save terminal state and enable raw mode
+    let stdin = io::stdin();
+    let mut stderr = io::stderr();
+
+    // Set raw mode via stty
+    let _ = Command::new("stty").arg("raw").arg("-echo").stdin(std::process::Stdio::inherit()).status();
+
+    let render = |selected: &[bool], cursor: usize, out: &mut io::Stderr| -> io::Result<()> {
+        // Move to start and clear
+        write!(out, "\r\x1b[J")?;
+        write!(out, "Select editors to configure (space=toggle, j/k=move, enter=confirm):\r\n")?;
+        for (i, option) in options.iter().enumerate() {
+            let check = if selected[i] { "x" } else { " " };
+            let prefix = if i == cursor { "> " } else { "  " };
+            write!(out, "{prefix}[{check}] {option}\r\n")?;
+        }
+        out.flush()
+    };
+
+    render(&selected, cursor, &mut stderr)?;
+
+    let result = (|| -> Result<Vec<String>> {
+        let mut bytes = stdin.lock().bytes();
+        loop {
+            let b = match bytes.next() {
+                Some(Ok(b)) => b,
+                _ => break,
+            };
+
+            match b {
+                b'\n' | b'\r' => {
+                    // Enter — confirm
+                    break;
+                }
+                b' ' => {
+                    selected[cursor] = !selected[cursor];
+                }
+                b'j' => {
+                    if cursor + 1 < options.len() {
+                        cursor += 1;
+                    }
+                }
+                b'k' => {
+                    if cursor > 0 {
+                        cursor -= 1;
+                    }
+                }
+                b'q' | 3 => {
+                    // q or Ctrl-C — abort
+                    let _ = Command::new("stty").arg("sane").stdin(std::process::Stdio::inherit()).status();
+                    write!(stderr, "\r\x1b[J")?;
+                    stderr.flush()?;
+                    std::process::exit(0);
+                }
+                27 => {
+                    // Escape sequence (arrow keys)
+                    let next = bytes.next();
+                    if let Some(Ok(b'[')) = next {
+                        if let Some(Ok(arrow)) = bytes.next() {
+                            match arrow {
+                                b'A' => { if cursor > 0 { cursor -= 1; } } // Up
+                                b'B' => { if cursor + 1 < options.len() { cursor += 1; } } // Down
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+
+            // Move cursor up to re-render
+            let lines_to_move = options.len() + 1; // +1 for the header line
+            write!(stderr, "\x1b[{}A", lines_to_move)?;
+            render(&selected, cursor, &mut stderr)?;
+        }
+
+        Ok(options
+            .iter()
+            .zip(selected.iter())
+            .filter_map(|(name, &sel)| if sel { Some(name.to_string()) } else { None })
+            .collect())
+    })();
+
+    // Restore terminal
+    let _ = Command::new("stty").arg("sane").stdin(std::process::Stdio::inherit()).status();
+    write!(stderr, "\r\x1b[J")?;
+    stderr.flush()?;
+
+    result
+}
+
+fn write_helix_lsp_config(project_dir: &Path) -> Result<()> {
+    let helix_dir = project_dir.join(".helix");
+    std::fs::create_dir_all(&helix_dir)?;
+
+    let config_path = helix_dir.join("languages.toml");
+    let config = r#"[language-server.nu-lsp]
+command = "nu"
+args = ["--env-config .nu-env/env.nu", "--lsp"]
+"#;
+
+    std::fs::write(&config_path, config)?;
+    eprintln!("Generated .helix/languages.toml");
+    Ok(())
+}
+
+fn write_zed_lsp_config(project_dir: &Path) -> Result<()> {
+    let zed_dir = project_dir.join(".zed");
+    std::fs::create_dir_all(&zed_dir)?;
+
+    let config_path = zed_dir.join("settings.json");
+    let config = r#"{
+  "lsp": {
+    "nu": {
+      "binary": {
+        "path": "nu",
+        "arguments": ["--env-config", ".nu-env/env.nu", "--lsp"]
+      }
+    }
+  }
+}
+"#;
+
+    std::fs::write(&config_path, config)?;
+    eprintln!("Generated .zed/settings.json");
     Ok(())
 }
 
@@ -613,6 +795,19 @@ mod tests {
         assert!(project_dir.join(&dir_name).join("mod.nu").exists());
         assert!(!project_dir.join("mod.nu").exists());
 
+        // Verify .nu-env files are generated
+        let nu_env = project_dir.join(".nu-env");
+        assert!(nu_env.join("activate.nu").exists());
+        assert!(nu_env.join("env.nu").exists());
+        assert!(nu_env.join("modules").is_dir());
+
+        let activate = std::fs::read_to_string(nu_env.join("activate.nu")).unwrap();
+        assert!(activate.contains("export alias nu ="));
+        assert!(activate.contains("export alias deactivate = overlay hide activate"));
+
+        let env_nu = std::fs::read_to_string(nu_env.join("env.nu")).unwrap();
+        assert!(env_nu.contains("export const NU_LIB_DIRS"));
+
         let _ = std::fs::remove_dir_all(project_dir);
     }
 
@@ -639,6 +834,69 @@ mod tests {
             .to_string();
         assert!(project_dir.join(&dir_name).join("mod.nu").exists());
         assert!(!project_dir.join("mod.nu").exists());
+
+        // Verify .nu-env files are generated
+        assert!(project_dir.join(".nu-env").join("activate.nu").exists());
+        assert!(project_dir.join(".nu-env").join("env.nu").exists());
+
+        let _ = std::fs::remove_dir_all(project_dir);
+    }
+
+    #[test]
+    fn helix_lsp_config_generates_languages_toml() {
+        let project_dir = make_temp_dir("helix_lsp");
+
+        write_helix_lsp_config(&project_dir).unwrap();
+
+        let config_path = project_dir.join(".helix").join("languages.toml");
+        assert!(config_path.exists());
+
+        let content = std::fs::read_to_string(&config_path).unwrap();
+        assert!(content.contains("[language-server.nu-lsp]"));
+        assert!(content.contains("command = \"nu\""));
+        assert!(content.contains("--env-config .nu-env/env.nu"));
+        assert!(content.contains("--lsp"));
+
+        let _ = std::fs::remove_dir_all(project_dir);
+    }
+
+    #[test]
+    fn zed_lsp_config_generates_settings_json() {
+        let project_dir = make_temp_dir("zed_lsp");
+
+        write_zed_lsp_config(&project_dir).unwrap();
+
+        let config_path = project_dir.join(".zed").join("settings.json");
+        assert!(config_path.exists());
+
+        let content = std::fs::read_to_string(&config_path).unwrap();
+        assert!(content.contains("\"nu\""));
+        assert!(content.contains("\"path\": \"nu\""));
+        assert!(content.contains("--env-config"));
+        assert!(content.contains(".nu-env/env.nu"));
+        assert!(content.contains("--lsp"));
+
+        let _ = std::fs::remove_dir_all(project_dir);
+    }
+
+    #[test]
+    fn cmd_lsp_with_explicit_editors_generates_configs() {
+        let project_dir = make_temp_dir("lsp_explicit");
+
+        cmd_lsp(&project_dir, vec!["helix".to_string(), "zed".to_string()]).unwrap();
+
+        assert!(project_dir.join(".helix").join("languages.toml").exists());
+        assert!(project_dir.join(".zed").join("settings.json").exists());
+
+        let _ = std::fs::remove_dir_all(project_dir);
+    }
+
+    #[test]
+    fn cmd_lsp_rejects_unknown_editor() {
+        let project_dir = make_temp_dir("lsp_unknown");
+
+        let err = cmd_lsp(&project_dir, vec!["vim".to_string()]).unwrap_err();
+        assert!(err.to_string().contains("unknown editor"));
 
         let _ = std::fs::remove_dir_all(project_dir);
     }

@@ -96,6 +96,13 @@ pub enum Commands {
 
     /// Print the Nushell env_change hook for auto-activating quiver projects
     Hook,
+
+    /// Generate editor-specific LSP configuration for Nushell
+    Lsp {
+        /// Editors to configure (helix, zed). If omitted, shows an interactive picker.
+        #[arg(long)]
+        editor: Vec<String>,
+    },
 }
 
 pub fn parse() -> Cli {
