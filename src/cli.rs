@@ -103,6 +103,13 @@ pub enum Commands {
         #[arg(long)]
         editor: Vec<String>,
     },
+
+    /// Run a command in the project with quiver's Nushell environment
+    Run {
+        /// Command and arguments to execute
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
 }
 
 pub fn parse() -> Cli {
@@ -136,6 +143,17 @@ mod tests {
     fn version_subcommand_parses() {
         let cli = Cli::try_parse_from(["quiver", "version"]).unwrap();
         assert!(matches!(cli.command, Commands::Version));
+    }
+
+    #[test]
+    fn run_subcommand_parses_with_multiple_args() {
+        let cli = Cli::try_parse_from(["quiver", "run", "nu", "script.nu", "--flag"]).unwrap();
+        match cli.command {
+            Commands::Run { command } => {
+                assert_eq!(command, vec!["nu", "script.nu", "--flag"]);
+            }
+            _ => panic!("expected run command"),
+        }
     }
 
     #[test]

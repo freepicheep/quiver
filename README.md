@@ -48,6 +48,9 @@ qv add user/nu-some-module
 # Install all dependencies from nupackage.toml
 qv install
 
+# Run a Nushell script with quiver's environment
+qv run script.nu
+
 # Activate the virtual environment
 overlay use .nu-env/activate.nu
 
@@ -155,6 +158,7 @@ Module dependencies must specify exactly one of `tag`, `branch`, or `rev`.
 | `qv install -g` | Install global dependencies from `~/.config/quiver/config.toml` |
 | `qv install --frozen` | Install from lockfile only (CI-friendly) |
 | `qv update` | Re-resolve all dependencies |
+| `qv run <command...>` | Run a command in the current project using `.nu-env` (injects `--env-config` for `nu`) |
 | `qv remove <name>` / `qv rm <name>` | Remove a module dependency |
 | `qv list` / `qv ls` | List installed dependencies (project or global) |
 | `qv lsp` | Generate editor-specific LSP configuration (interactive picker) |

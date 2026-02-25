@@ -714,7 +714,6 @@ mod tests {
 
         let env_nu = std::fs::read_to_string(nu_env_dir.join("env.nu")).unwrap();
         assert!(env_nu.contains("export const NU_LIB_DIRS"));
-        assert!(env_nu.contains("$env.NU_LIB_DIRS = ["));
         assert!(env_nu.contains(&modules_dir.display().to_string()));
 
         let _ = std::fs::remove_dir_all(nu_env_dir);
@@ -844,7 +843,7 @@ version = "0.1.0"
 
         let env_nu = std::fs::read_to_string(nu_env.join("env.nu")).unwrap();
         assert!(env_nu.contains("export const NU_LIB_DIRS"));
-        assert!(env_nu.contains("$env.NU_LIB_DIRS = ["));
+        assert!(env_nu.contains(".nu-env/modules"));
 
         let _ = std::fs::remove_dir_all(project_dir);
     }

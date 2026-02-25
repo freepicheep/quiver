@@ -8,8 +8,8 @@ mod lockfile;
 mod manifest;
 mod resolver;
 
-use std::path::Path;
 use std::io::{self, Write};
+use std::path::Path;
 use std::process::Command;
 
 use cli::Commands;
@@ -67,6 +67,7 @@ fn run(command: Commands) -> Result<()> {
         Commands::Version => cmd_version(),
         Commands::Hook => cmd_hook(),
         Commands::Lsp { editor } => cmd_lsp(&cwd, editor),
+        Commands::Run { command } => cmd_run(&cwd, command),
     }
 }
 
@@ -319,6 +320,84 @@ fn cmd_remove_global(name: String) -> Result<()> {
     Ok(())
 }
 
+fn cmd_run(cwd: &Path, command: Vec<String>) -> Result<()> {
+    if command.is_empty() {
+        return Err(error::QuiverError::Other(
+            "missing command to run".to_string(),
+        ));
+    }
+
+    if !cwd.join("nupackage.toml").exists() {
+        return Err(error::QuiverError::NoManifest(cwd.to_path_buf()));
+    }
+
+    let env_config_path = cwd.join(".nu-env").join("env.nu");
+    if !env_config_path.exists() {
+        eprintln!("No .nu-env found; running install first...");
+        installer::install(cwd, false)?;
+    }
+
+    if !env_config_path.exists() {
+        return Err(error::QuiverError::Other(
+            "failed to create .nu-env/env.nu".to_string(),
+        ));
+    }
+
+    let (program, args) = resolve_run_invocation(&command, &env_config_path, cwd);
+    let status = Command::new(&program)
+        .args(&args)
+        .current_dir(cwd)
+        .status()?;
+
+    if !status.success() {
+        std::process::exit(status.code().unwrap_or(1));
+    }
+
+    Ok(())
+}
+
+fn resolve_run_invocation(
+    command: &[String],
+    env_config_path: &Path,
+    cwd: &Path,
+) -> (String, Vec<String>) {
+    let executable = command[0].clone();
+    let mut args = command[1..].to_vec();
+    let env_config = env_config_path.to_string_lossy().to_string();
+
+    if executable == "nu" {
+        if !args.iter().any(|arg| arg == "--env-config") {
+            args.insert(0, env_config);
+            args.insert(0, "--env-config".to_string());
+        }
+        return (executable, args);
+    }
+
+    if is_nushell_script_command(&executable, cwd) {
+        let mut nu_args = vec!["--env-config".to_string(), env_config, executable];
+        nu_args.extend(args);
+        return ("nu".to_string(), nu_args);
+    }
+
+    (executable, args)
+}
+
+fn is_nushell_script_command(executable: &str, cwd: &Path) -> bool {
+    let command_path = Path::new(executable);
+    if command_path.extension().and_then(|ext| ext.to_str()) != Some("nu") {
+        return false;
+    }
+
+    if command_path.is_absolute() {
+        return true;
+    }
+
+    cwd.join(command_path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        == Some("nu")
+}
+
 fn cmd_hook() -> Result<()> {
     let hook_script = r#"# quiver auto-activate hook
 # Add this to your Nushell environment by running:
@@ -404,12 +483,19 @@ fn pick_editors(options: &[&str]) -> Result<Vec<String>> {
     let mut stderr = io::stderr();
 
     // Set raw mode via stty
-    let _ = Command::new("stty").arg("raw").arg("-echo").stdin(std::process::Stdio::inherit()).status();
+    let _ = Command::new("stty")
+        .arg("raw")
+        .arg("-echo")
+        .stdin(std::process::Stdio::inherit())
+        .status();
 
     let render = |selected: &[bool], cursor: usize, out: &mut io::Stderr| -> io::Result<()> {
         // Move to start and clear
         write!(out, "\r\x1b[J")?;
-        write!(out, "Select editors to configure (space=toggle, j/k=move, enter=confirm):\r\n")?;
+        write!(
+            out,
+            "Select editors to configure (space=toggle, j/k=move, enter=confirm):\r\n"
+        )?;
         for (i, option) in options.iter().enumerate() {
             let check = if selected[i] { "x" } else { " " };
             let prefix = if i == cursor { "> " } else { "  " };
@@ -448,7 +534,10 @@ fn pick_editors(options: &[&str]) -> Result<Vec<String>> {
                 }
                 b'q' | 3 => {
                     // q or Ctrl-C — abort
-                    let _ = Command::new("stty").arg("sane").stdin(std::process::Stdio::inherit()).status();
+                    let _ = Command::new("stty")
+                        .arg("sane")
+                        .stdin(std::process::Stdio::inherit())
+                        .status();
                     write!(stderr, "\r\x1b[J")?;
                     stderr.flush()?;
                     std::process::exit(0);
@@ -459,8 +548,16 @@ fn pick_editors(options: &[&str]) -> Result<Vec<String>> {
                     if let Some(Ok(b'[')) = next {
                         if let Some(Ok(arrow)) = bytes.next() {
                             match arrow {
-                                b'A' => { if cursor > 0 { cursor -= 1; } } // Up
-                                b'B' => { if cursor + 1 < options.len() { cursor += 1; } } // Down
+                                b'A' => {
+                                    if cursor > 0 {
+                                        cursor -= 1;
+                                    }
+                                } // Up
+                                b'B' => {
+                                    if cursor + 1 < options.len() {
+                                        cursor += 1;
+                                    }
+                                } // Down
                                 _ => {}
                             }
                         }
@@ -483,7 +580,10 @@ fn pick_editors(options: &[&str]) -> Result<Vec<String>> {
     })();
 
     // Restore terminal
-    let _ = Command::new("stty").arg("sane").stdin(std::process::Stdio::inherit()).status();
+    let _ = Command::new("stty")
+        .arg("sane")
+        .stdin(std::process::Stdio::inherit())
+        .status();
     write!(stderr, "\r\x1b[J")?;
     stderr.flush()?;
 
@@ -781,6 +881,74 @@ mod tests {
     }
 
     #[test]
+    fn resolve_run_invocation_injects_env_config_for_nu() {
+        let cwd = make_temp_dir("run_inject_nu");
+        let env_config = cwd.join(".nu-env").join("env.nu");
+        let command = vec![
+            "nu".to_string(),
+            "script.nu".to_string(),
+            "--flag".to_string(),
+        ];
+
+        let (program, args) = resolve_run_invocation(&command, &env_config, &cwd);
+
+        assert_eq!(program, "nu");
+        assert_eq!(args[0], "--env-config");
+        assert_eq!(args[1], env_config.to_string_lossy());
+        assert_eq!(args[2], "script.nu");
+        assert_eq!(args[3], "--flag");
+
+        let _ = std::fs::remove_dir_all(cwd);
+    }
+
+    #[test]
+    fn resolve_run_invocation_wraps_nu_script() {
+        let cwd = make_temp_dir("run_wrap_script");
+        let script_path = cwd.join("tool.nu");
+        std::fs::write(&script_path, "print 'ok'").unwrap();
+        let env_config = cwd.join(".nu-env").join("env.nu");
+        let command = vec!["tool.nu".to_string(), "arg1".to_string()];
+
+        let (program, args) = resolve_run_invocation(&command, &env_config, &cwd);
+
+        assert_eq!(program, "nu");
+        assert_eq!(args[0], "--env-config");
+        assert_eq!(args[1], env_config.to_string_lossy());
+        assert_eq!(args[2], "tool.nu");
+        assert_eq!(args[3], "arg1");
+
+        let _ = std::fs::remove_dir_all(cwd);
+    }
+
+    #[test]
+    fn resolve_run_invocation_leaves_other_commands_unchanged() {
+        let cwd = make_temp_dir("run_other_cmd");
+        let env_config = cwd.join(".nu-env").join("env.nu");
+        let command = vec!["echo".to_string(), "hello".to_string()];
+
+        let (program, args) = resolve_run_invocation(&command, &env_config, &cwd);
+
+        assert_eq!(program, "echo");
+        assert_eq!(args, vec!["hello".to_string()]);
+
+        let _ = std::fs::remove_dir_all(cwd);
+    }
+
+    #[test]
+    fn cmd_run_requires_manifest() {
+        let cwd = make_temp_dir("run_requires_manifest");
+        let err = cmd_run(
+            &cwd,
+            vec!["nu".to_string(), "-c".to_string(), "print hi".to_string()],
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, error::QuiverError::NoManifest(_)));
+
+        let _ = std::fs::remove_dir_all(cwd);
+    }
+
+    #[test]
     fn init_creates_mod_nu_in_subdir_named_after_current_dir() {
         let project_dir = make_temp_dir("init_subdir");
 
@@ -809,7 +977,7 @@ mod tests {
 
         let env_nu = std::fs::read_to_string(nu_env.join("env.nu")).unwrap();
         assert!(env_nu.contains("export const NU_LIB_DIRS"));
-        assert!(env_nu.contains("$env.NU_LIB_DIRS = ["));
+        assert!(env_nu.contains(".nu-env/modules"));
 
         let _ = std::fs::remove_dir_all(project_dir);
     }
