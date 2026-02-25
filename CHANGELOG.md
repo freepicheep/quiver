@@ -1,5 +1,19 @@
 # Unreleased
 
+# Version 0.2.3 (2026-02-25)
+
+## Added
+- Added `qv run` to run your nu scripts with the package environment and nu version in `.nu-env/bin/`.
+- Added a virtual `nu` symlink in the environment bin. This is a step towards managing your version of `nu` with quiver.
+- Added `qv lsp` to generate project specific profiles for helix and/or zed since we need to pass in `env.nu` so modules can be discovered by the lsp.
+
+## Changed
+- Moved Nushell environment artifacts to `nu-env/`, including the `modules/` subdirectory.
+- Improved `activate.nu` to export a definition of `nu` that loads the `env.nu` with the `$NU_LIB_DIRS` properly filled.
+
+## Fixed
+- Improved `activate.nu` reliability.
+
 # Version 0.2.2 (2026-02-24)
 
 **Nuance is now Quiver, with the executable being `qv`.** 
