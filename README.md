@@ -98,6 +98,8 @@ This exports a `nu` alias that runs with `--env-config .nu-env/env.nu`, so any t
 
 When you're done, run `deactivate` (or `overlay hide activate`) to unload the overlay.
 
+You can also run your script/module by running nu with the path to the modules dir `nu --include-path path_to_.nu-env/modules your_script.nu`.
+
 ### Auto-activation Hook
 
 If you want quiver projects to automatically update `$env.NU_LIB_DIRS` when you `cd` into their directory (and clean up when you leave), run:
