@@ -79,8 +79,8 @@ Running `qv install` (or `qv init`) sets up a `.nu-env/` virtual environment:
 
 ```
 .nu-env/
-├── activate.nu    # overlay with `nu` alias and `deactivate`
-├── env.nu         # sets NU_LIB_DIRS to the modules directory
+├── activate.nu    # overlay that loads env.nu, exports wrapped `nu`, and `deactivate`
+├── env.nu         # adds modules dir to NU_LIB_DIRS
 ├── bin/
 │   └── nu         # symlink to your system nu binary
 └── modules/       # installed module dependencies

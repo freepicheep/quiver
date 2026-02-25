@@ -802,11 +802,14 @@ mod tests {
         assert!(nu_env.join("modules").is_dir());
 
         let activate = std::fs::read_to_string(nu_env.join("activate.nu")).unwrap();
-        assert!(activate.contains("export alias nu ="));
+        assert!(activate.contains("export-env {"));
+        assert!(activate.contains("source-env"));
+        assert!(activate.contains("export def --wrapped nu [...rest]"));
         assert!(activate.contains("export alias deactivate = overlay hide activate"));
 
         let env_nu = std::fs::read_to_string(nu_env.join("env.nu")).unwrap();
         assert!(env_nu.contains("export const NU_LIB_DIRS"));
+        assert!(env_nu.contains("$env.NU_LIB_DIRS = ["));
 
         let _ = std::fs::remove_dir_all(project_dir);
     }
