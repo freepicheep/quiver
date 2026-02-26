@@ -14,6 +14,8 @@ Quiver handles dependency resolution, fetching, and lockfile management for Nush
 
 ## Install
 
+Quiver is pre-alpha. I release breaking changes frequently. Most of the code is written with Codex 5.3. I release build for the following platforms and have confirmed quiver works great on macOS silicon and ARM64 Linux (thanks Asahi devs).
+
 ![Apple Silicon macOS](https://img.shields.io/badge/macOS%20Apple%20Silicon-000000?logo=apple&logoColor=white)
 ![Intel macOS](https://img.shields.io/badge/macOS%20Intel-000000?logo=apple&logoColor=white)
 ![ARM64 Linux](https://img.shields.io/badge/Linux%20ARM64-FCC624?logo=linux&logoColor=black)
@@ -187,6 +189,10 @@ You can also set a custom host like `git.example.com` or a full `https://...` ba
 ## Roadmap
 
 Quiver currently installs modules only. The lockfile artifact kind model is intentionally kept extensible so future dependency types (for example Nushell plugins) can be added without reworking lock semantics.
+
+## Disclaimer
+
+I have not verified the security of all the code yet and I am not responsible for any grief or loss quiver may cause to you or your company.
 
 ## License
 
