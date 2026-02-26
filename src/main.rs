@@ -136,6 +136,37 @@ fn cmd_init(
     installer::write_env_nu(&nu_env_dir, &modules_dir)?;
     installer::create_nu_symlink(&nu_env_dir)?;
     installer::write_activate_overlay(&nu_env_dir, dir)?;
+    ensure_gitignore_ignores_nu_env(dir)?;
+
+    Ok(())
+}
+
+fn ensure_gitignore_ignores_nu_env(dir: &Path) -> Result<()> {
+    let gitignore_path = dir.join(".gitignore");
+    let ignore_entry = ".nu-env/";
+
+    if !gitignore_path.exists() {
+        std::fs::write(&gitignore_path, format!("{ignore_entry}\n"))?;
+        eprintln!("Created .gitignore");
+        return Ok(());
+    }
+
+    let existing = std::fs::read_to_string(&gitignore_path)?;
+    let has_nu_env_entry = existing
+        .lines()
+        .any(|line| matches!(line.trim(), ".nu-env/" | ".nu-env"));
+    if has_nu_env_entry {
+        return Ok(());
+    }
+
+    let mut updated = existing;
+    if !updated.ends_with('\n') && !updated.is_empty() {
+        updated.push('\n');
+    }
+    updated.push_str(ignore_entry);
+    updated.push('\n');
+    std::fs::write(&gitignore_path, updated)?;
+    eprintln!("Updated .gitignore with .nu-env/");
 
     Ok(())
 }
@@ -1010,6 +1041,32 @@ mod tests {
         // Verify .nu-env files are generated
         assert!(project_dir.join(".nu-env").join("activate.nu").exists());
         assert!(project_dir.join(".nu-env").join("env.nu").exists());
+
+        let _ = std::fs::remove_dir_all(project_dir);
+    }
+
+    #[test]
+    fn init_creates_gitignore_with_nu_env_entry() {
+        let project_dir = make_temp_dir("init_gitignore_create");
+
+        cmd_init(&project_dir, None, "0.1.0".to_string(), None).unwrap();
+
+        let gitignore = std::fs::read_to_string(project_dir.join(".gitignore")).unwrap();
+        assert!(gitignore.lines().any(|line| line.trim() == ".nu-env/"));
+
+        let _ = std::fs::remove_dir_all(project_dir);
+    }
+
+    #[test]
+    fn init_appends_nu_env_entry_to_existing_gitignore() {
+        let project_dir = make_temp_dir("init_gitignore_append");
+        std::fs::write(project_dir.join(".gitignore"), "target/\n").unwrap();
+
+        cmd_init(&project_dir, None, "0.1.0".to_string(), None).unwrap();
+
+        let gitignore = std::fs::read_to_string(project_dir.join(".gitignore")).unwrap();
+        assert!(gitignore.lines().any(|line| line.trim() == "target/"));
+        assert!(gitignore.lines().any(|line| line.trim() == ".nu-env/"));
 
         let _ = std::fs::remove_dir_all(project_dir);
     }
