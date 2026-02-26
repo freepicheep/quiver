@@ -1,5 +1,8 @@
 # Unreleased
 
+## Fixed
+- The `mod.nu` generated with `qv init` now properly reflects the ability to use relative paths for nu modules since we have a better nu env.
+
 # Version 0.2.3 (2026-02-25)
 
 ## Added
