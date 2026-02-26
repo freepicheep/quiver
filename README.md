@@ -5,7 +5,7 @@
   <br>Quiver
 </h1>
   <p align="center">
-    A fast dependency manager for <a href="https://www.nushell.sh/">Nushell</a> modules.
+    A fast package and project manager for <a href="https://www.nushell.sh/">Nushell</a> modules.
     <br />
   </p>
 </p>
