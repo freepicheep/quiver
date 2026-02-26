@@ -122,8 +122,9 @@ fn cmd_init(
             &mod_nu,
             r#"# Module entry point
 # Export your commands here with: export use <submodule>
-# Use installed modules with: use ../.nu-env/modules/module-name/module-name *
-            "#,
+# Use installed modules with: use module-name *
+# Set up your lsp with `qv lsp`
+"#,
         )?;
         eprintln!("Created {}", mod_nu.display());
     }
