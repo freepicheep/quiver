@@ -28,13 +28,13 @@ pub struct LockedPackage {
 
 /// The kind of installed artifact in the lockfile.
 ///
-/// Today only modules are installed. Unknown kinds are preserved for forward
-/// compatibility and ignored by module-only install paths.
+/// Unknown kinds are preserved for forward compatibility.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum LockedPackageKind {
     #[default]
     Module,
+    Plugin,
     #[serde(other)]
     Other,
 }
@@ -106,6 +106,15 @@ mod tests {
                     path: None,
                     sha256: "def456".to_string(),
                 },
+                LockedPackage {
+                    name: "nu_plugin_inc".to_string(),
+                    kind: LockedPackageKind::Plugin,
+                    git: "https://github.com/nushell/nu_plugin_inc".to_string(),
+                    tag: Some("v0.91.0".to_string()),
+                    rev: "2a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b".to_string(),
+                    path: Some("nu_plugin_inc".to_string()),
+                    sha256: "plugin123".to_string(),
+                },
             ],
         }
     }
@@ -155,13 +164,31 @@ sha256 = "abc123"
     }
 
     #[test]
+    fn parse_plugin_kind() {
+        let toml = r#"
+version = 1
+
+[[package]]
+name = "nu_plugin_inc"
+kind = "plugin"
+git = "https://github.com/nushell/nu_plugin_inc"
+tag = "v0.91.0"
+rev = "9a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b"
+path = "nu_plugin_inc"
+sha256 = "ghi789"
+"#;
+        let lock = Lockfile::from_str(toml).unwrap();
+        assert_eq!(lock.packages[0].kind, LockedPackageKind::Plugin);
+    }
+
+    #[test]
     fn parse_unknown_kind_as_other() {
         let toml = r#"
 version = 1
 
 [[package]]
 name = "future-artifact"
-kind = "plugin"
+kind = "futurekind"
 git = "https://github.com/someuser/future"
 tag = "v0.5.0"
 rev = "9a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b"

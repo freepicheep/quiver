@@ -16,7 +16,7 @@ use std::process::Command;
 use cli::Commands;
 use config::GlobalConfig;
 use error::Result;
-use manifest::{DependencySpec, Manifest, Package};
+use manifest::{DependencySpec, Manifest, Package, PluginDependencySpec};
 
 fn main() {
     let cli = cli::parse();
@@ -57,6 +57,13 @@ fn run(command: Commands) -> Result<()> {
                 cmd_add(&cwd, url, tag, rev, branch)
             }
         }
+        Commands::AddPlugin {
+            url,
+            tag,
+            rev,
+            branch,
+            bin,
+        } => cmd_add_plugin(&cwd, url, tag, rev, branch, bin),
         Commands::Remove { global, name } => {
             if global {
                 cmd_remove_global(name)
@@ -229,6 +236,78 @@ fn cmd_add(
     eprintln!("Added module '{pkg_name}' to nupackage.toml");
 
     // Run install
+    installer::install(dir, false)
+}
+
+fn cmd_add_plugin(
+    dir: &Path,
+    url: String,
+    tag: Option<String>,
+    rev: Option<String>,
+    branch: Option<String>,
+    bin: Option<String>,
+) -> Result<()> {
+    let mut manifest = Manifest::from_dir(dir)?;
+    let provider_base = if is_git_url(url.trim()) {
+        None
+    } else {
+        let config = GlobalConfig::load_or_default()?;
+        Some(config.default_git_provider_base_url()?)
+    };
+    let url = normalize_dependency_source(&url, provider_base.as_deref())?;
+
+    let pkg_name = git::repo_name_from_url(&url).ok_or_else(|| {
+        error::QuiverError::Other(format!("could not determine package name from URL: {url}"))
+    })?;
+
+    if manifest.dependencies.plugins.contains_key(&pkg_name) {
+        return Err(error::QuiverError::Manifest(format!(
+            "plugin dependency '{pkg_name}' already exists in nupackage.toml"
+        )));
+    }
+
+    let dep_spec = if tag.is_none() && rev.is_none() && branch.is_none() {
+        eprintln!("Fetching {url} to detect plugin version...");
+        let repo_path = git::clone_or_fetch(&url)?;
+        if let Some(latest) = git::latest_tag(&repo_path)? {
+            eprintln!("  Found latest tag: {latest}");
+            PluginDependencySpec {
+                git: url.to_string(),
+                tag: Some(latest),
+                rev: None,
+                branch: None,
+                bin,
+            }
+        } else {
+            let default_br = git::default_branch(&repo_path)?;
+            eprintln!("  No tags found, using branch: {default_br}");
+            PluginDependencySpec {
+                git: url.to_string(),
+                tag: None,
+                rev: None,
+                branch: Some(default_br),
+                bin,
+            }
+        }
+    } else {
+        PluginDependencySpec {
+            git: url.to_string(),
+            tag,
+            rev,
+            branch,
+            bin,
+        }
+    };
+
+    dep_spec.validate(&pkg_name)?;
+    manifest
+        .dependencies
+        .plugins
+        .insert(pkg_name.clone(), dep_spec);
+    let content = manifest.to_toml_string()?;
+    std::fs::write(dir.join("nupackage.toml"), content)?;
+    eprintln!("Added plugin '{pkg_name}' to nupackage.toml");
+
     installer::install(dir, false)
 }
 

@@ -76,6 +76,28 @@ pub enum Commands {
         branch: Option<String>,
     },
 
+    /// Add a plugin dependency from a git URL or owner/repo shorthand
+    AddPlugin {
+        /// Git URL (e.g. https://github.com/user/nu_plugin_inc) or owner/repo shorthand
+        url: String,
+
+        /// Pin to a specific tag
+        #[arg(long)]
+        tag: Option<String>,
+
+        /// Pin to a specific commit SHA
+        #[arg(long)]
+        rev: Option<String>,
+
+        /// Track a branch
+        #[arg(long)]
+        branch: Option<String>,
+
+        /// Binary target name if it differs from the repo/package name
+        #[arg(long)]
+        bin: Option<String>,
+    },
+
     /// Remove a module dependency from nupackage.toml and .nu_modules/
     #[command(visible_alias = "rm")]
     Remove {
@@ -166,5 +188,35 @@ mod tests {
     fn short_uppercase_v_displays_version() {
         let err = Cli::try_parse_from(["quiver", "-V"]).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::DisplayVersion);
+    }
+
+    #[test]
+    fn add_plugin_parses_with_bin() {
+        let cli = Cli::try_parse_from([
+            "quiver",
+            "add-plugin",
+            "nushell/nu_plugin_inc",
+            "--tag",
+            "v0.91.0",
+            "--bin",
+            "nu_plugin_inc",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::AddPlugin {
+                url,
+                tag,
+                rev,
+                branch,
+                bin,
+            } => {
+                assert_eq!(url, "nushell/nu_plugin_inc");
+                assert_eq!(tag.as_deref(), Some("v0.91.0"));
+                assert!(rev.is_none());
+                assert!(branch.is_none());
+                assert_eq!(bin.as_deref(), Some("nu_plugin_inc"));
+            }
+            _ => panic!("expected add-plugin command"),
+        }
     }
 }

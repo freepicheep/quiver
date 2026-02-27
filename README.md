@@ -5,12 +5,12 @@
   <br>Quiver
 </h1>
   <p align="center">
-    A fast package and project manager for <a href="https://www.nushell.sh/">Nushell</a> modules.
+    A fast package and project manager for <a href="https://www.nushell.sh/">Nushell</a> modules and plugins.
     <br />
   </p>
 </p>
 
-Quiver handles dependency resolution, fetching, and lockfile management for Nushell modules distributed as git repositories.
+Quiver handles dependency resolution, fetching, and lockfile management for Nushell modules and plugins distributed as git repositories.
 
 ## Install
 
@@ -46,6 +46,9 @@ qv add https://github.com/user/nu-some-module
 
 # Or use owner/repo shorthand (defaults to github)
 qv add user/nu-some-module
+
+# Add a plugin dependency
+qv add-plugin nushell/nu_plugin_inc --tag v0.91.0 --bin nu_plugin_inc
 
 # Install all dependencies from nupackage.toml
 qv install
@@ -87,7 +90,8 @@ Running `qv install` (or `qv init`) sets up a `.nu-env/` virtual environment:
 ├── activate.nu    # overlay that loads env.nu, exports wrapped `nu`, and `deactivate`
 ├── env.nu         # adds modules dir to NU_LIB_DIRS
 ├── bin/
-│   └── nu         # symlink to your system nu binary
+│   ├── nu         # symlink to your system nu binary (or managed nu)
+│   └── ...        # plugin binaries linked for project activation
 └── modules/       # installed module dependencies
 ```
 
@@ -146,9 +150,13 @@ description = "a wonderful nu module anyone can use"
 nu-utils = { git = "https://github.com/user/nu-utils", tag = "v1.0.0" }
 other-lib = { git = "https://github.com/user/other-lib", branch = "main" }
 pinned = { git = "https://github.com/user/pinned", rev = "a3f9c12" }
+
+[dependencies.plugins]
+nu_plugin_inc = { git = "https://github.com/nushell/nu_plugin_inc", tag = "v0.91.0", bin = "nu_plugin_inc" }
 ```
 
 Module dependencies must specify exactly one of `tag`, `branch`, or `rev`.
+Plugin dependencies must specify exactly one of `tag`, `branch`, or `rev` (with optional `bin`).
 
 ## Commands
 
@@ -156,6 +164,7 @@ Module dependencies must specify exactly one of `tag`, `branch`, or `rev`.
 |---------|-------------|
 | `qv init` | Create a new `nupackage.toml`, scaffold `<project-dir-name>/mod.nu`, and set up `.nu-env/` |
 | `qv add <source>` | Add a module dependency from a URL or owner/repo shorthand (auto-detects latest tag) |
+| `qv add-plugin <source>` | Add a plugin dependency (release asset preferred, cargo build fallback) |
 | `qv install` | Install dependencies from `nupackage.toml` and generate `.nu-env/` virtual environment |
 | `qv install -g` | Install global dependencies from `~/.config/quiver/config.toml` |
 | `qv install --frozen` | Install from lockfile only (CI-friendly) |
@@ -192,9 +201,11 @@ You can also set a custom host like `git.example.com` or a full `https://...` ba
 - `hardlink`: uses hardlinks for files
 - `copy`: always copies files
 
-## Roadmap
+## Plugin Install Behavior
 
-Quiver currently installs modules only. The lockfile artifact kind model is intentionally kept extensible so future dependency types (for example Nushell plugins) can be added without reworking lock semantics.
+For plugin dependencies, Quiver installs in this order:
+1. GitHub releases artifact matching current platform/arch (preferred).
+2. Cargo build fallback from source if no usable release artifact is available.
 
 ## Disclaimer
 

@@ -18,11 +18,13 @@ pub struct Manifest {
 pub struct DependencyGroups {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub modules: HashMap<String, DependencySpec>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub plugins: HashMap<String, PluginDependencySpec>,
 }
 
 impl DependencyGroups {
     pub fn is_empty(&self) -> bool {
-        self.modules.is_empty()
+        self.modules.is_empty() && self.plugins.is_empty()
     }
 }
 
@@ -51,6 +53,20 @@ pub struct DependencySpec {
     pub rev: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
+}
+
+/// A single plugin dependency specification from `[dependencies.plugins]`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginDependencySpec {
+    pub git: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tag: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rev: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bin: Option<String>,
 }
 
 impl DependencySpec {
@@ -84,6 +100,58 @@ impl DependencySpec {
         }
         if let Some(branch) = &self.branch {
             parts.push(format!("branch = {}", toml_scalar(branch)?));
+        }
+        Ok(parts.join(", "))
+    }
+}
+
+impl PluginDependencySpec {
+    /// Validate that exactly one of tag/rev/branch is specified.
+    pub fn validate(&self, name: &str) -> Result<()> {
+        validate_ref_fields(
+            name,
+            "plugin dependency",
+            &self.tag,
+            &self.rev,
+            &self.branch,
+        )?;
+
+        if self.git.trim().is_empty() {
+            return Err(QuiverError::Manifest(format!(
+                "plugin dependency '{name}': git cannot be empty"
+            )));
+        }
+        if self.bin.as_deref().is_some_and(|bin| bin.trim().is_empty()) {
+            return Err(QuiverError::Manifest(format!(
+                "plugin dependency '{name}': bin cannot be empty when set"
+            )));
+        }
+
+        Ok(())
+    }
+
+    /// Returns the git ref string (tag, rev, or branch value).
+    pub fn ref_spec(&self) -> &str {
+        self.rev
+            .as_deref()
+            .or(self.tag.as_deref())
+            .or(self.branch.as_deref())
+            .expect("validated: one of tag/rev/branch is set")
+    }
+
+    fn to_inline_toml(&self) -> Result<String> {
+        let mut parts = vec![format!("git = {}", toml_scalar(&self.git)?)];
+        if let Some(tag) = &self.tag {
+            parts.push(format!("tag = {}", toml_scalar(tag)?));
+        }
+        if let Some(rev) = &self.rev {
+            parts.push(format!("rev = {}", toml_scalar(rev)?));
+        }
+        if let Some(branch) = &self.branch {
+            parts.push(format!("branch = {}", toml_scalar(branch)?));
+        }
+        if let Some(bin) = &self.bin {
+            parts.push(format!("bin = {}", toml_scalar(bin)?));
         }
         Ok(parts.join(", "))
     }
@@ -143,10 +211,15 @@ impl Manifest {
         }
         if let Some(nu_version) = &self.package.nu_version {
             nu::parse_nu_version_requirement(nu_version).map_err(|err| {
-                QuiverError::Manifest(format!("package nu-version '{nu_version}' is invalid: {err}"))
+                QuiverError::Manifest(format!(
+                    "package nu-version '{nu_version}' is invalid: {err}"
+                ))
             })?;
         }
         for (name, spec) in &self.dependencies.modules {
+            spec.validate(name)?;
+        }
+        for (name, spec) in &self.dependencies.plugins {
             spec.validate(name)?;
         }
         Ok(())
@@ -176,6 +249,19 @@ impl Manifest {
             let mut modules: Vec<_> = self.dependencies.modules.iter().collect();
             modules.sort_by(|a, b| a.0.cmp(b.0));
             for (name, spec) in modules {
+                out.push_str(&format!(
+                    "{} = {{ {} }}\n",
+                    bare_key_or_quoted(name),
+                    spec.to_inline_toml()?
+                ));
+            }
+        }
+
+        if !self.dependencies.plugins.is_empty() {
+            out.push_str("\n[dependencies.plugins]\n");
+            let mut plugins: Vec<_> = self.dependencies.plugins.iter().collect();
+            plugins.sort_by(|a, b| a.0.cmp(b.0));
+            for (name, spec) in plugins {
                 out.push_str(&format!(
                     "{} = {{ {} }}\n",
                     bare_key_or_quoted(name),
@@ -228,14 +314,19 @@ description = "Useful utilities"
 [dependencies.modules]
 nu-utils = { git = "https://github.com/someuser/nu-utils", tag = "v1.2.3" }
 nu-http = { git = "https://github.com/someuser/nu-http", branch = "main" }
+
+[dependencies.plugins]
+nu_plugin_inc = { git = "https://github.com/someuser/nu_plugin_inc", tag = "v0.8.0", bin = "nu_plugin_inc" }
 "#;
 
         let manifest = Manifest::from_str(toml).unwrap();
         assert_eq!(manifest.package.name, "my-module");
         assert_eq!(manifest.package.version, "0.1.0");
         assert_eq!(manifest.dependencies.modules.len(), 2);
+        assert_eq!(manifest.dependencies.plugins.len(), 1);
         assert!(manifest.dependencies.modules.contains_key("nu-utils"));
         assert!(manifest.dependencies.modules.contains_key("nu-http"));
+        assert!(manifest.dependencies.plugins.contains_key("nu_plugin_inc"));
     }
 
     #[test]
@@ -300,6 +391,16 @@ x = { git = "https://example.com/x" }
                         },
                     ),
                 ]),
+                plugins: HashMap::from([(
+                    "nu_plugin_inc".to_string(),
+                    PluginDependencySpec {
+                        git: "https://github.com/user/nu_plugin_inc".to_string(),
+                        tag: Some("v0.9.0".to_string()),
+                        rev: None,
+                        branch: None,
+                        bin: Some("nu_plugin_inc".to_string()),
+                    },
+                )]),
             },
         };
 
@@ -314,17 +415,25 @@ x = { git = "https://example.com/x" }
         assert!(toml.contains("nu-version = \"0.91.0\"\n"));
 
         let idx_modules = toml.find("[dependencies.modules]\n").unwrap();
+        let idx_plugins = toml.find("[dependencies.plugins]\n").unwrap();
         let idx_alpha = toml
             .find("alpha = { git = \"https://github.com/user/alpha\", branch = \"main\" }")
             .unwrap();
         let idx_zeta = toml
             .find("zeta = { git = \"https://github.com/user/zeta\", tag = \"v1.0.0\" }")
             .unwrap();
+        let idx_plugin = toml
+            .find(
+                "nu_plugin_inc = { git = \"https://github.com/user/nu_plugin_inc\", tag = \"v0.9.0\", bin = \"nu_plugin_inc\" }",
+            )
+            .unwrap();
         assert!(idx_modules < idx_alpha && idx_alpha < idx_zeta);
+        assert!(idx_plugins < idx_plugin);
 
         let parsed = Manifest::from_str(&toml).unwrap();
         assert_eq!(parsed.package.name, "my-module");
         assert_eq!(parsed.dependencies.modules.len(), 2);
+        assert_eq!(parsed.dependencies.plugins.len(), 1);
     }
 
     #[test]
@@ -354,5 +463,35 @@ nu-version = ">=0.110.0, <0.112.0"
             manifest.package.nu_version.as_deref(),
             Some(">=0.110.0, <0.112.0")
         );
+    }
+
+    #[test]
+    fn reject_plugin_dep_with_no_refs() {
+        let toml = r#"
+[package]
+name = "bad"
+version = "0.1.0"
+
+[dependencies.plugins]
+x = { git = "https://example.com/x", bin = "x" }
+"#;
+
+        let err = Manifest::from_str(toml).unwrap_err();
+        assert!(err.to_string().contains("must specify one"));
+    }
+
+    #[test]
+    fn reject_plugin_dep_with_empty_bin() {
+        let toml = r#"
+[package]
+name = "bad"
+version = "0.1.0"
+
+[dependencies.plugins]
+x = { git = "https://example.com/x", tag = "v1.0.0", bin = "   " }
+"#;
+
+        let err = Manifest::from_str(toml).unwrap_err();
+        assert!(err.to_string().contains("bin cannot be empty"));
     }
 }

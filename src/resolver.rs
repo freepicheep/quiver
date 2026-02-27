@@ -5,7 +5,7 @@ use crate::checksum;
 use crate::error::{QuiverError, Result};
 use crate::git::{self, RefKind};
 use crate::lockfile::{LockedPackage, LockedPackageKind};
-use crate::manifest::{DependencySpec, Manifest};
+use crate::manifest::{DependencySpec, Manifest, PluginDependencySpec};
 
 /// A fully resolved dependency.
 #[derive(Debug, Clone)]
@@ -16,10 +16,22 @@ pub struct ResolvedDep {
     pub rev: String,
 }
 
+/// A fully resolved plugin dependency.
+#[derive(Debug, Clone)]
+pub struct ResolvedPlugin {
+    pub name: String,
+    pub git: String,
+    pub tag: Option<String>,
+    pub rev: String,
+    pub bin: Option<String>,
+}
+
 /// Resolve dependencies from a pre-built dependency map (used by global install).
 ///
 /// Returns a flat list of resolved dependencies, sorted by name.
-pub fn resolve_from_deps(deps: &HashMap<String, DependencySpec>) -> Result<Vec<ResolvedDep>> {
+pub fn resolve_modules_from_deps(
+    deps: &HashMap<String, DependencySpec>,
+) -> Result<Vec<ResolvedDep>> {
     let mut resolved: HashMap<String, ResolvedDep> = HashMap::new();
 
     resolve_deps(deps, &mut resolved)?;
@@ -31,7 +43,7 @@ pub fn resolve_from_deps(deps: &HashMap<String, DependencySpec>) -> Result<Vec<R
 }
 
 /// Resolve dependencies from an existing lockfile without re-fetching.
-pub fn resolve_from_lock(locked: &[LockedPackage]) -> Vec<ResolvedDep> {
+pub fn resolve_modules_from_lock(locked: &[LockedPackage]) -> Vec<ResolvedDep> {
     locked
         .iter()
         .filter(|p| p.kind == LockedPackageKind::Module)
@@ -42,6 +54,48 @@ pub fn resolve_from_lock(locked: &[LockedPackage]) -> Vec<ResolvedDep> {
             rev: p.rev.clone(),
         })
         .collect()
+}
+
+/// Resolve plugin dependencies from a pre-built dependency map.
+pub fn resolve_plugins_from_deps(
+    deps: &HashMap<String, PluginDependencySpec>,
+) -> Result<Vec<ResolvedPlugin>> {
+    let mut resolved = Vec::new();
+
+    for (name, spec) in deps {
+        eprintln!("  Fetching plugin {name} from {}...", spec.git);
+        let repo_path = git::clone_or_fetch(&spec.git)?;
+        let kind = RefKind::from_spec(&spec.tag, &spec.rev, &spec.branch);
+        let rev = git::resolve_ref(&repo_path, spec.ref_spec(), kind)?;
+
+        resolved.push(ResolvedPlugin {
+            name: name.clone(),
+            git: spec.git.clone(),
+            tag: spec.tag.clone(),
+            rev,
+            bin: spec.bin.clone(),
+        });
+    }
+
+    resolved.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(resolved)
+}
+
+/// Resolve plugin dependencies from an existing lockfile without re-fetching.
+pub fn resolve_plugins_from_lock(locked: &[LockedPackage]) -> Vec<ResolvedPlugin> {
+    let mut plugins: Vec<_> = locked
+        .iter()
+        .filter(|p| p.kind == LockedPackageKind::Plugin)
+        .map(|p| ResolvedPlugin {
+            name: p.name.clone(),
+            git: p.git.clone(),
+            tag: p.tag.clone(),
+            rev: p.rev.clone(),
+            bin: p.path.clone(),
+        })
+        .collect();
+    plugins.sort_by(|a, b| a.name.cmp(&b.name));
+    plugins
 }
 
 fn resolve_deps(
