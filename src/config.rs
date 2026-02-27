@@ -177,6 +177,38 @@ pub fn global_lock_path() -> Result<PathBuf> {
     Ok(global_config_dir()?.join("config.lock"))
 }
 
+/// Returns the root install directory.
+///
+/// Uses `~/.local/share/quiver/installs/` on macOS/Linux and
+/// `%APPDATA%/quiver/installs/` on Windows.
+pub fn installs_root_dir() -> Result<PathBuf> {
+    #[cfg(windows)]
+    {
+        let data = dirs::data_dir()
+            .ok_or_else(|| QuiverError::Config("could not determine data directory".to_string()))?;
+        return Ok(data.join("quiver").join("installs"));
+    }
+
+    #[cfg(not(windows))]
+    {
+        let home = dirs::home_dir()
+            .ok_or_else(|| QuiverError::Config("could not determine home directory".to_string()))?;
+        return Ok(home.join(".local").join("share").join("quiver").join("installs"));
+    }
+}
+
+/// Returns the shared module install store:
+/// `~/.local/share/quiver/installs/modules/` on Linux.
+pub fn installs_modules_dir() -> Result<PathBuf> {
+    Ok(installs_root_dir()?.join("modules"))
+}
+
+/// Returns the shared plugin install store:
+/// `~/.local/share/quiver/installs/plugins/` on Linux.
+pub fn installs_plugins_dir() -> Result<PathBuf> {
+    Ok(installs_root_dir()?.join("plugins"))
+}
+
 /// Returns the default global modules directory, using the platform config
 /// directory (where Nushell stores its config) + `vendor/quiver/modules/`.
 ///
@@ -278,6 +310,18 @@ mod tests {
 
         let lock = global_lock_path().unwrap();
         assert!(lock.ends_with("quiver/config.lock"));
+    }
+
+    #[test]
+    fn install_store_paths() {
+        let root = installs_root_dir().unwrap();
+        assert!(root.ends_with("quiver/installs"));
+
+        let modules = installs_modules_dir().unwrap();
+        assert!(modules.ends_with("quiver/installs/modules"));
+
+        let plugins = installs_plugins_dir().unwrap();
+        assert!(plugins.ends_with("quiver/installs/plugins"));
     }
 
     #[test]

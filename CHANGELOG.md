@@ -5,6 +5,9 @@
 - Added configurable `install_mode` in global config (`clone`, `hardlink`, `copy`) for module installation strategy.
 - Default install mode is now `clone` on macOS/Linux (with automatic fallback to `copy` if clone fails) and `hardlink` on Windows.
 
+## Changed
+- Quiver now installs modules (and plugins soon) to `~/.local/share/quiver/` now instead of using the `~/.cache/` dir. This is more like mise-en-place and works better for the binary installs of plugins.
+
 ## Fixed
 - The `mod.nu` generated with `qv init` now properly reflects the ability to use relative paths for nu modules since we have a better nu env.
 

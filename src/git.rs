@@ -2,13 +2,13 @@ use std::path::{Path, PathBuf};
 
 use git2::{FetchOptions, RemoteCallbacks, Repository, build::RepoBuilder};
 
+use crate::config;
 use crate::error::{QuiverError, Result};
 
-/// Returns the global cache directory for git repos: `~/.cache/quiver/git/`.
+/// Returns the global install directory for git repos:
+/// `~/.local/share/quiver/installs/git/` on macOS/Linux.
 pub fn cache_dir() -> Result<PathBuf> {
-    let cache = dirs::cache_dir()
-        .ok_or_else(|| QuiverError::Other("could not determine cache directory".to_string()))?;
-    Ok(cache.join("quiver").join("git"))
+    Ok(config::installs_root_dir()?.join("git"))
 }
 
 /// Convert a git URL into a safe directory name for caching.
