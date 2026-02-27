@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
-use crate::config::{self, GlobalConfig};
+use crate::config::{self, GlobalConfig, InstallMode};
 use crate::error::Result;
 use crate::git;
 use crate::lockfile::{LockedPackage, LockedPackageKind, Lockfile};
@@ -26,6 +26,8 @@ struct NupmMetadataHints {
 /// Run a full local install: resolve -> fetch -> checksum -> place -> lock.
 pub fn install(project_dir: &Path, frozen: bool) -> Result<()> {
     let manifest = Manifest::from_dir(project_dir)?;
+    let global_config = GlobalConfig::load_or_default()?;
+    let install_mode = global_config.install_mode;
     let lock_path = project_dir.join("quiver.lock");
     let nu_env_dir = project_dir.join(NU_ENV_DIR);
     let modules_dir = nu_env_dir.join(MODULES_SUBDIR);
@@ -77,6 +79,7 @@ pub fn install(project_dir: &Path, frozen: bool) -> Result<()> {
         &lock_path,
         &nu_env_dir,
         &display_name,
+        install_mode,
     )
 }
 
@@ -94,6 +97,7 @@ pub fn update(project_dir: &Path) -> Result<()> {
 /// modules to the configured global directory.
 pub fn install_global(frozen: bool) -> Result<()> {
     let config = GlobalConfig::load()?;
+    let install_mode = config.install_mode;
     let modules_dir = config.modules_dir()?;
     let lock_path = config::global_lock_path()?;
     let display_dir = modules_dir.display().to_string();
@@ -123,7 +127,13 @@ pub fn install_global(frozen: bool) -> Result<()> {
         resolver::resolve_from_deps(&config.dependencies)?
     };
 
-    install_resolved_global(&resolved_modules, &modules_dir, &lock_path, &display_dir)
+    install_resolved_global(
+        &resolved_modules,
+        &modules_dir,
+        &lock_path,
+        &display_dir,
+        install_mode,
+    )
 }
 
 /// Install resolved global dependencies and write `config.lock`.
@@ -132,6 +142,7 @@ fn install_resolved_global(
     modules_dir: &Path,
     lock_path: &Path,
     modules_display_name: &str,
+    install_mode: InstallMode,
 ) -> Result<()> {
     std::fs::create_dir_all(modules_dir)?;
 
@@ -143,7 +154,7 @@ fn install_resolved_global(
             dep.name,
             &dep.rev[..12.min(dep.rev.len())]
         );
-        install_dep(dep, modules_dir)?;
+        install_dep(dep, modules_dir, install_mode)?;
 
         let dest = modules_dir.join(&dep.name);
         let sha256 = resolver::compute_checksum(&dest)?;
@@ -183,6 +194,7 @@ fn install_resolved(
     lock_path: &Path,
     nu_env_dir: &Path,
     display_name: &str,
+    install_mode: InstallMode,
 ) -> Result<()> {
     std::fs::create_dir_all(modules_dir)?;
     let mut locked_packages = Vec::new();
@@ -193,7 +205,7 @@ fn install_resolved(
             dep.name,
             &dep.rev[..12.min(dep.rev.len())]
         );
-        install_dep(dep, modules_dir)?;
+        install_dep(dep, modules_dir, install_mode)?;
 
         let dest = modules_dir.join(&dep.name);
         let sha256 = resolver::compute_checksum(&dest)?;
@@ -338,11 +350,133 @@ fn nu_string_literal(path: &Path) -> String {
 }
 
 /// Install a single resolved dependency into the modules directory.
-fn install_dep(dep: &ResolvedDep, modules_dir: &Path) -> Result<String> {
+fn install_dep(dep: &ResolvedDep, modules_dir: &Path, install_mode: InstallMode) -> Result<String> {
     let repo_path = git::clone_or_fetch(&dep.git)?;
     let dest = modules_dir.join(&dep.name);
-    git::export_to(&repo_path, &dep.rev, &dest)?;
+    let staging = modules_dir.join(format!(
+        ".quiver-staging-{}-{}",
+        dep.name,
+        std::process::id()
+    ));
+    if staging.exists() {
+        std::fs::remove_dir_all(&staging)?;
+    }
+
+    git::export_to(&repo_path, &dep.rev, &staging)?;
+    materialize_module_dir(&staging, &dest, install_mode)?;
+    std::fs::remove_dir_all(&staging)?;
     discover_module_use_path(&dest, &dep.name)
+}
+
+fn materialize_module_dir(src: &Path, dest: &Path, mode: InstallMode) -> Result<()> {
+    if dest.exists() {
+        std::fs::remove_dir_all(dest)?;
+    }
+
+    match mode {
+        InstallMode::Clone => {
+            if let Err(err) = clone_dir(src, dest) {
+                eprintln!("Warning: clone mode failed ({err}); falling back to copy.");
+                copy_dir(src, dest)?;
+            }
+            Ok(())
+        }
+        InstallMode::Hardlink => hardlink_dir(src, dest),
+        InstallMode::Copy => copy_dir(src, dest),
+    }
+}
+
+fn clone_dir(src: &Path, dest: &Path) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        copy_with_cp(src, dest, &["-cR"])
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        copy_with_cp(src, dest, &["-a", "--reflink=always"])
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = (src, dest);
+        Err(crate::error::QuiverError::Other(
+            "clone mode is not supported on this platform".to_string(),
+        ))
+    }
+}
+
+fn copy_with_cp(src: &Path, dest: &Path, flags: &[&str]) -> Result<()> {
+    let output = Command::new("cp")
+        .args(flags)
+        .arg(src)
+        .arg(dest)
+        .output()?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let message = if stderr.is_empty() {
+        "cp failed with unknown error".to_string()
+    } else {
+        stderr
+    };
+    Err(crate::error::QuiverError::Other(message))
+}
+
+fn hardlink_dir(src: &Path, dest: &Path) -> Result<()> {
+    std::fs::create_dir_all(dest)?;
+    for entry in WalkDir::new(src)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(std::result::Result::ok)
+    {
+        let relative = entry
+            .path()
+            .strip_prefix(src)
+            .map_err(|e| crate::error::QuiverError::Other(e.to_string()))?;
+        if relative.as_os_str().is_empty() {
+            continue;
+        }
+        let target = dest.join(relative);
+        if entry.file_type().is_dir() {
+            std::fs::create_dir_all(&target)?;
+        } else if entry.file_type().is_file() {
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::hard_link(entry.path(), &target)?;
+        }
+    }
+    Ok(())
+}
+
+fn copy_dir(src: &Path, dest: &Path) -> Result<()> {
+    std::fs::create_dir_all(dest)?;
+    for entry in WalkDir::new(src)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(std::result::Result::ok)
+    {
+        let relative = entry
+            .path()
+            .strip_prefix(src)
+            .map_err(|e| crate::error::QuiverError::Other(e.to_string()))?;
+        if relative.as_os_str().is_empty() {
+            continue;
+        }
+        let target = dest.join(relative);
+        if entry.file_type().is_dir() {
+            std::fs::create_dir_all(&target)?;
+        } else if entry.file_type().is_file() {
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::copy(entry.path(), &target)?;
+        }
+    }
+    Ok(())
 }
 
 fn discover_module_use_path(module_root: &Path, dep_name: &str) -> Result<String> {
@@ -869,6 +1003,7 @@ sha256 = "aaa"
         let config = GlobalConfig {
             modules_dir: None,
             default_git_provider: "github".to_string(),
+            install_mode: InstallMode::Copy,
             dependencies: HashMap::from([(
                 "nu-utils".to_string(),
                 crate::manifest::DependencySpec {
@@ -905,6 +1040,7 @@ sha256 = "aaa"
         let config = GlobalConfig {
             modules_dir: None,
             default_git_provider: "github".to_string(),
+            install_mode: InstallMode::Copy,
             dependencies: HashMap::from([(
                 "nu-utils".to_string(),
                 crate::manifest::DependencySpec {

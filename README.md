@@ -175,6 +175,7 @@ Global config manages global module dependencies.
 
 ```toml
 default_git_provider = "github" # default
+install_mode = "clone"          # default on macOS/Linux; default is "hardlink" on Windows
 
 # optional override
 # modules_dir = "/custom/modules"
@@ -185,6 +186,11 @@ nu-utils = { git = "https://github.com/user/nu-utils", tag = "v1.0.0" }
 
 Supported provider aliases are `github`, `gitlab`, `codeberg`, and `bitbucket`.
 You can also set a custom host like `git.example.com` or a full `https://...` base URL.
+
+`install_mode` controls how modules are materialized into the install directory.
+- `clone`: prefers copy-on-write clone behavior when available; falls back to `copy` if clone fails
+- `hardlink`: uses hardlinks for files
+- `copy`: always copies files
 
 ## Roadmap
 

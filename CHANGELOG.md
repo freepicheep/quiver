@@ -2,6 +2,8 @@
 
 ## Added
 - Ignore the `.nu-env` directory with a generated `.gitignore` upon `qv init` (appends to existing `.gitignore` if one already exists).
+- Added configurable `install_mode` in global config (`clone`, `hardlink`, `copy`) for module installation strategy.
+- Default install mode is now `clone` on macOS/Linux (with automatic fallback to `copy` if clone fails) and `hardlink` on Windows.
 
 ## Fixed
 - The `mod.nu` generated with `qv init` now properly reflects the ability to use relative paths for nu modules since we have a better nu env.

@@ -832,6 +832,7 @@ mod tests {
         GlobalConfig {
             modules_dir: None,
             default_git_provider: provider.to_string(),
+            install_mode: config::InstallMode::Copy,
             dependencies: HashMap::new(),
         }
     }
