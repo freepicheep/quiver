@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::error::{QuiverError, Result};
+use crate::nu;
 
 /// The top-level `nupackage.toml` manifest.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -140,6 +141,11 @@ impl Manifest {
                 "package version cannot be empty".to_string(),
             ));
         }
+        if let Some(nu_version) = &self.package.nu_version {
+            nu::parse_nu_version_requirement(nu_version).map_err(|err| {
+                QuiverError::Manifest(format!("package nu-version '{nu_version}' is invalid: {err}"))
+            })?;
+        }
         for (name, spec) in &self.dependencies.modules {
             spec.validate(name)?;
         }
@@ -271,7 +277,7 @@ x = { git = "https://example.com/x" }
                 description: Some("Example module".to_string()),
                 license: Some("MIT".to_string()),
                 authors: Some(vec!["Alice".to_string(), "Bob".to_string()]),
-                nu_version: Some("0.91".to_string()),
+                nu_version: Some("0.91.0".to_string()),
             },
             dependencies: DependencyGroups {
                 modules: HashMap::from([
@@ -305,7 +311,7 @@ x = { git = "https://example.com/x" }
         assert!(toml.contains("description = \"Example module\"\n"));
         assert!(toml.contains("license = \"MIT\"\n"));
         assert!(toml.contains("authors = [\"Alice\", \"Bob\"]\n"));
-        assert!(toml.contains("nu-version = \"0.91\"\n"));
+        assert!(toml.contains("nu-version = \"0.91.0\"\n"));
 
         let idx_modules = toml.find("[dependencies.modules]\n").unwrap();
         let idx_alpha = toml
@@ -319,5 +325,34 @@ x = { git = "https://example.com/x" }
         let parsed = Manifest::from_str(&toml).unwrap();
         assert_eq!(parsed.package.name, "my-module");
         assert_eq!(parsed.dependencies.modules.len(), 2);
+    }
+
+    #[test]
+    fn reject_invalid_nu_version_requirement() {
+        let toml = r#"
+[package]
+name = "bad"
+version = "0.1.0"
+nu-version = "not-semver"
+"#;
+
+        let err = Manifest::from_str(toml).unwrap_err();
+        assert!(err.to_string().contains("nu-version"));
+    }
+
+    #[test]
+    fn accepts_semver_range_nu_version_requirement() {
+        let toml = r#"
+[package]
+name = "ok"
+version = "0.1.0"
+nu-version = ">=0.110.0, <0.112.0"
+"#;
+
+        let manifest = Manifest::from_str(toml).unwrap();
+        assert_eq!(
+            manifest.package.nu_version.as_deref(),
+            Some(">=0.110.0, <0.112.0")
+        );
     }
 }

@@ -6,6 +6,7 @@ mod git;
 mod installer;
 mod lockfile;
 mod manifest;
+mod nu;
 mod resolver;
 
 use std::io::{self, Write};
@@ -99,7 +100,7 @@ fn cmd_init(
             description: Some(description.unwrap_or_default()),
             license: Some(String::new()),
             authors: Some(Vec::new()),
-            nu_version: Some(detect_nu_version().unwrap_or_default()),
+            nu_version: detect_nu_version(),
         },
         dependencies: Default::default(),
     };
@@ -134,7 +135,7 @@ fn cmd_init(
     let modules_dir = nu_env_dir.join("modules");
     std::fs::create_dir_all(&modules_dir)?;
     installer::write_env_nu(&nu_env_dir, &modules_dir)?;
-    installer::create_nu_symlink(&nu_env_dir)?;
+    installer::create_nu_symlink(&nu_env_dir, manifest.package.nu_version.as_deref())?;
     installer::write_activate_overlay(&nu_env_dir, dir)?;
     ensure_gitignore_ignores_nu_env(dir)?;
 
@@ -813,12 +814,7 @@ fn detect_nu_version() -> Option<String> {
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let version = stdout.trim();
-    if version.is_empty() {
-        None
-    } else {
-        Some(version.to_string())
-    }
+    nu::extract_semver_from_text(&stdout).map(|version| version.to_string())
 }
 
 #[cfg(test)]

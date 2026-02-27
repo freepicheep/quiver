@@ -209,6 +209,12 @@ pub fn installs_plugins_dir() -> Result<PathBuf> {
     Ok(installs_root_dir()?.join("plugins"))
 }
 
+/// Returns the shared Nushell-version install store:
+/// `~/.local/share/quiver/installs/nu_versions/` on macOS/Linux.
+pub fn installs_nu_versions_dir() -> Result<PathBuf> {
+    Ok(installs_root_dir()?.join("nu_versions"))
+}
+
 /// Returns the default global modules directory, using the platform config
 /// directory (where Nushell stores its config) + `vendor/quiver/modules/`.
 ///
@@ -322,6 +328,9 @@ mod tests {
 
         let plugins = installs_plugins_dir().unwrap();
         assert!(plugins.ends_with("quiver/installs/plugins"));
+
+        let nu_versions = installs_nu_versions_dir().unwrap();
+        assert!(nu_versions.ends_with("quiver/installs/nu_versions"));
     }
 
     #[test]
