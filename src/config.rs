@@ -201,12 +201,6 @@ pub fn installs_root_dir() -> Result<PathBuf> {
     }
 }
 
-/// Returns the shared module install store:
-/// `~/.local/share/quiver/installs/modules/` on Linux.
-pub fn installs_modules_dir() -> Result<PathBuf> {
-    Ok(installs_root_dir()?.join("modules"))
-}
-
 /// Returns the shared plugin install store:
 /// `~/.local/share/quiver/installs/plugins/` on Linux.
 pub fn installs_plugins_dir() -> Result<PathBuf> {
@@ -327,7 +321,7 @@ mod tests {
         let root = installs_root_dir().unwrap();
         assert!(root.ends_with("quiver/installs"));
 
-        let modules = installs_modules_dir().unwrap();
+        let modules = installs_root_dir().unwrap().join("modules");
         assert!(modules.ends_with("quiver/installs/modules"));
 
         let plugins = installs_plugins_dir().unwrap();
