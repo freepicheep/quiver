@@ -1,18 +1,31 @@
 # Unreleased
 
+# Version 0.3.0 (2026-03-02)
+
 ## Added
-- Ignore the `.nu-env` directory with a generated `.gitignore` upon `qv init` (appends to existing `.gitignore` if one already exists).
+- Added plugin dependencies via `[dependencies.plugins]` and `qv add-plugin`.
+- Added support for Nushell core plugins as first-class dependencies (for example `qv add-plugin polars`).
+- Added plugin-aware `qv list` and `qv remove` behavior for project dependencies.
+- Added `qv init --nu-version <requirement>` to pin Nushell version requirements at project creation time.
+- Added semver enforcement for `package.nu-version`, including automatic Nushell install from GitHub releases when no matching local binary is available.
+- Added plugin post-install guidance (`plugin add` / `plugin use`) after dependency installation.
+- Added progress bars and colored terminal output for network/download operations.
 - Added configurable `install_mode` in global config (`clone`, `hardlink`, `copy`) for module installation strategy.
-- Default install mode is now `clone` on macOS/Linux (with automatic fallback to `copy` if clone fails) and `hardlink` on Windows.
-- Enforcing semver `package.nu-version` in `nupackage.toml`.
-  - If present, it is enforced.
-  - If the specified version of `nu` is not installed, quiver will attempt to download it from the GitHub releases into `~/.local/share/quiver/installs/nu_versions/<version>/bin/nu`. This will be symlinked the projects `.nu-env/bin/` which is added to path with `activate.nu` and `env.nu`.
+- `qv init` now ensures `.nu-env/` is ignored by Git by creating or updating `.gitignore`.
 
 ## Changed
-- Quiver now installs modules (and plugins soon) to `~/.local/share/quiver/` now instead of using the `~/.cache/` dir. This is more like mise-en-place and works better for the binary installs of plugins.
+- Quiver install artifacts now live under `~/.local/share/quiver/installs/` instead of cache paths.
+- Default install mode is now `clone` on macOS/Linux (with fallback to `copy`) and `hardlink` on Windows.
+- Environment generation now uses `.nu-env/config.nu` (plus `.nu-env/plugins.msgpackz`) and aliases `nu` with both `--config` and `--plugin-config`.
+- Core plugin resolution now prefers binaries that match the selected project Nushell install.
 
 ## Fixed
-- The `mod.nu` generated with `qv init` now properly reflects the ability to use relative paths for nu modules since we have a better nu env.
+- Fixed handling for specific Nushell version downloads and project activation wiring.
+- Fixed scaffolding output in generated `mod.nu` comments for current environment behavior.
+
+## Internal
+- Removed an unused function from config handling.
+- Added repository-local agent guidance in `AGENTS.md`.
 
 # Version 0.2.3 (2026-02-25)
 
