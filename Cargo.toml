@@ -19,6 +19,8 @@ sha2 = "0.10"
 thiserror = "2"
 toml = "1.0.3"
 walkdir = "2"
+indicatif = "0.18.4"
+console = "0.16.2"
 
 # The profile that 'dist' will build with
 [profile.dist]

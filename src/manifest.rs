@@ -544,7 +544,11 @@ nu_plugin_polars = { source = "nu-core", bin = "nu_plugin_polars" }
 "#;
 
         let manifest = Manifest::from_str(toml).unwrap();
-        let plugin = manifest.dependencies.plugins.get("nu_plugin_polars").unwrap();
+        let plugin = manifest
+            .dependencies
+            .plugins
+            .get("nu_plugin_polars")
+            .unwrap();
         assert_eq!(plugin.source.as_deref(), Some("nu-core"));
         assert!(plugin.git.is_empty());
         assert!(plugin.tag.is_none());

@@ -8,6 +8,7 @@ mod lockfile;
 mod manifest;
 mod nu;
 mod resolver;
+mod ui;
 
 use std::io::{self, Write};
 use std::path::Path;
@@ -22,7 +23,7 @@ fn main() {
     let cli = cli::parse();
 
     if let Err(e) = run(cli.command) {
-        eprintln!("error: {e}");
+        ui::error(format!("{e}"));
         std::process::exit(1);
     }
 }
@@ -233,7 +234,7 @@ fn cmd_add(
     let content = manifest.to_toml_string()?;
     std::fs::write(dir.join("nupackage.toml"), content)?;
 
-    eprintln!("Added module '{pkg_name}' to nupackage.toml");
+    ui::success(format!("Added module '{pkg_name}' to nupackage.toml"));
 
     // Run install
     installer::install(dir, false)
@@ -277,7 +278,9 @@ fn cmd_add_plugin(
             .insert(core_plugin_name.clone(), dep_spec);
         let content = manifest.to_toml_string()?;
         std::fs::write(dir.join("nupackage.toml"), content)?;
-        eprintln!("Added core plugin '{core_plugin_name}' to nupackage.toml");
+        ui::success(format!(
+            "Added core plugin '{core_plugin_name}' to nupackage.toml"
+        ));
         return installer::install(dir, false);
     }
 
@@ -300,10 +303,14 @@ fn cmd_add_plugin(
     }
 
     let dep_spec = if tag.is_none() && rev.is_none() && branch.is_none() {
-        eprintln!("Fetching {url} to detect plugin version...");
+        ui::info(format!(
+            "{} plugin source {} to detect version",
+            ui::keyword("Fetching"),
+            url
+        ));
         let repo_path = git::clone_or_fetch(&url)?;
         if let Some(latest) = git::latest_tag(&repo_path)? {
-            eprintln!("  Found latest tag: {latest}");
+            ui::info(format!("{} latest tag {}", ui::keyword("Found"), latest));
             PluginDependencySpec {
                 source: None,
                 git: url.to_string(),
@@ -314,7 +321,11 @@ fn cmd_add_plugin(
             }
         } else {
             let default_br = git::default_branch(&repo_path)?;
-            eprintln!("  No tags found, using branch: {default_br}");
+            ui::warn(format!(
+                "{} tags found; using branch {}",
+                ui::keyword("No"),
+                default_br
+            ));
             PluginDependencySpec {
                 source: None,
                 git: url.to_string(),
@@ -342,7 +353,7 @@ fn cmd_add_plugin(
         .insert(pkg_name.clone(), dep_spec);
     let content = manifest.to_toml_string()?;
     std::fs::write(dir.join("nupackage.toml"), content)?;
-    eprintln!("Added plugin '{pkg_name}' to nupackage.toml");
+    ui::success(format!("Added plugin '{pkg_name}' to nupackage.toml"));
 
     installer::install(dir, false)
 }
@@ -772,7 +783,7 @@ fn write_helix_lsp_config(project_dir: &Path) -> Result<()> {
     std::fs::create_dir_all(&helix_dir)?;
 
     let config_path = helix_dir.join("languages.toml");
-let config = r#"[language-server.nu-lsp]
+    let config = r#"[language-server.nu-lsp]
 command = ".nu-env/bin/nu"
 args = ["--config .nu-env/config.nu", "--plugin-config .nu-env/plugins.msgpackz", "--lsp"]
 "#;
@@ -986,11 +997,15 @@ fn auto_detect_dep_spec(
     branch: Option<String>,
 ) -> Result<DependencySpec> {
     if tag.is_none() && rev.is_none() && branch.is_none() {
-        eprintln!("Fetching {url} to detect version...");
+        ui::info(format!(
+            "{} dependency source {} to detect version",
+            ui::keyword("Fetching"),
+            url
+        ));
         let repo_path = git::clone_or_fetch(url)?;
 
         if let Some(latest) = git::latest_tag(&repo_path)? {
-            eprintln!("  Found latest tag: {latest}");
+            ui::info(format!("{} latest tag {}", ui::keyword("Found"), latest));
             Ok(DependencySpec {
                 git: url.to_string(),
                 tag: Some(latest),
@@ -999,7 +1014,11 @@ fn auto_detect_dep_spec(
             })
         } else {
             let default_br = git::default_branch(&repo_path)?;
-            eprintln!("  No tags found, using branch: {default_br}");
+            ui::warn(format!(
+                "{} tags found; using branch {}",
+                ui::keyword("No"),
+                default_br
+            ));
             Ok(DependencySpec {
                 git: url.to_string(),
                 tag: None,
@@ -1155,7 +1174,10 @@ mod tests {
 
         assert_eq!(
             plugins,
-            vec!["nu_plugin_polars".to_string(), "nu_plugin_query".to_string()]
+            vec![
+                "nu_plugin_polars".to_string(),
+                "nu_plugin_query".to_string()
+            ]
         );
 
         let _ = std::fs::remove_dir_all(bin_dir);

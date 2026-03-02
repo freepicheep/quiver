@@ -1,9 +1,11 @@
 use std::path::{Path, PathBuf};
 
-use git2::{FetchOptions, RemoteCallbacks, Repository, build::RepoBuilder};
+use git2::{FetchOptions, Progress, RemoteCallbacks, Repository, build::RepoBuilder};
+use indicatif::ProgressBar;
 
 use crate::config;
 use crate::error::{QuiverError, Result};
+use crate::ui;
 
 /// Returns the global install directory for git repos:
 /// `~/.local/share/quiver/installs/git/` on macOS/Linux.
@@ -26,27 +28,81 @@ pub fn clone_or_fetch(url: &str) -> Result<PathBuf> {
     std::fs::create_dir_all(&cache)?;
 
     let repo_dir = cache.join(url_to_dirname(url));
+    let repo_label = repo_name_from_url(url).unwrap_or_else(|| url.to_string());
 
     if repo_dir.exists() {
-        // Fetch latest from the remote
+        ui::info(format!(
+            "{} cached repository {}",
+            ui::keyword("Updating"),
+            repo_label
+        ));
+
+        let progress = ui::bytes_progress(format!("fetching {repo_label}"));
         let repo = Repository::open(&repo_dir)?;
         let mut remote = repo.find_remote("origin")?;
-        let callbacks = RemoteCallbacks::new();
+        let callbacks = transfer_progress_callbacks(progress.clone(), repo_label.clone());
         let mut fetch_opts = FetchOptions::new();
         fetch_opts.remote_callbacks(callbacks);
         remote.fetch(&[] as &[&str], Some(&mut fetch_opts), None)?;
+        progress.finish_and_clear();
+        ui::success(format!(
+            "{} repository {}",
+            ui::keyword("Updated"),
+            repo_label
+        ));
         Ok(repo_dir)
     } else {
-        // Fresh clone
-        let callbacks = RemoteCallbacks::new();
+        ui::info(format!(
+            "{} repository {}",
+            ui::keyword("Cloning"),
+            repo_label
+        ));
+
+        let progress = ui::bytes_progress(format!("cloning {repo_label}"));
+        let callbacks = transfer_progress_callbacks(progress.clone(), repo_label.clone());
         let mut fetch_opts = FetchOptions::new();
         fetch_opts.remote_callbacks(callbacks);
 
         RepoBuilder::new()
             .fetch_options(fetch_opts)
             .clone(url, &repo_dir)?;
+        progress.finish_and_clear();
+        ui::success(format!(
+            "{} repository {}",
+            ui::keyword("Cloned"),
+            repo_label
+        ));
 
         Ok(repo_dir)
+    }
+}
+
+fn transfer_progress_callbacks(
+    progress: ProgressBar,
+    repo_label: String,
+) -> RemoteCallbacks<'static> {
+    let mut callbacks = RemoteCallbacks::new();
+    callbacks.transfer_progress(move |stats| {
+        update_transfer_progress(&progress, &repo_label, stats);
+        true
+    });
+    callbacks
+}
+
+fn update_transfer_progress(progress: &ProgressBar, repo_label: &str, stats: Progress<'_>) {
+    let total_objects = stats.total_objects() as u64;
+    let received_objects = stats.received_objects() as u64;
+    let total_deltas = stats.total_deltas() as u64;
+    let indexed_deltas = stats.indexed_deltas() as u64;
+
+    if total_objects > 0 {
+        progress.set_length(total_objects);
+        progress.set_position(received_objects);
+        progress.set_message(format!(
+            "{repo_label} objects {received_objects}/{total_objects} deltas {indexed_deltas}/{total_deltas}"
+        ));
+    } else {
+        progress.set_message(format!("{repo_label} preparing remote objects"));
     }
 }
 

@@ -6,6 +6,7 @@ use crate::error::{QuiverError, Result};
 use crate::git::{self, RefKind};
 use crate::lockfile::{LockedPackage, LockedPackageKind};
 use crate::manifest::{DependencySpec, Manifest, PluginDependencySpec};
+use crate::ui;
 
 /// A fully resolved dependency.
 #[derive(Debug, Clone)]
@@ -75,7 +76,12 @@ pub fn resolve_plugins_from_deps(
             continue;
         }
 
-        eprintln!("  Fetching plugin {name} from {}...", spec.git);
+        ui::info(format!(
+            "{} plugin {} from {}",
+            ui::keyword("Fetching"),
+            name,
+            spec.git
+        ));
         let repo_path = git::clone_or_fetch(&spec.git)?;
         let kind = RefKind::from_spec(&spec.tag, &spec.rev, &spec.branch);
         let rev = git::resolve_ref(&repo_path, spec.ref_spec(), kind)?;
@@ -116,7 +122,12 @@ fn resolve_deps(
 ) -> Result<()> {
     for (name, spec) in deps {
         // Clone or fetch the repo
-        eprintln!("  Fetching {name} from {}...", spec.git);
+        ui::info(format!(
+            "{} module {} from {}",
+            ui::keyword("Fetching"),
+            name,
+            spec.git
+        ));
         let repo_path = git::clone_or_fetch(&spec.git)?;
 
         // Resolve the ref to a commit SHA
@@ -153,7 +164,11 @@ fn resolve_deps(
 
         if let Ok(dep_manifest) = Manifest::from_dir(&tmp) {
             if !dep_manifest.dependencies.modules.is_empty() {
-                eprintln!("  Resolving transitive dependencies for {name}...");
+                ui::info(format!(
+                    "{} transitive dependencies for {}",
+                    ui::keyword("Resolving"),
+                    name
+                ));
                 resolve_deps(&dep_manifest.dependencies.modules, resolved)?;
             }
         }
