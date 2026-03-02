@@ -391,34 +391,63 @@ fn cmd_remove(dir: &Path, name: String) -> Result<()> {
     // Load existing manifest
     let mut manifest = Manifest::from_dir(dir)?;
 
-    // Check the module dep exists
-    if manifest.dependencies.modules.remove(&name).is_none() {
+    // Try removing as a module first
+    if manifest.dependencies.modules.remove(&name).is_some() {
+        // Write updated manifest
+        let content = manifest.to_toml_string()?;
+        std::fs::write(dir.join("nupackage.toml"), content)?;
+        eprintln!("Removed module '{name}' from nupackage.toml");
+
+        // Remove from .nu-env/modules/
+        let module_dir = dir.join(".nu-env").join("modules").join(&name);
+        if module_dir.exists() {
+            std::fs::remove_dir_all(&module_dir)?;
+            eprintln!("Removed .nu-env/modules/{name}/");
+        }
+
+        // Update lockfile: remove the module package entry
+        let lock_path = dir.join("quiver.lock");
+        if lock_path.exists() {
+            let mut lockfile = lockfile::Lockfile::from_path(&lock_path)?;
+            lockfile
+                .packages
+                .retain(|p| !(p.name == name && p.kind == lockfile::LockedPackageKind::Module));
+            lockfile.write_to(&lock_path)?;
+            eprintln!("Updated quiver.lock");
+        }
+    } else if let Some(plugin_spec) = manifest.dependencies.plugins.remove(&name) {
+        // Removing a plugin dependency
+        let content = manifest.to_toml_string()?;
+        std::fs::write(dir.join("nupackage.toml"), content)?;
+        eprintln!("Removed plugin '{name}' from nupackage.toml");
+
+        // Remove plugin binary symlink from .nu-env/bin/
+        let bin_name = plugin_spec.bin.as_deref().unwrap_or(&name);
+        let binary_filename = if cfg!(windows) && !bin_name.ends_with(".exe") {
+            format!("{bin_name}.exe")
+        } else {
+            bin_name.to_string()
+        };
+        let plugin_link = dir.join(".nu-env").join("bin").join(&binary_filename);
+        if plugin_link.exists() || plugin_link.symlink_metadata().is_ok() {
+            std::fs::remove_file(&plugin_link)?;
+            eprintln!("Removed .nu-env/bin/{binary_filename}");
+        }
+
+        // Update lockfile: remove the plugin package entry
+        let lock_path = dir.join("quiver.lock");
+        if lock_path.exists() {
+            let mut lockfile = lockfile::Lockfile::from_path(&lock_path)?;
+            lockfile
+                .packages
+                .retain(|p| !(p.name == name && p.kind == lockfile::LockedPackageKind::Plugin));
+            lockfile.write_to(&lock_path)?;
+            eprintln!("Updated quiver.lock");
+        }
+    } else {
         return Err(error::QuiverError::Manifest(format!(
-            "module dependency '{name}' not found in nupackage.toml"
+            "dependency '{name}' not found in nupackage.toml"
         )));
-    }
-
-    // Write updated manifest
-    let content = manifest.to_toml_string()?;
-    std::fs::write(dir.join("nupackage.toml"), content)?;
-    eprintln!("Removed module '{name}' from nupackage.toml");
-
-    // Remove from .nu-env/modules/
-    let module_dir = dir.join(".nu-env").join("modules").join(&name);
-    if module_dir.exists() {
-        std::fs::remove_dir_all(&module_dir)?;
-        eprintln!("Removed .nu-env/modules/{name}/");
-    }
-
-    // Update lockfile: remove the package entry
-    let lock_path = dir.join("quiver.lock");
-    if lock_path.exists() {
-        let mut lockfile = lockfile::Lockfile::from_path(&lock_path)?;
-        lockfile
-            .packages
-            .retain(|p| !(p.name == name && p.kind == lockfile::LockedPackageKind::Module));
-        lockfile.write_to(&lock_path)?;
-        eprintln!("Updated quiver.lock");
     }
 
     // Regenerate activate.nu from the updated manifest and lockfile state.
@@ -778,19 +807,30 @@ fn write_zed_lsp_config(project_dir: &Path) -> Result<()> {
 fn cmd_list(cwd: &Path) -> Result<()> {
     if cwd.join("nupackage.toml").exists() {
         let modules_dir = cwd.join(".nu-env").join("modules");
+        let bin_dir = cwd.join(".nu-env").join("bin");
         let modules = list_installed_module_names(&modules_dir)?;
+        let plugins = list_installed_plugin_names(&bin_dir)?;
 
-        if modules.is_empty() {
-            eprintln!(
-                "No installed project dependencies found in {}",
-                modules_dir.display(),
-            );
+        if modules.is_empty() && plugins.is_empty() {
+            eprintln!("No installed project dependencies found.");
             return Ok(());
         }
 
-        eprintln!("Installed project modules from {}", modules_dir.display());
-        for module in modules {
-            eprintln!("{module}");
+        if !modules.is_empty() {
+            eprintln!("Installed project modules:");
+            for module in &modules {
+                eprintln!("  {module}");
+            }
+        }
+
+        if !plugins.is_empty() {
+            if !modules.is_empty() {
+                eprintln!();
+            }
+            eprintln!("Installed project plugins:");
+            for plugin in &plugins {
+                eprintln!("  {plugin}");
+            }
         }
     } else {
         let config = GlobalConfig::load_or_default()?;
@@ -835,6 +875,31 @@ fn list_installed_module_names(modules_dir: &Path) -> Result<Vec<String>> {
 
     modules.sort();
     Ok(modules)
+}
+
+fn list_installed_plugin_names(bin_dir: &Path) -> Result<Vec<String>> {
+    if !bin_dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut plugins = Vec::new();
+
+    for entry in std::fs::read_dir(bin_dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+
+        // Strip .exe on Windows for display; only include nu_plugin_* entries
+        let base_name = name_str.strip_suffix(".exe").unwrap_or(name_str);
+        if base_name.starts_with("nu_plugin_") {
+            plugins.push(base_name.to_string());
+        }
+    }
+
+    plugins.sort();
+    Ok(plugins)
 }
 
 fn normalize_dependency_source(input: &str, provider_base_url: Option<&str>) -> Result<String> {
@@ -1075,6 +1140,32 @@ mod tests {
         let root_dir = make_temp_dir("list_missing");
         let modules = list_installed_module_names(&root_dir.join("missing")).unwrap();
         assert!(modules.is_empty());
+        let _ = std::fs::remove_dir_all(root_dir);
+    }
+
+    #[test]
+    fn list_installed_plugin_names_returns_sorted_plugin_binaries() {
+        let bin_dir = make_temp_dir("list_plugins");
+        std::fs::write(bin_dir.join("nu_plugin_query"), "binary").unwrap();
+        std::fs::write(bin_dir.join("nu_plugin_polars"), "binary").unwrap();
+        std::fs::write(bin_dir.join("nu"), "binary").unwrap(); // should be excluded
+        std::fs::write(bin_dir.join("other_file"), "binary").unwrap(); // should be excluded
+
+        let plugins = list_installed_plugin_names(&bin_dir).unwrap();
+
+        assert_eq!(
+            plugins,
+            vec!["nu_plugin_polars".to_string(), "nu_plugin_query".to_string()]
+        );
+
+        let _ = std::fs::remove_dir_all(bin_dir);
+    }
+
+    #[test]
+    fn list_installed_plugin_names_handles_missing_directory() {
+        let root_dir = make_temp_dir("list_plugins_missing");
+        let plugins = list_installed_plugin_names(&root_dir.join("missing")).unwrap();
+        assert!(plugins.is_empty());
         let _ = std::fs::remove_dir_all(root_dir);
     }
 
