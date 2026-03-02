@@ -137,11 +137,11 @@ fn cmd_init(
         eprintln!("Created {}", mod_nu.display());
     }
 
-    // Generate .nu-env/ with activate.nu, env.nu, and bin/nu symlink
+    // Generate .nu-env/ with activate.nu, config.nu, and bin/nu symlink
     let nu_env_dir = dir.join(".nu-env");
     let modules_dir = nu_env_dir.join("modules");
     std::fs::create_dir_all(&modules_dir)?;
-    installer::write_env_nu(&nu_env_dir, &modules_dir)?;
+    installer::write_config_nu(&nu_env_dir, &modules_dir)?;
     installer::create_nu_symlink(&nu_env_dir, manifest.package.nu_version.as_deref())?;
     installer::write_activate_overlay(&nu_env_dir, dir)?;
     ensure_gitignore_ignores_nu_env(dir)?;
@@ -252,7 +252,11 @@ fn cmd_add_plugin(
     if !is_git_url(url.trim())
         && let Some(core_plugin_name) = resolve_core_plugin_name(&url)
     {
-        if manifest.dependencies.plugins.contains_key(&core_plugin_name) {
+        if manifest
+            .dependencies
+            .plugins
+            .contains_key(&core_plugin_name)
+        {
             return Err(error::QuiverError::Manifest(format!(
                 "plugin dependency '{core_plugin_name}' already exists in nupackage.toml"
             )));
@@ -475,19 +479,19 @@ fn cmd_run(cwd: &Path, command: Vec<String>) -> Result<()> {
         return Err(error::QuiverError::NoManifest(cwd.to_path_buf()));
     }
 
-    let env_config_path = cwd.join(".nu-env").join("env.nu");
-    if !env_config_path.exists() {
+    let config_path = cwd.join(".nu-env").join("config.nu");
+    if !config_path.exists() {
         eprintln!("No .nu-env found; running install first...");
         installer::install(cwd, false)?;
     }
 
-    if !env_config_path.exists() {
+    if !config_path.exists() {
         return Err(error::QuiverError::Other(
-            "failed to create .nu-env/env.nu".to_string(),
+            "failed to create .nu-env/config.nu".to_string(),
         ));
     }
 
-    let (program, args) = resolve_run_invocation(&command, &env_config_path, cwd);
+    let (program, args) = resolve_run_invocation(&command, &config_path, cwd);
     let status = Command::new(&program)
         .args(&args)
         .current_dir(cwd)
@@ -502,23 +506,23 @@ fn cmd_run(cwd: &Path, command: Vec<String>) -> Result<()> {
 
 fn resolve_run_invocation(
     command: &[String],
-    env_config_path: &Path,
+    config_path: &Path,
     cwd: &Path,
 ) -> (String, Vec<String>) {
     let executable = command[0].clone();
     let mut args = command[1..].to_vec();
-    let env_config = env_config_path.to_string_lossy().to_string();
+    let config = config_path.to_string_lossy().to_string();
 
     if executable == "nu" {
-        if !args.iter().any(|arg| arg == "--env-config") {
-            args.insert(0, env_config);
-            args.insert(0, "--env-config".to_string());
+        if !args.iter().any(|arg| arg == "--config") {
+            args.insert(0, config);
+            args.insert(0, "--config".to_string());
         }
         return (executable, args);
     }
 
     if is_nushell_script_command(&executable, cwd) {
-        let mut nu_args = vec!["--env-config".to_string(), env_config, executable];
+        let mut nu_args = vec!["--config".to_string(), config, executable];
         nu_args.extend(args);
         return ("nu".to_string(), nu_args);
     }
@@ -739,9 +743,9 @@ fn write_helix_lsp_config(project_dir: &Path) -> Result<()> {
     std::fs::create_dir_all(&helix_dir)?;
 
     let config_path = helix_dir.join("languages.toml");
-    let config = r#"[language-server.nu-lsp]
-command = "nu"
-args = ["--env-config .nu-env/env.nu", "--lsp"]
+let config = r#"[language-server.nu-lsp]
+command = ".nu-env/bin/nu"
+args = ["--config .nu-env/config.nu", "--plugin-config .nu-env/plugins.msgpackz", "--lsp"]
 "#;
 
     std::fs::write(&config_path, config)?;
@@ -758,8 +762,8 @@ fn write_zed_lsp_config(project_dir: &Path) -> Result<()> {
   "lsp": {
     "nu": {
       "binary": {
-        "path": "nu",
-        "arguments": ["--env-config", ".nu-env/env.nu", "--lsp"]
+        "path": ".nu-env/bin/nu",
+        "arguments": ["--config .nu-env/config.nu", "--plugin-config .nu-env/plugins.msgpackz", "--lsp"]
       }
     }
   }
@@ -1075,20 +1079,20 @@ mod tests {
     }
 
     #[test]
-    fn resolve_run_invocation_injects_env_config_for_nu() {
+    fn resolve_run_invocation_injects_config_for_nu() {
         let cwd = make_temp_dir("run_inject_nu");
-        let env_config = cwd.join(".nu-env").join("env.nu");
+        let config = cwd.join(".nu-env").join("config.nu");
         let command = vec![
             "nu".to_string(),
             "script.nu".to_string(),
             "--flag".to_string(),
         ];
 
-        let (program, args) = resolve_run_invocation(&command, &env_config, &cwd);
+        let (program, args) = resolve_run_invocation(&command, &config, &cwd);
 
         assert_eq!(program, "nu");
-        assert_eq!(args[0], "--env-config");
-        assert_eq!(args[1], env_config.to_string_lossy());
+        assert_eq!(args[0], "--config");
+        assert_eq!(args[1], config.to_string_lossy());
         assert_eq!(args[2], "script.nu");
         assert_eq!(args[3], "--flag");
 
@@ -1100,14 +1104,14 @@ mod tests {
         let cwd = make_temp_dir("run_wrap_script");
         let script_path = cwd.join("tool.nu");
         std::fs::write(&script_path, "print 'ok'").unwrap();
-        let env_config = cwd.join(".nu-env").join("env.nu");
+        let config = cwd.join(".nu-env").join("config.nu");
         let command = vec!["tool.nu".to_string(), "arg1".to_string()];
 
-        let (program, args) = resolve_run_invocation(&command, &env_config, &cwd);
+        let (program, args) = resolve_run_invocation(&command, &config, &cwd);
 
         assert_eq!(program, "nu");
-        assert_eq!(args[0], "--env-config");
-        assert_eq!(args[1], env_config.to_string_lossy());
+        assert_eq!(args[0], "--config");
+        assert_eq!(args[1], config.to_string_lossy());
         assert_eq!(args[2], "tool.nu");
         assert_eq!(args[3], "arg1");
 
@@ -1117,10 +1121,10 @@ mod tests {
     #[test]
     fn resolve_run_invocation_leaves_other_commands_unchanged() {
         let cwd = make_temp_dir("run_other_cmd");
-        let env_config = cwd.join(".nu-env").join("env.nu");
+        let config = cwd.join(".nu-env").join("config.nu");
         let command = vec!["echo".to_string(), "hello".to_string()];
 
-        let (program, args) = resolve_run_invocation(&command, &env_config, &cwd);
+        let (program, args) = resolve_run_invocation(&command, &config, &cwd);
 
         assert_eq!(program, "echo");
         assert_eq!(args, vec!["hello".to_string()]);
@@ -1160,18 +1164,18 @@ mod tests {
         // Verify .nu-env files are generated
         let nu_env = project_dir.join(".nu-env");
         assert!(nu_env.join("activate.nu").exists());
-        assert!(nu_env.join("env.nu").exists());
+        assert!(nu_env.join("config.nu").exists());
         assert!(nu_env.join("modules").is_dir());
 
         let activate = std::fs::read_to_string(nu_env.join("activate.nu")).unwrap();
         assert!(activate.contains("export-env {"));
         assert!(activate.contains("source-env"));
-        assert!(activate.contains("export def --wrapped nu [...rest]"));
+        assert!(activate.contains("export alias nu = ^"));
         assert!(activate.contains("export alias deactivate = overlay hide activate"));
 
-        let env_nu = std::fs::read_to_string(nu_env.join("env.nu")).unwrap();
-        assert!(env_nu.contains("export const NU_LIB_DIRS"));
-        assert!(env_nu.contains(".nu-env/modules"));
+        let config_nu = std::fs::read_to_string(nu_env.join("config.nu")).unwrap();
+        assert!(config_nu.contains("export const NU_LIB_DIRS"));
+        assert!(config_nu.contains(".nu-env/modules"));
 
         let _ = std::fs::remove_dir_all(project_dir);
     }
@@ -1202,7 +1206,7 @@ mod tests {
 
         // Verify .nu-env files are generated
         assert!(project_dir.join(".nu-env").join("activate.nu").exists());
-        assert!(project_dir.join(".nu-env").join("env.nu").exists());
+        assert!(project_dir.join(".nu-env").join("config.nu").exists());
 
         let _ = std::fs::remove_dir_all(project_dir);
     }
@@ -1244,8 +1248,9 @@ mod tests {
 
         let content = std::fs::read_to_string(&config_path).unwrap();
         assert!(content.contains("[language-server.nu-lsp]"));
-        assert!(content.contains("command = \"nu\""));
-        assert!(content.contains("--env-config .nu-env/env.nu"));
+        assert!(content.contains("command = \".nu-env/bin/nu\""));
+        assert!(content.contains("--config .nu-env/config.nu"));
+        assert!(content.contains("--plugin-config .nu-env/plugins.msgpackz"));
         assert!(content.contains("--lsp"));
 
         let _ = std::fs::remove_dir_all(project_dir);
@@ -1262,9 +1267,11 @@ mod tests {
 
         let content = std::fs::read_to_string(&config_path).unwrap();
         assert!(content.contains("\"nu\""));
-        assert!(content.contains("\"path\": \"nu\""));
-        assert!(content.contains("--env-config"));
-        assert!(content.contains(".nu-env/env.nu"));
+        assert!(content.contains("\"path\": \".nu-env/bin/nu\""));
+        assert!(content.contains("--config"));
+        assert!(content.contains(".nu-env/config.nu"));
+        assert!(content.contains("--plugin-config"));
+        assert!(content.contains(".nu-env/plugins.msgpackz"));
         assert!(content.contains("--lsp"));
 
         let _ = std::fs::remove_dir_all(project_dir);
