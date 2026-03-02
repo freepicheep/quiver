@@ -324,8 +324,61 @@ fn install_resolved(
     write_config_nu(nu_env_dir, modules_dir)?;
     create_nu_symlink(nu_env_dir, nu_version_req)?;
     write_activate_overlay(nu_env_dir, project_dir)?;
+    print_plugin_registration_instructions(plugins);
 
     Ok(())
+}
+
+fn print_plugin_registration_instructions(plugins: &[ResolvedPlugin]) {
+    let commands = plugin_registration_commands(plugins);
+    if commands.is_empty() {
+        return;
+    }
+
+    ui::info("Run the following to finish enabling your new plugin(s) for this shell:");
+    eprintln!(
+        "  {}",
+        ui::command_with_inline_comment("overlay use .nu-env/activate.nu # sets the nushell env")
+    );
+    eprintln!(
+        "  {}",
+        ui::command_with_inline_comment(
+            "nu # runs the proper version of nu for this project with the module and plugin configs"
+        )
+    );
+    for (plugin_name, use_name) in commands {
+        eprintln!("  {}", ui::command(format!("plugin add {plugin_name}")));
+        eprintln!("  {}", ui::command(format!("plugin use {use_name}")));
+    }
+}
+
+fn plugin_registration_commands(plugins: &[ResolvedPlugin]) -> Vec<(String, String)> {
+    let mut commands = Vec::new();
+    let mut seen = HashSet::new();
+
+    for plugin in plugins {
+        let plugin_name = plugin
+            .bin
+            .clone()
+            .unwrap_or_else(|| plugin.name.clone())
+            .trim()
+            .to_string();
+        if plugin_name.is_empty() {
+            continue;
+        }
+
+        if seen.insert(plugin_name.clone()) {
+            commands.push((plugin_name.clone(), plugin_use_name(&plugin_name)));
+        }
+    }
+
+    commands.sort_by(|a, b| a.0.cmp(&b.0));
+    commands
+}
+
+fn plugin_use_name(plugin_name: &str) -> String {
+    let base = plugin_name.strip_suffix(".exe").unwrap_or(plugin_name);
+    base.strip_prefix("nu_plugin_").unwrap_or(base).to_string()
 }
 
 /// Generate `.nu-env/activate.nu` with a `nu` alias and deactivate alias.
@@ -2362,5 +2415,47 @@ nu_plugin_inc = { git = "https://github.com/nushell/nu_plugin_inc", tag = "v0.91
     fn nu_string_literal_escapes_paths() {
         let literal = nu_string_literal(Path::new(r#"/tmp/dir "with quote"/nu"#));
         assert_eq!(literal, r#""/tmp/dir \"with quote\"/nu""#);
+    }
+
+    #[test]
+    fn plugin_registration_commands_are_sorted_and_deduped() {
+        let commands = plugin_registration_commands(&[
+            ResolvedPlugin {
+                name: "z_plugin".to_string(),
+                git: "nu-core".to_string(),
+                tag: None,
+                rev: "nu-core".to_string(),
+                bin: Some("nu_plugin_zeta".to_string()),
+            },
+            ResolvedPlugin {
+                name: "a_plugin".to_string(),
+                git: "nu-core".to_string(),
+                tag: None,
+                rev: "nu-core".to_string(),
+                bin: None,
+            },
+            ResolvedPlugin {
+                name: "duplicate".to_string(),
+                git: "nu-core".to_string(),
+                tag: None,
+                rev: "nu-core".to_string(),
+                bin: Some("nu_plugin_zeta".to_string()),
+            },
+        ]);
+
+        assert_eq!(
+            commands,
+            vec![
+                ("a_plugin".to_string(), "a_plugin".to_string()),
+                ("nu_plugin_zeta".to_string(), "zeta".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn plugin_use_name_strips_prefix_and_windows_suffix() {
+        assert_eq!(plugin_use_name("nu_plugin_inc"), "inc");
+        assert_eq!(plugin_use_name("nu_plugin_query.exe"), "query");
+        assert_eq!(plugin_use_name("custom_plugin"), "custom_plugin");
     }
 }
