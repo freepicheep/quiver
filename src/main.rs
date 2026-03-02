@@ -35,8 +35,9 @@ fn run(command: Commands) -> Result<()> {
         Commands::Init {
             name,
             version,
+            nu_version,
             description,
-        } => cmd_init(&cwd, name, version, description),
+        } => cmd_init(&cwd, name, version, nu_version, description),
         Commands::Install { global, frozen } => {
             if global {
                 cmd_install_global(frozen)
@@ -84,6 +85,7 @@ fn cmd_init(
     dir: &Path,
     name: Option<String>,
     version: String,
+    nu_version: Option<String>,
     description: Option<String>,
 ) -> Result<()> {
     let nupackage_toml = dir.join("nupackage.toml");
@@ -100,6 +102,13 @@ fn cmd_init(
             .unwrap_or("my-module")
             .to_string()
     });
+    if let Some(ref requested_nu_version) = nu_version {
+        nu::parse_nu_version_requirement(requested_nu_version).map_err(|err| {
+            error::QuiverError::Manifest(format!(
+                "package nu-version '{requested_nu_version}' is invalid: {err}"
+            ))
+        })?;
+    }
 
     let manifest = Manifest {
         package: Package {
@@ -108,7 +117,7 @@ fn cmd_init(
             description: Some(description.unwrap_or_default()),
             license: Some(String::new()),
             authors: Some(Vec::new()),
-            nu_version: detect_nu_version(),
+            nu_version: nu_version.or_else(detect_nu_version),
         },
         dependencies: Default::default(),
     };
@@ -1263,7 +1272,7 @@ mod tests {
     fn init_creates_mod_nu_in_subdir_named_after_current_dir() {
         let project_dir = make_temp_dir("init_subdir");
 
-        cmd_init(&project_dir, None, "0.1.0".to_string(), None).unwrap();
+        cmd_init(&project_dir, None, "0.1.0".to_string(), None, None).unwrap();
 
         let dir_name = project_dir
             .file_name()
@@ -1302,6 +1311,7 @@ mod tests {
             Some("custom-module-name".to_string()),
             "0.1.0".to_string(),
             None,
+            None,
         )
         .unwrap();
 
@@ -1325,10 +1335,54 @@ mod tests {
     }
 
     #[test]
+    fn init_uses_explicit_nu_version_when_provided() {
+        let project_dir = make_temp_dir("init_nu_version");
+        let Some(local_nu_version) = detect_nu_version() else {
+            let _ = std::fs::remove_dir_all(project_dir);
+            return;
+        };
+
+        cmd_init(
+            &project_dir,
+            None,
+            "0.1.0".to_string(),
+            Some(local_nu_version.clone()),
+            None,
+        )
+        .unwrap();
+
+        let manifest_text = std::fs::read_to_string(project_dir.join("nupackage.toml")).unwrap();
+        let manifest = Manifest::from_str(&manifest_text).unwrap();
+        assert_eq!(
+            manifest.package.nu_version.as_deref(),
+            Some(local_nu_version.as_str())
+        );
+
+        let _ = std::fs::remove_dir_all(project_dir);
+    }
+
+    #[test]
+    fn init_rejects_invalid_explicit_nu_version() {
+        let project_dir = make_temp_dir("init_bad_nu_version");
+
+        let err = cmd_init(
+            &project_dir,
+            None,
+            "0.1.0".to_string(),
+            Some("definitely-not-semver".to_string()),
+            None,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("package nu-version"));
+
+        let _ = std::fs::remove_dir_all(project_dir);
+    }
+
+    #[test]
     fn init_creates_gitignore_with_nu_env_entry() {
         let project_dir = make_temp_dir("init_gitignore_create");
 
-        cmd_init(&project_dir, None, "0.1.0".to_string(), None).unwrap();
+        cmd_init(&project_dir, None, "0.1.0".to_string(), None, None).unwrap();
 
         let gitignore = std::fs::read_to_string(project_dir.join(".gitignore")).unwrap();
         assert!(gitignore.lines().any(|line| line.trim() == ".nu-env/"));
@@ -1341,7 +1395,7 @@ mod tests {
         let project_dir = make_temp_dir("init_gitignore_append");
         std::fs::write(project_dir.join(".gitignore"), "target/\n").unwrap();
 
-        cmd_init(&project_dir, None, "0.1.0".to_string(), None).unwrap();
+        cmd_init(&project_dir, None, "0.1.0".to_string(), None, None).unwrap();
 
         let gitignore = std::fs::read_to_string(project_dir.join(".gitignore")).unwrap();
         assert!(gitignore.lines().any(|line| line.trim() == "target/"));

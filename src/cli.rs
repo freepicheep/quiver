@@ -35,6 +35,10 @@ pub enum Commands {
         #[arg(long, default_value = "0.1.0")]
         version: String,
 
+        /// Nushell version requirement for this project (e.g. 0.109.0, >=0.109,<0.111)
+        #[arg(long = "nu-version")]
+        nu_version: Option<String>,
+
         /// Package description
         #[arg(long)]
         description: Option<String>,
@@ -217,6 +221,25 @@ mod tests {
                 assert_eq!(bin.as_deref(), Some("nu_plugin_inc"));
             }
             _ => panic!("expected add-plugin command"),
+        }
+    }
+
+    #[test]
+    fn init_parses_with_nu_version() {
+        let cli = Cli::try_parse_from(["quiver", "init", "--nu-version", "0.109.0"]).unwrap();
+        match cli.command {
+            Commands::Init {
+                name,
+                version,
+                nu_version,
+                description,
+            } => {
+                assert!(name.is_none());
+                assert_eq!(version, "0.1.0");
+                assert_eq!(nu_version.as_deref(), Some("0.109.0"));
+                assert!(description.is_none());
+            }
+            _ => panic!("expected init command"),
         }
     }
 }
