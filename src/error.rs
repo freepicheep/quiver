@@ -33,6 +33,21 @@ pub enum QuiverError {
     #[error("toml serialize error: {0}")]
     TomlSerialize(#[from] toml::ser::Error),
 
+    #[error("checksum source not found for asset '{asset}': {details}")]
+    ChecksumSourceNotFound { asset: String, details: String },
+
+    #[error("checksum parse failure for asset '{asset}': {details}")]
+    ChecksumParse { asset: String, details: String },
+
+    #[error(
+        "checksum mismatch for asset '{asset}': expected {expected_sha256}, got {actual_sha256}"
+    )]
+    ChecksumMismatch {
+        asset: String,
+        expected_sha256: String,
+        actual_sha256: String,
+    },
+
     #[error("{0}")]
     Other(String),
 }

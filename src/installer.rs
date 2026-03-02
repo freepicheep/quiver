@@ -5,6 +5,7 @@ use std::process::{Command, Stdio};
 
 use semver::{Version, VersionReq};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 
 use crate::config::{self, GlobalConfig, InstallMode};
 use crate::error::Result;
@@ -30,11 +31,42 @@ struct NupmMetadataHints {
     entry_hint: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct SecurityPolicy {
+    require_signed_assets: bool,
+    allow_unsigned: bool,
+    no_build_fallback: bool,
+}
+
+#[derive(Debug, Default, Clone)]
+struct DownloadVerificationMetadata {
+    asset_sha256: Option<String>,
+    asset_url: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct GitHubReleaseAssetCandidate {
+    release_tag: String,
+    release_assets: Vec<GitHubReleaseAsset>,
+    asset: GitHubReleaseAsset,
+}
+
 /// Run a full local install: resolve -> fetch -> checksum -> place -> lock.
-pub fn install(project_dir: &Path, frozen: bool) -> Result<()> {
+pub fn install(
+    project_dir: &Path,
+    frozen: bool,
+    allow_unsigned: bool,
+    no_build_fallback: bool,
+) -> Result<()> {
     let manifest = Manifest::from_dir(project_dir)?;
     let global_config = GlobalConfig::load_or_default()?;
     let install_mode = global_config.install_mode;
+    let security_policy = security_policy_for(
+        global_config.security.require_signed_assets,
+        frozen,
+        allow_unsigned,
+        no_build_fallback,
+    );
     let lock_path = project_dir.join("quiver.lock");
     let nu_env_dir = project_dir.join(NU_ENV_DIR);
     let modules_dir = nu_env_dir.join(MODULES_SUBDIR);
@@ -44,7 +76,11 @@ pub fn install(project_dir: &Path, frozen: bool) -> Result<()> {
     if manifest.dependencies.is_empty() {
         ui::warn("No dependencies declared in nupackage.toml.");
         write_config_nu(&nu_env_dir, &modules_dir)?;
-        create_nu_symlink(&nu_env_dir, manifest.package.nu_version.as_deref())?;
+        create_nu_symlink_with_policy(
+            &nu_env_dir,
+            manifest.package.nu_version.as_deref(),
+            security_policy,
+        )?;
         write_activate_overlay(&nu_env_dir, project_dir)?;
         return Ok(());
     }
@@ -116,6 +152,7 @@ pub fn install(project_dir: &Path, frozen: bool) -> Result<()> {
         install_mode,
         frozen,
         frozen_lockfile.as_ref(),
+        security_policy,
     )
 }
 
@@ -126,14 +163,20 @@ pub fn update(project_dir: &Path) -> Result<()> {
     if lock_path.exists() {
         std::fs::remove_file(&lock_path)?;
     }
-    install(project_dir, false)
+    install(project_dir, false, false, false)
 }
 
 /// Run a global install: resolve from `~/.config/quiver/config.toml` and install
 /// modules to the configured global directory.
-pub fn install_global(frozen: bool) -> Result<()> {
+pub fn install_global(frozen: bool, allow_unsigned: bool, no_build_fallback: bool) -> Result<()> {
     let config = GlobalConfig::load()?;
     let install_mode = config.install_mode;
+    let _security_policy = security_policy_for(
+        config.security.require_signed_assets,
+        frozen,
+        allow_unsigned,
+        no_build_fallback,
+    );
     let modules_dir = config.modules_dir()?;
     let lock_path = config::global_lock_path()?;
     let display_dir = modules_dir.display().to_string();
@@ -225,6 +268,8 @@ fn install_resolved_global(
             rev: dep.rev.clone(),
             path: None,
             sha256,
+            asset_sha256: None,
+            asset_url: None,
         });
     }
 
@@ -261,10 +306,16 @@ fn install_resolved(
     install_mode: InstallMode,
     frozen: bool,
     frozen_lockfile: Option<&Lockfile>,
+    security_policy: SecurityPolicy,
 ) -> Result<()> {
     std::fs::create_dir_all(modules_dir)?;
     std::fs::create_dir_all(bin_dir)?;
     let mut locked_packages = Vec::new();
+    let existing_lockfile = if !frozen && lock_path.exists() {
+        Lockfile::from_path(lock_path).ok()
+    } else {
+        None
+    };
 
     for dep in modules {
         safety::validate_dependency_name(&dep.name, "module dependency")?;
@@ -295,6 +346,8 @@ fn install_resolved(
             rev: dep.rev.clone(),
             path: None,
             sha256,
+            asset_sha256: None,
+            asset_url: None,
         });
     }
 
@@ -309,7 +362,17 @@ fn install_resolved(
             plugin.name,
             &plugin.rev[..12.min(plugin.rev.len())]
         ));
-        let (installed_bin, bin_name, version_dir) = install_plugin(plugin, nu_version_req)?;
+        let frozen_locked_plugin = frozen_lockfile
+            .and_then(|lock| lock.find_package(&plugin.name, LockedPackageKind::Plugin));
+        let plugin_install = install_plugin(
+            plugin,
+            nu_version_req,
+            security_policy,
+            frozen_locked_plugin,
+        )?;
+        let installed_bin = plugin_install.installed_bin;
+        let bin_name = plugin_install.bin_name;
+        let version_dir = plugin_install.version_dir;
         link_plugin_into_env(&installed_bin, bin_dir, &bin_name)?;
         let sha256 = resolver::compute_checksum(&version_dir)?;
         if frozen {
@@ -320,6 +383,36 @@ fn install_resolved(
                 &sha256,
             )?;
         }
+        if frozen
+            && let Some(expected_asset_sha) =
+                frozen_locked_plugin.and_then(|locked| locked.asset_sha256.as_deref())
+        {
+            let actual_asset_sha = plugin_install.asset_metadata.asset_sha256.as_deref().ok_or_else(|| {
+                crate::error::QuiverError::Lockfile(format!(
+                    "frozen install requires downloaded asset_sha256 for plugin '{}' but no verified release asset digest was recorded",
+                    plugin.name
+                ))
+            })?;
+            if expected_asset_sha != actual_asset_sha {
+                return Err(crate::error::QuiverError::Lockfile(format!(
+                    "frozen install asset checksum mismatch for plugin '{}': expected {}, got {}",
+                    plugin.name, expected_asset_sha, actual_asset_sha
+                )));
+            }
+        }
+
+        let existing_metadata = existing_lockfile
+            .as_ref()
+            .and_then(|lock| lock.find_package(&plugin.name, LockedPackageKind::Plugin));
+        let asset_sha256 = plugin_install
+            .asset_metadata
+            .asset_sha256
+            .or_else(|| existing_metadata.and_then(|pkg| pkg.asset_sha256.clone()));
+        let asset_url = plugin_install
+            .asset_metadata
+            .asset_url
+            .or_else(|| existing_metadata.and_then(|pkg| pkg.asset_url.clone()));
+
         let locked_tag = if plugin.git == "nu-core" {
             None
         } else {
@@ -343,6 +436,8 @@ fn install_resolved(
             rev: locked_rev,
             path: Some(bin_name),
             sha256,
+            asset_sha256,
+            asset_url,
         });
     }
 
@@ -369,7 +464,7 @@ fn install_resolved(
     let project_dir = nu_env_dir.parent().unwrap_or(nu_env_dir);
 
     write_config_nu(nu_env_dir, modules_dir)?;
-    create_nu_symlink(nu_env_dir, nu_version_req)?;
+    create_nu_symlink_with_policy(nu_env_dir, nu_version_req, security_policy)?;
     write_activate_overlay(nu_env_dir, project_dir)?;
     print_plugin_registration_instructions(plugins);
 
@@ -545,6 +640,22 @@ export alias nu = ^{nu_bin_literal} --config {config_literal} --plugin-config {p
 /// 1. `nu` in PATH (if present and matches `nu-version` when provided)
 /// 2. `~/.local/share/quiver/installs/nu_versions/<version>/` store
 pub fn create_nu_symlink(nu_env_dir: &Path, nu_version_req: Option<&str>) -> Result<()> {
+    create_nu_symlink_with_policy(
+        nu_env_dir,
+        nu_version_req,
+        SecurityPolicy {
+            require_signed_assets: true,
+            allow_unsigned: false,
+            no_build_fallback: false,
+        },
+    )
+}
+
+fn create_nu_symlink_with_policy(
+    nu_env_dir: &Path,
+    nu_version_req: Option<&str>,
+    security_policy: SecurityPolicy,
+) -> Result<()> {
     let bin_dir = nu_env_dir.join(BIN_SUBDIR);
     std::fs::create_dir_all(&bin_dir)?;
 
@@ -555,7 +666,7 @@ pub fn create_nu_symlink(nu_env_dir: &Path, nu_version_req: Option<&str>) -> Res
         std::fs::remove_file(&symlink_path)?;
     }
 
-    let nu_path = match resolve_nu_binary_for_requirement(nu_version_req)? {
+    let nu_path = match resolve_nu_binary_for_requirement(nu_version_req, security_policy)? {
         Some(path) => path,
         None if nu_version_req.is_none() => {
             ui::warn("could not find 'nu' in PATH; skipping .nu-env/bin/nu symlink.");
@@ -581,7 +692,10 @@ pub fn create_nu_symlink(nu_env_dir: &Path, nu_version_req: Option<&str>) -> Res
     Ok(())
 }
 
-fn resolve_nu_binary_for_requirement(nu_version_req: Option<&str>) -> Result<Option<PathBuf>> {
+fn resolve_nu_binary_for_requirement(
+    nu_version_req: Option<&str>,
+    security_policy: SecurityPolicy,
+) -> Result<Option<PathBuf>> {
     let requirement = nu_version_req
         .map(|raw| {
             nu::parse_nu_version_requirement(raw).map_err(|err| {
@@ -591,10 +705,13 @@ fn resolve_nu_binary_for_requirement(nu_version_req: Option<&str>) -> Result<Opt
             })
         })
         .transpose()?;
-    resolve_nu_binary(requirement.as_ref())
+    resolve_nu_binary(requirement.as_ref(), security_policy)
 }
 
-fn resolve_nu_binary(requirement: Option<&VersionReq>) -> Result<Option<PathBuf>> {
+fn resolve_nu_binary(
+    requirement: Option<&VersionReq>,
+    security_policy: SecurityPolicy,
+) -> Result<Option<PathBuf>> {
     if let Some(nu_path) = detect_nu_path() {
         if let Some(req) = requirement {
             if detect_nu_binary_version(&nu_path).is_some_and(|v| req.matches(&v)) {
@@ -620,7 +737,7 @@ fn resolve_nu_binary(requirement: Option<&VersionReq>) -> Result<Option<PathBuf>
 
     if let Some(req) = requirement {
         let target = select_nu_version_to_install(req)?;
-        let path = install_nu_version_from_github_release(&target)?;
+        let path = install_nu_version_from_github_release(&target, security_policy)?;
         return Ok(Some(path));
     }
 
@@ -899,7 +1016,253 @@ fn probe_content_length(url: &str) -> Option<u64> {
     })
 }
 
-fn install_nu_version_from_github_release(version: &Version) -> Result<PathBuf> {
+fn security_policy_for(
+    config_requires_signed_assets: bool,
+    frozen: bool,
+    allow_unsigned_flag: bool,
+    no_build_fallback_flag: bool,
+) -> SecurityPolicy {
+    if frozen {
+        return SecurityPolicy {
+            require_signed_assets: true,
+            allow_unsigned: false,
+            no_build_fallback: true,
+        };
+    }
+
+    let require_signed_assets = if allow_unsigned_flag {
+        false
+    } else {
+        config_requires_signed_assets
+    };
+
+    SecurityPolicy {
+        require_signed_assets,
+        allow_unsigned: allow_unsigned_flag,
+        no_build_fallback: no_build_fallback_flag,
+    }
+}
+
+fn is_asset_verification_error(err: &crate::error::QuiverError) -> bool {
+    matches!(
+        err,
+        crate::error::QuiverError::ChecksumSourceNotFound { .. }
+            | crate::error::QuiverError::ChecksumParse { .. }
+            | crate::error::QuiverError::ChecksumMismatch { .. }
+    )
+}
+
+fn download_text(url: &str, label: &str) -> Result<String> {
+    ui::info(format!("{} {label}", ui::keyword("Downloading")));
+    let output = Command::new("curl")
+        .args(["-fsSL", "-H", "User-Agent: quiver"])
+        .arg(url)
+        .output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(crate::error::QuiverError::Other(format!(
+            "failed to download {label}: {stderr}"
+        )));
+    }
+    String::from_utf8(output.stdout).map_err(|err| {
+        crate::error::QuiverError::Other(format!("invalid UTF-8 while downloading {label}: {err}"))
+    })
+}
+
+fn download_release_checksums(
+    release_assets: &[GitHubReleaseAsset],
+    asset_name: &str,
+    release_label: &str,
+) -> Result<String> {
+    let (source_asset, source_kind) = select_checksum_asset(release_assets, asset_name).ok_or_else(|| {
+        crate::error::QuiverError::ChecksumSourceNotFound {
+            asset: asset_name.to_string(),
+            details: format!(
+                "no checksum asset found in {release_label}; expected SHA256SUMS/checksums.txt or {}.sha256",
+                asset_name
+            ),
+        }
+    })?;
+    if source_asset.browser_download_url.trim().is_empty() {
+        return Err(crate::error::QuiverError::ChecksumSourceNotFound {
+            asset: asset_name.to_string(),
+            details: format!(
+                "checksum asset '{}' in {release_label} had no download URL",
+                source_asset.name
+            ),
+        });
+    }
+    download_text(
+        &source_asset.browser_download_url,
+        &format!("{source_kind} checksum source {}", source_asset.name),
+    )
+}
+
+fn select_checksum_asset<'a>(
+    release_assets: &'a [GitHubReleaseAsset],
+    asset_name: &str,
+) -> Option<(&'a GitHubReleaseAsset, &'static str)> {
+    let preferred = release_assets.iter().find(|asset| {
+        let lower = asset.name.to_ascii_lowercase();
+        lower == "sha256sums"
+            || lower == "sha256sums.txt"
+            || lower == "checksums.txt"
+            || lower == "checksums"
+    });
+    if let Some(asset) = preferred {
+        return Some((asset, "multi-file"));
+    }
+
+    let fallback_name = format!("{}.sha256", asset_name.to_ascii_lowercase());
+    release_assets
+        .iter()
+        .find(|asset| asset.name.to_ascii_lowercase() == fallback_name)
+        .map(|asset| (asset, "single-file"))
+}
+
+fn parse_expected_sha256(checksum_text: &str, asset_name: &str) -> Result<String> {
+    let mut lone_digest: Option<String> = None;
+
+    for raw_line in checksum_text.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        if let Some(hash) = parse_bsd_sha256_line(line, asset_name)? {
+            return Ok(hash);
+        }
+        if let Some(hash) = parse_posix_sha256_line(line, asset_name)? {
+            return Ok(hash);
+        }
+        if let Some(hash) = parse_lone_sha256_line(line, asset_name)? {
+            lone_digest = Some(hash);
+        }
+    }
+
+    lone_digest.ok_or_else(|| crate::error::QuiverError::ChecksumParse {
+        asset: asset_name.to_string(),
+        details: "checksum data did not contain a valid SHA-256 entry for the asset".to_string(),
+    })
+}
+
+fn parse_bsd_sha256_line(line: &str, asset_name: &str) -> Result<Option<String>> {
+    let prefix = "SHA256 (";
+    if !line.starts_with(prefix) {
+        return Ok(None);
+    }
+    let Some(end_name) = line.find(") =") else {
+        return Err(crate::error::QuiverError::ChecksumParse {
+            asset: asset_name.to_string(),
+            details: format!("malformed BSD checksum line: '{line}'"),
+        });
+    };
+    let filename = &line[prefix.len()..end_name];
+    if filename != asset_name {
+        return Ok(None);
+    }
+    let digest = line[end_name + 4..].trim();
+    let normalized =
+        normalize_sha256(digest).ok_or_else(|| crate::error::QuiverError::ChecksumParse {
+            asset: asset_name.to_string(),
+            details: format!("invalid SHA-256 digest for asset '{asset_name}': '{digest}'"),
+        })?;
+    Ok(Some(normalized))
+}
+
+fn parse_posix_sha256_line(line: &str, asset_name: &str) -> Result<Option<String>> {
+    let mut parts = line.split_whitespace();
+    let Some(candidate_digest) = parts.next() else {
+        return Ok(None);
+    };
+    let Some(mut filename) = parts.next() else {
+        return Ok(None);
+    };
+
+    if filename.starts_with('*') {
+        filename = &filename[1..];
+    }
+    if filename != asset_name {
+        return Ok(None);
+    }
+
+    let normalized = normalize_sha256(candidate_digest).ok_or_else(|| {
+        crate::error::QuiverError::ChecksumParse {
+            asset: asset_name.to_string(),
+            details: format!(
+                "invalid SHA-256 digest for asset '{asset_name}': '{candidate_digest}'"
+            ),
+        }
+    })?;
+    Ok(Some(normalized))
+}
+
+fn parse_lone_sha256_line(line: &str, asset_name: &str) -> Result<Option<String>> {
+    if let Some(normalized) = normalize_sha256(line) {
+        return Ok(Some(normalized));
+    }
+
+    if line.chars().all(|c| c.is_ascii_hexdigit()) && line.len() != 64 {
+        return Err(crate::error::QuiverError::ChecksumParse {
+            asset: asset_name.to_string(),
+            details: format!("invalid SHA-256 digest length: '{}'", line.len()),
+        });
+    }
+
+    Ok(None)
+}
+
+fn normalize_sha256(raw: &str) -> Option<String> {
+    let digest = raw.trim().to_ascii_lowercase();
+    if digest.len() != 64 {
+        return None;
+    }
+    if digest.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        Some(digest)
+    } else {
+        None
+    }
+}
+
+fn sha256_file(path: &Path) -> Result<String> {
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn verify_downloaded_asset(path: &Path, asset_name: &str, expected_sha256: &str) -> Result<()> {
+    let expected = normalize_sha256(expected_sha256).ok_or_else(|| {
+        crate::error::QuiverError::ChecksumParse {
+            asset: asset_name.to_string(),
+            details: format!(
+                "expected SHA-256 digest for asset '{}' was malformed: '{}'",
+                asset_name, expected_sha256
+            ),
+        }
+    })?;
+    let actual = sha256_file(path)?;
+    if actual != expected {
+        return Err(crate::error::QuiverError::ChecksumMismatch {
+            asset: asset_name.to_string(),
+            expected_sha256: expected,
+            actual_sha256: actual,
+        });
+    }
+    Ok(())
+}
+
+fn install_nu_version_from_github_release(
+    version: &Version,
+    security_policy: SecurityPolicy,
+) -> Result<PathBuf> {
     let version_dir = config::installs_nu_versions_dir()?.join(version.to_string());
     let binary_name = if cfg!(windows) { "nu.exe" } else { "nu" };
     let installed_path = version_dir.join("bin").join(binary_name);
@@ -911,7 +1274,38 @@ fn install_nu_version_from_github_release(version: &Version) -> Result<PathBuf> 
 
     let asset_suffix = nu_release_asset_suffix()?;
     let asset_name = format!("nu-{version}-{asset_suffix}");
-    let tag_candidates = [version.to_string(), format!("v{version}")];
+    let releases = fetch_nu_github_releases()?;
+    let selected_release = releases
+        .into_iter()
+        .find(|release| {
+            !release.draft
+                && !release.prerelease
+                && parse_version_from_release_tag(&release.tag_name).as_ref() == Some(version)
+                && release.assets.iter().any(|asset| asset.name == asset_name)
+        })
+        .ok_or_else(|| {
+            crate::error::QuiverError::Other(format!(
+                "could not find Nushell release asset '{}' for version {}",
+                asset_name, version
+            ))
+        })?;
+    let asset = selected_release
+        .assets
+        .iter()
+        .find(|candidate| candidate.name == asset_name)
+        .cloned()
+        .ok_or_else(|| {
+            crate::error::QuiverError::Other(format!(
+                "could not locate Nushell release asset '{}' in release {}",
+                asset_name, selected_release.tag_name
+            ))
+        })?;
+    if asset.browser_download_url.trim().is_empty() {
+        return Err(crate::error::QuiverError::Other(format!(
+            "Nushell release asset '{}' did not include a download URL",
+            asset.name
+        )));
+    }
 
     let temp_root = config::installs_root_dir()?.join(format!(
         ".nu-download-{}-{}",
@@ -924,38 +1318,37 @@ fn install_nu_version_from_github_release(version: &Version) -> Result<PathBuf> 
     std::fs::create_dir_all(&temp_root)?;
 
     let archive_path = temp_root.join(&asset_name);
-    let mut downloaded = false;
-    let mut last_download_error = String::new();
-    for tag in &tag_candidates {
-        let url =
-            format!("https://github.com/nushell/nushell/releases/download/{tag}/{asset_name}");
-        match download_file_with_progress(
-            &url,
-            &archive_path,
-            &format!("Nushell {version} release artifact"),
-        ) {
-            Ok(()) => {
-                downloaded = true;
-                break;
-            }
-            Err(err) => {
-                last_download_error = err.to_string();
-            }
-        }
-    }
-
-    if !downloaded {
+    if let Err(err) = download_file_with_progress(
+        &asset.browser_download_url,
+        &archive_path,
+        &format!("Nushell {version} release artifact"),
+    ) {
         let _ = std::fs::remove_dir_all(&temp_root);
         return Err(crate::error::QuiverError::Other(format!(
             "failed to download Nushell {} release artifact '{}' from GitHub: {}",
-            version,
-            asset_name,
-            if last_download_error.is_empty() {
-                "unknown error"
-            } else {
-                &last_download_error
-            }
+            version, asset_name, err
         )));
+    }
+
+    let verification_result: Result<()> = (|| {
+        let checksum_text = download_release_checksums(
+            &selected_release.assets,
+            &asset_name,
+            &format!("Nushell release {}", selected_release.tag_name),
+        )?;
+        let expected_sha256 = parse_expected_sha256(&checksum_text, &asset_name)?;
+        verify_downloaded_asset(&archive_path, &asset_name, &expected_sha256)?;
+        Ok(())
+    })();
+    if let Err(err) = verification_result {
+        if security_policy.require_signed_assets {
+            let _ = std::fs::remove_dir_all(&temp_root);
+            return Err(err);
+        }
+        ui::warn(format!(
+            "SECURITY WARNING: Nushell release asset '{}' could not be verified ({err}); continuing because --allow-unsigned/config override is active",
+            asset_name
+        ));
     }
 
     let extract_dir = temp_root.join("extract");
@@ -1145,10 +1538,20 @@ fn make_executable(path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone)]
+struct PluginInstallResult {
+    installed_bin: PathBuf,
+    bin_name: String,
+    version_dir: PathBuf,
+    asset_metadata: DownloadVerificationMetadata,
+}
+
 fn install_plugin(
     plugin: &ResolvedPlugin,
     nu_version_req: Option<&str>,
-) -> Result<(PathBuf, String, PathBuf)> {
+    security_policy: SecurityPolicy,
+    frozen_locked_plugin: Option<&LockedPackage>,
+) -> Result<PluginInstallResult> {
     safety::validate_dependency_name(&plugin.name, "plugin dependency")?;
     if plugin.git == "nu-core" {
         return install_core_plugin(plugin, nu_version_req);
@@ -1163,18 +1566,51 @@ fn install_plugin(
         .join(version);
     let installed_bin = version_dir.join("bin").join(&binary_filename);
     if installed_bin.is_file() {
-        return Ok((installed_bin, binary_filename, version_dir));
+        return Ok(PluginInstallResult {
+            installed_bin,
+            bin_name: binary_filename,
+            version_dir,
+            asset_metadata: DownloadVerificationMetadata::default(),
+        });
     }
 
     std::fs::create_dir_all(version_dir.join("bin"))?;
 
-    if let Err(err) = install_plugin_from_github_release(plugin, &version_dir, &binary_filename) {
-        ui::warn(format!(
-            "release install for plugin '{}' failed ({err}); falling back to cargo build",
-            plugin.name
-        ));
-        install_plugin_from_cargo_source(plugin, &version_dir, &binary_filename)?;
-    }
+    let asset_metadata = match install_plugin_from_github_release(
+        plugin,
+        &version_dir,
+        &binary_filename,
+        security_policy,
+        frozen_locked_plugin,
+    ) {
+        Ok(metadata) => metadata,
+        Err(err) => {
+            if security_policy.no_build_fallback {
+                return Err(err);
+            }
+            let verification_failure = is_asset_verification_error(&err);
+            if verification_failure && !security_policy.allow_unsigned {
+                return Err(err);
+            }
+            if verification_failure {
+                ui::warn(format!(
+                    "SECURITY WARNING: release verification failed for plugin '{}' ({err}); continuing with local cargo source build because --allow-unsigned was set",
+                    plugin.name
+                ));
+            } else {
+                ui::warn(format!(
+                    "release install for plugin '{}' failed ({err}); falling back to cargo build",
+                    plugin.name
+                ));
+            }
+            ui::warn(format!(
+                "SECURITY WARNING: building plugin '{}' from source locally (trust mode changed)",
+                plugin.name
+            ));
+            install_plugin_from_cargo_source(plugin, &version_dir, &binary_filename)?;
+            DownloadVerificationMetadata::default()
+        }
+    };
 
     if !installed_bin.is_file() {
         return Err(crate::error::QuiverError::Other(format!(
@@ -1183,19 +1619,32 @@ fn install_plugin(
         )));
     }
 
-    Ok((installed_bin, binary_filename, version_dir))
+    Ok(PluginInstallResult {
+        installed_bin,
+        bin_name: binary_filename,
+        version_dir,
+        asset_metadata,
+    })
 }
 
 fn install_core_plugin(
     plugin: &ResolvedPlugin,
     nu_version_req: Option<&str>,
-) -> Result<(PathBuf, String, PathBuf)> {
+) -> Result<PluginInstallResult> {
     safety::validate_dependency_name(&plugin.name, "plugin dependency")?;
     let bin_name = plugin.bin.clone().unwrap_or_else(|| plugin.name.clone());
     safety::validate_binary_name(&bin_name, "plugin dependency bin")?;
     let binary_filename = plugin_binary_filename(&bin_name);
 
-    let nu_path = resolve_nu_binary_for_requirement(nu_version_req)?.ok_or_else(|| {
+    let nu_path = resolve_nu_binary_for_requirement(
+        nu_version_req,
+        SecurityPolicy {
+            require_signed_assets: true,
+            allow_unsigned: false,
+            no_build_fallback: false,
+        },
+    )?
+    .ok_or_else(|| {
         crate::error::QuiverError::Other(
             "could not resolve a Nushell binary while installing core plugin".to_string(),
         )
@@ -1221,14 +1670,24 @@ fn install_core_plugin(
         .join(format!("nu-{nu_version}"));
     let installed_bin = version_dir.join("bin").join(&binary_filename);
     if installed_bin.is_file() {
-        return Ok((installed_bin, binary_filename, version_dir));
+        return Ok(PluginInstallResult {
+            installed_bin,
+            bin_name: binary_filename,
+            version_dir,
+            asset_metadata: DownloadVerificationMetadata::default(),
+        });
     }
 
     std::fs::create_dir_all(version_dir.join("bin"))?;
     std::fs::copy(&source_binary, &installed_bin)?;
     make_executable(&installed_bin)?;
 
-    Ok((installed_bin, binary_filename, version_dir))
+    Ok(PluginInstallResult {
+        installed_bin,
+        bin_name: binary_filename,
+        version_dir,
+        asset_metadata: DownloadVerificationMetadata::default(),
+    })
 }
 
 fn plugin_binary_filename(bin_name: &str) -> String {
@@ -1243,7 +1702,9 @@ fn install_plugin_from_github_release(
     plugin: &ResolvedPlugin,
     version_dir: &Path,
     binary_filename: &str,
-) -> Result<()> {
+    security_policy: SecurityPolicy,
+    _frozen_locked_plugin: Option<&LockedPackage>,
+) -> Result<DownloadVerificationMetadata> {
     let (owner, repo) = parse_github_owner_repo(&plugin.git).ok_or_else(|| {
         crate::error::QuiverError::Other(format!(
             "plugin '{}' git source is not a supported GitHub repo URL",
@@ -1251,17 +1712,17 @@ fn install_plugin_from_github_release(
         ))
     })?;
     let releases = fetch_repo_github_releases(&owner, &repo)?;
-    let asset = select_plugin_release_asset(&releases, plugin.tag.as_deref(), binary_filename)
+    let selected = select_plugin_release_asset(&releases, plugin.tag.as_deref(), binary_filename)
         .ok_or_else(|| {
-            crate::error::QuiverError::Other(format!(
-                "no suitable release asset found for plugin '{}' ({}/{})",
-                plugin.name, owner, repo
-            ))
-        })?;
-    if asset.browser_download_url.trim().is_empty() {
+        crate::error::QuiverError::Other(format!(
+            "no suitable release asset found for plugin '{}' ({}/{})",
+            plugin.name, owner, repo
+        ))
+    })?;
+    if selected.asset.browser_download_url.trim().is_empty() {
         return Err(crate::error::QuiverError::Other(format!(
             "release asset '{}' did not include a download URL",
-            asset.name
+            selected.asset.name
         )));
     }
 
@@ -1275,39 +1736,70 @@ fn install_plugin_from_github_release(
     }
     std::fs::create_dir_all(&temp_root)?;
 
-    let downloaded_path = temp_root.join(&asset.name);
+    let downloaded_path = temp_root.join(&selected.asset.name);
     if let Err(err) = download_file_with_progress(
-        &asset.browser_download_url,
+        &selected.asset.browser_download_url,
         &downloaded_path,
-        &format!("plugin {} asset {}", plugin.name, asset.name),
+        &format!("plugin {} asset {}", plugin.name, selected.asset.name),
     ) {
         let _ = std::fs::remove_dir_all(&temp_root);
         return Err(crate::error::QuiverError::Other(format!(
             "failed downloading plugin release asset '{}': {err}",
-            asset.name,
+            selected.asset.name,
         )));
     }
 
-    let binary = if asset.name.ends_with(".tar.gz") || asset.name.ends_with(".zip") {
-        let extract_dir = temp_root.join("extract");
-        std::fs::create_dir_all(&extract_dir)?;
-        extract_archive(&downloaded_path, &extract_dir)?;
-        find_extracted_binary_named(&extract_dir, binary_filename).ok_or_else(|| {
-            crate::error::QuiverError::Other(format!(
-                "release asset '{}' did not contain '{}'",
-                asset.name, binary_filename
-            ))
-        })?
-    } else {
-        downloaded_path.clone()
+    let mut asset_metadata = DownloadVerificationMetadata {
+        asset_sha256: None,
+        asset_url: Some(selected.asset.browser_download_url.clone()),
     };
+    let verification_result: Result<String> = (|| {
+        let checksum_text = download_release_checksums(
+            &selected.release_assets,
+            &selected.asset.name,
+            &format!("plugin {} release {}", plugin.name, selected.release_tag),
+        )?;
+        let expected_sha256 = parse_expected_sha256(&checksum_text, &selected.asset.name)?;
+        verify_downloaded_asset(&downloaded_path, &selected.asset.name, &expected_sha256)?;
+        sha256_file(&downloaded_path)
+    })();
+    match verification_result {
+        Ok(actual_sha256) => {
+            asset_metadata.asset_sha256 = Some(actual_sha256);
+        }
+        Err(err) => {
+            if security_policy.require_signed_assets {
+                let _ = std::fs::remove_dir_all(&temp_root);
+                return Err(err);
+            }
+            ui::warn(format!(
+                "SECURITY WARNING: plugin '{}' release asset '{}' could not be verified ({err}); continuing because --allow-unsigned/config override is active",
+                plugin.name, selected.asset.name
+            ));
+        }
+    }
+
+    let binary =
+        if selected.asset.name.ends_with(".tar.gz") || selected.asset.name.ends_with(".zip") {
+            let extract_dir = temp_root.join("extract");
+            std::fs::create_dir_all(&extract_dir)?;
+            extract_archive(&downloaded_path, &extract_dir)?;
+            find_extracted_binary_named(&extract_dir, binary_filename).ok_or_else(|| {
+                crate::error::QuiverError::Other(format!(
+                    "release asset '{}' did not contain '{}'",
+                    selected.asset.name, binary_filename
+                ))
+            })?
+        } else {
+            downloaded_path.clone()
+        };
 
     let target = version_dir.join("bin").join(binary_filename);
     std::fs::copy(&binary, &target)?;
     make_executable(&target)?;
     let _ = std::fs::remove_dir_all(&temp_root);
 
-    Ok(())
+    Ok(asset_metadata)
 }
 
 fn install_plugin_from_cargo_source(
@@ -1452,7 +1944,7 @@ fn select_plugin_release_asset(
     releases: &[GitHubRelease],
     preferred_tag: Option<&str>,
     binary_filename: &str,
-) -> Option<GitHubReleaseAsset> {
+) -> Option<GitHubReleaseAssetCandidate> {
     for release in releases {
         if release.draft || release.prerelease {
             continue;
@@ -1473,7 +1965,11 @@ fn select_plugin_release_asset(
             .collect();
         candidates.sort_by(|a, b| b.0.cmp(&a.0));
         if let Some((_, asset)) = candidates.into_iter().next() {
-            return Some(asset);
+            return Some(GitHubReleaseAssetCandidate {
+                release_tag: release.tag_name.clone(),
+                release_assets: release.assets.clone(),
+                asset,
+            });
         }
     }
     None
@@ -2173,7 +2669,7 @@ version = "0.1.0"
         )
         .unwrap();
 
-        install(&project_dir, true).unwrap();
+        install(&project_dir, true, false, false).unwrap();
 
         let nu_env = project_dir.join(".nu-env");
         let activate = std::fs::read_to_string(nu_env.join("activate.nu")).unwrap();
@@ -2210,6 +2706,7 @@ sha256 = "aaa"
             modules_dir: None,
             default_git_provider: "github".to_string(),
             install_mode: InstallMode::Copy,
+            security: crate::config::SecurityConfig::default(),
             dependencies: HashMap::from([(
                 "nu-utils".to_string(),
                 crate::manifest::DependencySpec {
@@ -2247,6 +2744,7 @@ sha256 = "aaa"
             modules_dir: None,
             default_git_provider: "github".to_string(),
             install_mode: InstallMode::Copy,
+            security: crate::config::SecurityConfig::default(),
             dependencies: HashMap::from([(
                 "nu-utils".to_string(),
                 crate::manifest::DependencySpec {
@@ -2338,6 +2836,8 @@ nu_plugin_inc = { git = "https://github.com/nushell/nu_plugin_inc", tag = "v0.91
                 rev: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
                 path: None,
                 sha256: "aaa".to_string(),
+                asset_sha256: None,
+                asset_url: None,
             }],
         };
 
@@ -2531,6 +3031,56 @@ nu_plugin_inc = { git = "https://github.com/nushell/nu_plugin_inc", tag = "v0.91
     }
 
     #[test]
+    fn parse_expected_sha256_supports_common_formats() {
+        let asset = "nu-x86_64-unknown-linux-gnu.tar.gz";
+        let hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let checksum_text =
+            format!("{hash}  {asset}\n{hash} *{asset}\nSHA256 ({asset}) = {hash}\n");
+        let parsed = parse_expected_sha256(&checksum_text, asset).unwrap();
+        assert_eq!(parsed, hash);
+    }
+
+    #[test]
+    fn parse_expected_sha256_rejects_malformed_digest() {
+        let asset = "nu-x86_64-unknown-linux-gnu.tar.gz";
+        let err = parse_expected_sha256("abc123  nu-x86_64-unknown-linux-gnu.tar.gz", asset)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("checksum parse failure"));
+        assert!(err.contains(asset));
+    }
+
+    #[test]
+    fn verify_downloaded_asset_detects_match_and_mismatch() {
+        let root = make_temp_dir("asset_verify");
+        let asset_path = root.join("sample.tar.gz");
+        std::fs::write(&asset_path, b"quiver-security").unwrap();
+
+        let digest = sha256_file(&asset_path).unwrap();
+        assert!(verify_downloaded_asset(&asset_path, "sample.tar.gz", &digest).is_ok());
+
+        let mismatch = verify_downloaded_asset(
+            &asset_path,
+            "sample.tar.gz",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(mismatch.contains("checksum mismatch"));
+        assert!(mismatch.contains("sample.tar.gz"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn frozen_policy_forces_signed_assets_and_disables_fallback() {
+        let policy = security_policy_for(false, true, true, false);
+        assert!(policy.require_signed_assets);
+        assert!(!policy.allow_unsigned);
+        assert!(policy.no_build_fallback);
+    }
+
+    #[test]
     fn frozen_checksum_verification_requires_matching_sha() {
         let lock = Lockfile {
             version: 1,
@@ -2542,6 +3092,8 @@ nu_plugin_inc = { git = "https://github.com/nushell/nu_plugin_inc", tag = "v0.91
                 rev: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
                 path: None,
                 sha256: "deadbeef".to_string(),
+                asset_sha256: None,
+                asset_url: None,
             }],
         };
 

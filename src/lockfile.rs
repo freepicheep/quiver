@@ -24,6 +24,10 @@ pub struct LockedPackage {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
     pub sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub asset_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub asset_url: Option<String>,
 }
 
 /// The kind of installed artifact in the lockfile.
@@ -96,6 +100,8 @@ mod tests {
                     rev: "d4e8f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8".to_string(),
                     path: None,
                     sha256: "abc123".to_string(),
+                    asset_sha256: None,
+                    asset_url: None,
                 },
                 LockedPackage {
                     name: "nu-str-extras".to_string(),
@@ -105,6 +111,8 @@ mod tests {
                     rev: "1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b".to_string(),
                     path: None,
                     sha256: "def456".to_string(),
+                    asset_sha256: None,
+                    asset_url: None,
                 },
                 LockedPackage {
                     name: "nu_plugin_inc".to_string(),
@@ -114,6 +122,13 @@ mod tests {
                     rev: "2a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b".to_string(),
                     path: Some("nu_plugin_inc".to_string()),
                     sha256: "plugin123".to_string(),
+                    asset_sha256: Some(
+                        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                            .to_string(),
+                    ),
+                    asset_url: Some(
+                        "https://github.com/nushell/nu_plugin_inc/releases/download/v0.91.0/nu_plugin_inc-x86_64-unknown-linux-gnu.tar.gz".to_string(),
+                    ),
                 },
             ],
         }
@@ -137,6 +152,8 @@ mod tests {
             .unwrap();
         assert_eq!(pkg.rev, "d4e8f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8");
         assert_eq!(pkg.path, None);
+        assert!(pkg.asset_sha256.is_none());
+        assert!(pkg.asset_url.is_none());
         assert!(
             lock.find_package("nonexistent", LockedPackageKind::Module)
                 .is_none()
@@ -179,6 +196,33 @@ sha256 = "ghi789"
 "#;
         let lock = Lockfile::from_str(toml).unwrap();
         assert_eq!(lock.packages[0].kind, LockedPackageKind::Plugin);
+    }
+
+    #[test]
+    fn parse_optional_asset_metadata() {
+        let toml = r#"
+version = 1
+
+[[package]]
+name = "nu_plugin_inc"
+kind = "plugin"
+git = "https://github.com/nushell/nu_plugin_inc"
+tag = "v0.91.0"
+rev = "9a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b"
+path = "nu_plugin_inc"
+sha256 = "ghi789"
+asset_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+asset_url = "https://example.com/nu_plugin_inc.tar.gz"
+"#;
+        let lock = Lockfile::from_str(toml).unwrap();
+        assert_eq!(
+            lock.packages[0].asset_sha256.as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+        assert_eq!(
+            lock.packages[0].asset_url.as_deref(),
+            Some("https://example.com/nu_plugin_inc.tar.gz")
+        );
     }
 
     #[test]

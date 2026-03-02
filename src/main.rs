@@ -40,11 +40,16 @@ fn run(command: Commands) -> Result<()> {
             nu_version,
             description,
         } => cmd_init(&cwd, name, version, nu_version, description),
-        Commands::Install { global, frozen } => {
+        Commands::Install {
+            global,
+            frozen,
+            allow_unsigned,
+            no_build_fallback,
+        } => {
             if global {
-                cmd_install_global(frozen)
+                cmd_install_global(frozen, allow_unsigned, no_build_fallback)
             } else {
-                cmd_install(&cwd, frozen)
+                cmd_install(&cwd, frozen, allow_unsigned, no_build_fallback)
             }
         }
         Commands::Update => cmd_update(&cwd),
@@ -191,12 +196,17 @@ fn ensure_gitignore_ignores_nu_env(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn cmd_install(dir: &Path, frozen: bool) -> Result<()> {
-    installer::install(dir, frozen)
+fn cmd_install(
+    dir: &Path,
+    frozen: bool,
+    allow_unsigned: bool,
+    no_build_fallback: bool,
+) -> Result<()> {
+    installer::install(dir, frozen, allow_unsigned, no_build_fallback)
 }
 
-fn cmd_install_global(frozen: bool) -> Result<()> {
-    installer::install_global(frozen)
+fn cmd_install_global(frozen: bool, allow_unsigned: bool, no_build_fallback: bool) -> Result<()> {
+    installer::install_global(frozen, allow_unsigned, no_build_fallback)
 }
 
 fn cmd_update(dir: &Path) -> Result<()> {
@@ -249,7 +259,7 @@ fn cmd_add(
     ui::success(format!("Added module '{pkg_name}' to nupackage.toml"));
 
     // Run install
-    installer::install(dir, false)
+    installer::install(dir, false, false, false)
 }
 
 fn cmd_add_plugin(
@@ -293,7 +303,7 @@ fn cmd_add_plugin(
         ui::success(format!(
             "Added core plugin '{core_plugin_name}' to nupackage.toml"
         ));
-        return installer::install(dir, false);
+        return installer::install(dir, false, false, false);
     }
 
     let provider_base = if is_git_url(url.trim()) {
@@ -371,7 +381,7 @@ fn cmd_add_plugin(
     std::fs::write(dir.join("nupackage.toml"), content)?;
     ui::success(format!("Added plugin '{pkg_name}' to nupackage.toml"));
 
-    installer::install(dir, false)
+    installer::install(dir, false, false, false)
 }
 
 fn cmd_add_global(
@@ -412,7 +422,7 @@ fn cmd_add_global(
     eprintln!("Added '{pkg_name}' to global config");
 
     // Run global install
-    installer::install_global(false)
+    installer::install_global(false, false, false)
 }
 
 fn cmd_remove(dir: &Path, name: String) -> Result<()> {
@@ -482,7 +492,7 @@ fn cmd_remove(dir: &Path, name: String) -> Result<()> {
 
     // Regenerate activate.nu from the updated manifest and lockfile state.
     eprintln!("Regenerating activate.nu...");
-    installer::install(dir, false)?;
+    installer::install(dir, false, false, false)?;
 
     Ok(())
 }
@@ -523,7 +533,7 @@ fn cmd_remove_global(name: String) -> Result<()> {
 
     // Regenerate the activate.nu overlay with remaining global packages
     eprintln!("Regenerating global activate.nu...");
-    installer::install_global(false)?;
+    installer::install_global(false, false, false)?;
 
     Ok(())
 }
@@ -542,7 +552,7 @@ fn cmd_run(cwd: &Path, command: Vec<String>) -> Result<()> {
     let config_path = cwd.join(".nu-env").join("config.nu");
     if !config_path.exists() {
         eprintln!("No .nu-env found; running install first...");
-        installer::install(cwd, false)?;
+        installer::install(cwd, false, false, false)?;
     }
 
     if !config_path.exists() {
@@ -1078,6 +1088,7 @@ mod tests {
             modules_dir: None,
             default_git_provider: provider.to_string(),
             install_mode: config::InstallMode::Copy,
+            security: config::SecurityConfig::default(),
             dependencies: HashMap::new(),
         }
     }

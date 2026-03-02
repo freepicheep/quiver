@@ -201,6 +201,9 @@ install_mode = "clone"          # default on macOS/Linux; default is "hardlink" 
 
 [dependencies]
 nu-utils = { git = "https://github.com/user/nu-utils", tag = "v1.0.0" }
+
+[security]
+require_signed_assets = true # default
 ```
 
 Supported provider aliases are `github`, `gitlab`, `codeberg`, and `bitbucket`.
@@ -217,6 +220,8 @@ For plugin dependencies, Quiver installs in this order:
 1. GitHub releases artifact matching current platform/arch (preferred).
 2. Cargo build fallback from source if no usable release artifact is available.
 
+Use `qv install --no-build-fallback` to disable source-build fallback.
+
 After Quiver installs a plugin, make sure you enable it by running the version of nu for the package you are working in.
 
 ```nu
@@ -224,6 +229,24 @@ overlay use .nu-env/activate.nu # activates the env for this project
 nu # runs the alias for the project's nu version with the modules and plugins properly pointed
 plugin add <nu_plugin_name>
 plugin use <name>
+```
+
+## Supply Chain Security
+
+Quiver verifies SHA-256 checksums for downloaded release artifacts (Nushell archives and plugin release assets) before extraction or install.
+
+- Default behavior is fail-closed: installs stop if checksum data is missing, unparseable, or mismatched.
+- Quiver looks for checksum assets in the same release:
+  - preferred: `SHA256SUMS` or `checksums.txt`
+  - fallback: `<asset>.sha256`
+- `qv install --frozen` enforces secure behavior even if local overrides are set.
+- `qv install --allow-unsigned` is an explicit insecure override. Use only when you accept reduced integrity guarantees.
+- If plugin release install fails and fallback remains enabled, Quiver may compile from source locally. This is a different trust boundary than verified release artifacts.
+
+For CI, use:
+
+```bash
+qv install --frozen --no-build-fallback
 ```
 
 ## Disclaimer
