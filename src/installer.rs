@@ -13,6 +13,7 @@ use crate::lockfile::{LockedPackage, LockedPackageKind, Lockfile};
 use crate::manifest::Manifest;
 use crate::nu;
 use crate::resolver::{self, ResolvedDep, ResolvedPlugin};
+use crate::safety;
 use crate::ui;
 use walkdir::WalkDir;
 
@@ -49,6 +50,7 @@ pub fn install(project_dir: &Path, frozen: bool) -> Result<()> {
     }
 
     // Determine whether to re-resolve or use the lockfile
+    let mut frozen_lockfile: Option<Lockfile> = None;
     let (resolved_modules, resolved_plugins) = if frozen {
         // --frozen: use lockfile only
         if !lock_path.exists() {
@@ -57,6 +59,7 @@ pub fn install(project_dir: &Path, frozen: bool) -> Result<()> {
             ));
         }
         let lockfile = Lockfile::from_path(&lock_path)?;
+        frozen_lockfile = Some(lockfile.clone());
         ui::info(format!(
             "{} locked dependencies (--frozen)",
             ui::keyword("Using")
@@ -111,6 +114,8 @@ pub fn install(project_dir: &Path, frozen: bool) -> Result<()> {
         manifest.package.nu_version.as_deref(),
         &display_name,
         install_mode,
+        frozen,
+        frozen_lockfile.as_ref(),
     )
 }
 
@@ -138,6 +143,7 @@ pub fn install_global(frozen: bool) -> Result<()> {
         return Ok(());
     }
 
+    let mut frozen_lockfile: Option<Lockfile> = None;
     let resolved_modules = if frozen {
         if !lock_path.exists() {
             return Err(crate::error::QuiverError::Lockfile(
@@ -145,6 +151,7 @@ pub fn install_global(frozen: bool) -> Result<()> {
             ));
         }
         let lockfile = Lockfile::from_path(&lock_path)?;
+        frozen_lockfile = Some(lockfile.clone());
         ui::info(format!(
             "{} locked global dependencies (--frozen)",
             ui::keyword("Using")
@@ -170,6 +177,8 @@ pub fn install_global(frozen: bool) -> Result<()> {
         &lock_path,
         &display_dir,
         install_mode,
+        frozen,
+        frozen_lockfile.as_ref(),
     )
 }
 
@@ -180,12 +189,15 @@ fn install_resolved_global(
     lock_path: &Path,
     modules_display_name: &str,
     install_mode: InstallMode,
+    frozen: bool,
+    frozen_lockfile: Option<&Lockfile>,
 ) -> Result<()> {
     std::fs::create_dir_all(modules_dir)?;
 
     let mut locked_packages = Vec::new();
 
     for dep in modules {
+        safety::validate_dependency_name(&dep.name, "module dependency")?;
         ui::info(format!(
             "{} module {}@{}",
             ui::keyword("Installing"),
@@ -196,6 +208,14 @@ fn install_resolved_global(
 
         let dest = modules_dir.join(&dep.name);
         let sha256 = resolver::compute_checksum(&dest)?;
+        if frozen {
+            verify_frozen_checksum(
+                frozen_lockfile,
+                &dep.name,
+                LockedPackageKind::Module,
+                &sha256,
+            )?;
+        }
 
         locked_packages.push(LockedPackage {
             name: dep.name.clone(),
@@ -210,11 +230,13 @@ fn install_resolved_global(
 
     locked_packages.sort_by(|a, b| a.kind.cmp(&b.kind).then(a.name.cmp(&b.name)));
 
-    let lockfile = Lockfile {
-        version: 1,
-        packages: locked_packages,
-    };
-    lockfile.write_to(lock_path)?;
+    if !frozen {
+        let lockfile = Lockfile {
+            version: 1,
+            packages: locked_packages,
+        };
+        lockfile.write_to(lock_path)?;
+    }
 
     let module_count = modules.len();
     let module_suffix = if module_count == 1 { "" } else { "s" };
@@ -237,12 +259,15 @@ fn install_resolved(
     nu_version_req: Option<&str>,
     display_name: &str,
     install_mode: InstallMode,
+    frozen: bool,
+    frozen_lockfile: Option<&Lockfile>,
 ) -> Result<()> {
     std::fs::create_dir_all(modules_dir)?;
     std::fs::create_dir_all(bin_dir)?;
     let mut locked_packages = Vec::new();
 
     for dep in modules {
+        safety::validate_dependency_name(&dep.name, "module dependency")?;
         ui::info(format!(
             "{} module {}@{}",
             ui::keyword("Installing"),
@@ -253,6 +278,14 @@ fn install_resolved(
 
         let dest = modules_dir.join(&dep.name);
         let sha256 = resolver::compute_checksum(&dest)?;
+        if frozen {
+            verify_frozen_checksum(
+                frozen_lockfile,
+                &dep.name,
+                LockedPackageKind::Module,
+                &sha256,
+            )?;
+        }
 
         locked_packages.push(LockedPackage {
             name: dep.name.clone(),
@@ -266,6 +299,10 @@ fn install_resolved(
     }
 
     for plugin in plugins {
+        safety::validate_dependency_name(&plugin.name, "plugin dependency")?;
+        if let Some(bin) = plugin.bin.as_deref() {
+            safety::validate_binary_name(bin, "plugin dependency bin")?;
+        }
         ui::info(format!(
             "{} plugin {}@{}",
             ui::keyword("Installing"),
@@ -275,6 +312,14 @@ fn install_resolved(
         let (installed_bin, bin_name, version_dir) = install_plugin(plugin, nu_version_req)?;
         link_plugin_into_env(&installed_bin, bin_dir, &bin_name)?;
         let sha256 = resolver::compute_checksum(&version_dir)?;
+        if frozen {
+            verify_frozen_checksum(
+                frozen_lockfile,
+                &plugin.name,
+                LockedPackageKind::Plugin,
+                &sha256,
+            )?;
+        }
         let locked_tag = if plugin.git == "nu-core" {
             None
         } else {
@@ -304,11 +349,13 @@ fn install_resolved(
     locked_packages.sort_by(|a, b| a.kind.cmp(&b.kind).then(a.name.cmp(&b.name)));
 
     // Write lockfile
-    let lockfile = Lockfile {
-        version: 1,
-        packages: locked_packages,
-    };
-    lockfile.write_to(lock_path)?;
+    if !frozen {
+        let lockfile = Lockfile {
+            version: 1,
+            packages: locked_packages,
+        };
+        lockfile.write_to(lock_path)?;
+    }
 
     let module_count = modules.len();
     let plugin_count = plugins.len();
@@ -379,6 +426,36 @@ fn plugin_registration_commands(plugins: &[ResolvedPlugin]) -> Vec<(String, Stri
 fn plugin_use_name(plugin_name: &str) -> String {
     let base = plugin_name.strip_suffix(".exe").unwrap_or(plugin_name);
     base.strip_prefix("nu_plugin_").unwrap_or(base).to_string()
+}
+
+fn verify_frozen_checksum(
+    frozen_lockfile: Option<&Lockfile>,
+    name: &str,
+    kind: LockedPackageKind,
+    actual_sha256: &str,
+) -> Result<()> {
+    let lockfile = frozen_lockfile.ok_or_else(|| {
+        crate::error::QuiverError::Lockfile(
+            "internal error: frozen install missing loaded lockfile".to_string(),
+        )
+    })?;
+    let expected = lockfile.find_package(name, kind.clone()).ok_or_else(|| {
+        crate::error::QuiverError::Lockfile(format!(
+            "frozen install expected package '{name}' ({kind:?}) in lockfile but it was missing"
+        ))
+    })?;
+    if expected.sha256.trim().is_empty() {
+        return Err(crate::error::QuiverError::Lockfile(format!(
+            "frozen install requires non-empty sha256 for package '{name}' ({kind:?})"
+        )));
+    }
+    if expected.sha256 != actual_sha256 {
+        return Err(crate::error::QuiverError::Lockfile(format!(
+            "checksum mismatch for package '{name}' ({kind:?}): expected {}, got {}",
+            expected.sha256, actual_sha256
+        )));
+    }
+    Ok(())
 }
 
 /// Generate `.nu-env/activate.nu` with a `nu` alias and deactivate alias.
@@ -1072,11 +1149,13 @@ fn install_plugin(
     plugin: &ResolvedPlugin,
     nu_version_req: Option<&str>,
 ) -> Result<(PathBuf, String, PathBuf)> {
+    safety::validate_dependency_name(&plugin.name, "plugin dependency")?;
     if plugin.git == "nu-core" {
         return install_core_plugin(plugin, nu_version_req);
     }
 
     let bin_name = plugin.bin.clone().unwrap_or_else(|| plugin.name.clone());
+    safety::validate_binary_name(&bin_name, "plugin dependency bin")?;
     let binary_filename = plugin_binary_filename(&bin_name);
     let version = plugin.tag.clone().unwrap_or_else(|| plugin.rev.clone());
     let version_dir = config::installs_plugins_dir()?
@@ -1111,7 +1190,9 @@ fn install_core_plugin(
     plugin: &ResolvedPlugin,
     nu_version_req: Option<&str>,
 ) -> Result<(PathBuf, String, PathBuf)> {
+    safety::validate_dependency_name(&plugin.name, "plugin dependency")?;
     let bin_name = plugin.bin.clone().unwrap_or_else(|| plugin.name.clone());
+    safety::validate_binary_name(&bin_name, "plugin dependency bin")?;
     let binary_filename = plugin_binary_filename(&bin_name);
 
     let nu_path = resolve_nu_binary_for_requirement(nu_version_req)?.ok_or_else(|| {
@@ -1281,6 +1362,7 @@ fn link_plugin_into_env(
     bin_dir: &Path,
     binary_filename: &str,
 ) -> Result<()> {
+    safety::validate_binary_name(binary_filename, "plugin binary filename")?;
     std::fs::create_dir_all(bin_dir)?;
     let link_path = bin_dir.join(binary_filename);
     if link_path.exists() || link_path.symlink_metadata().is_ok() {
@@ -1460,13 +1542,14 @@ fn nu_string_literal(path: &Path) -> String {
 
 /// Install a single resolved dependency into the modules directory.
 fn install_dep(dep: &ResolvedDep, modules_dir: &Path, install_mode: InstallMode) -> Result<String> {
+    safety::validate_dependency_name(&dep.name, "module dependency")?;
     let repo_path = git::clone_or_fetch(&dep.git)?;
     let dest = modules_dir.join(&dep.name);
-    let staging = modules_dir.join(format!(
-        ".quiver-staging-{}-{}",
-        dep.name,
-        std::process::id()
-    ));
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let staging = modules_dir.join(format!(".quiver-staging-{}-{unique}", std::process::id()));
     if staging.exists() {
         std::fs::remove_dir_all(&staging)?;
     }
@@ -1596,7 +1679,7 @@ fn discover_module_use_path(module_root: &Path, dep_name: &str) -> Result<String
     }
 
     if let Some(package_name) = metadata.package_name.as_deref() {
-        if let Some(subdir) = normalized_relative_path(Path::new(package_name)) {
+        if let Some(subdir) = safety::normalized_relative_path(Path::new(package_name)) {
             if module_root.join(&subdir).join("mod.nu").is_file() {
                 push_unique_path(&mut candidates, &mut seen, subdir);
             }
@@ -1747,7 +1830,7 @@ fn module_subpath_from_hint(module_root: &Path, hint: &str) -> Option<PathBuf> {
         return None;
     }
 
-    let hint_path = normalized_relative_path(Path::new(&normalized_hint))?;
+    let hint_path = safety::normalized_relative_path(Path::new(&normalized_hint))?;
     let subdir = if hint_path.file_name().and_then(|name| name.to_str()) == Some("mod.nu") {
         hint_path
             .parent()
@@ -1761,18 +1844,6 @@ fn module_subpath_from_hint(module_root: &Path, hint: &str) -> Option<PathBuf> {
     } else {
         None
     }
-}
-
-fn normalized_relative_path(path: &Path) -> Option<PathBuf> {
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::Normal(segment) => normalized.push(segment),
-            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
-        }
-    }
-    Some(normalized)
 }
 
 fn find_mod_nu_dirs(module_root: &Path) -> Vec<PathBuf> {
@@ -1789,7 +1860,7 @@ fn find_mod_nu_dirs(module_root: &Path) -> Vec<PathBuf> {
 
         if let Ok(relative_file) = entry.path().strip_prefix(module_root) {
             let parent = relative_file.parent().unwrap_or_else(|| Path::new(""));
-            if let Some(normalized) = normalized_relative_path(parent) {
+            if let Some(normalized) = safety::normalized_relative_path(parent) {
                 dirs.push(normalized);
             }
         }
@@ -2457,5 +2528,40 @@ nu_plugin_inc = { git = "https://github.com/nushell/nu_plugin_inc", tag = "v0.91
         assert_eq!(plugin_use_name("nu_plugin_inc"), "inc");
         assert_eq!(plugin_use_name("nu_plugin_query.exe"), "query");
         assert_eq!(plugin_use_name("custom_plugin"), "custom_plugin");
+    }
+
+    #[test]
+    fn frozen_checksum_verification_requires_matching_sha() {
+        let lock = Lockfile {
+            version: 1,
+            packages: vec![LockedPackage {
+                name: "nu-utils".to_string(),
+                kind: LockedPackageKind::Module,
+                git: "https://github.com/example/nu-utils".to_string(),
+                tag: Some("v1.0.0".to_string()),
+                rev: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+                path: None,
+                sha256: "deadbeef".to_string(),
+            }],
+        };
+
+        assert!(
+            verify_frozen_checksum(
+                Some(&lock),
+                "nu-utils",
+                LockedPackageKind::Module,
+                "deadbeef"
+            )
+            .is_ok()
+        );
+        assert!(
+            verify_frozen_checksum(
+                Some(&lock),
+                "nu-utils",
+                LockedPackageKind::Module,
+                "cafebabe"
+            )
+            .is_err()
+        );
     }
 }

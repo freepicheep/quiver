@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 
 use git2::{FetchOptions, Progress, RemoteCallbacks, Repository, build::RepoBuilder};
 use indicatif::ProgressBar;
+use sha2::{Digest, Sha256};
 
 use crate::config;
 use crate::error::{QuiverError, Result};
@@ -15,10 +16,29 @@ pub fn cache_dir() -> Result<PathBuf> {
 
 /// Convert a git URL into a safe directory name for caching.
 fn url_to_dirname(url: &str) -> String {
-    url.replace("://", "_")
-        .replace('/', "_")
-        .replace('\\', "_")
-        .replace('.', "_")
+    let digest = Sha256::digest(url.as_bytes());
+    format!("repo-{}", hex::encode(digest))
+}
+
+fn normalize_git_url(url: &str) -> String {
+    url.trim()
+        .trim_end_matches('/')
+        .trim_end_matches(".git")
+        .to_string()
+}
+
+fn ensure_origin_matches(repo: &Repository, expected_url: &str) -> Result<()> {
+    let origin = repo.find_remote("origin")?;
+    let actual = origin.url().ok_or_else(|| {
+        QuiverError::Other("cached repository has an origin remote without URL".to_string())
+    })?;
+    if normalize_git_url(actual) == normalize_git_url(expected_url) {
+        return Ok(());
+    }
+    Err(QuiverError::Other(format!(
+        "cached repository origin mismatch: expected '{}', found '{}'. Remove cache directory and retry.",
+        expected_url, actual
+    )))
 }
 
 /// Clone a repository into the cache, or fetch updates if it already exists.
@@ -39,6 +59,7 @@ pub fn clone_or_fetch(url: &str) -> Result<PathBuf> {
 
         let progress = ui::bytes_progress(format!("fetching {repo_label}"));
         let repo = Repository::open(&repo_dir)?;
+        ensure_origin_matches(&repo, url)?;
         let mut remote = repo.find_remote("origin")?;
         let callbacks = transfer_progress_callbacks(progress.clone(), repo_label.clone());
         let mut fetch_opts = FetchOptions::new();
@@ -150,7 +171,12 @@ pub fn export_to(repo_path: &Path, sha: &str, dest: &Path) -> Result<()> {
     std::fs::create_dir_all(dest)?;
 
     // Walk the tree and write files
+    let mut io_error: Option<std::io::Error> = None;
+    let mut git_error: Option<git2::Error> = None;
     tree.walk(git2::TreeWalkMode::PreOrder, |dir, entry| {
+        if io_error.is_some() || git_error.is_some() {
+            return git2::TreeWalkResult::Abort;
+        }
         let name = match entry.name() {
             Some(n) => n,
             None => return git2::TreeWalkResult::Ok,
@@ -159,21 +185,41 @@ pub fn export_to(repo_path: &Path, sha: &str, dest: &Path) -> Result<()> {
 
         match entry.kind() {
             Some(git2::ObjectType::Tree) => {
-                let _ = std::fs::create_dir_all(&path);
-            }
-            Some(git2::ObjectType::Blob) => {
-                if let Ok(obj) = repo.find_blob(entry.id()) {
-                    if let Some(parent) = path.parent() {
-                        let _ = std::fs::create_dir_all(parent);
-                    }
-                    let _ = std::fs::write(&path, obj.content());
+                if let Err(err) = std::fs::create_dir_all(&path) {
+                    io_error = Some(err);
+                    return git2::TreeWalkResult::Abort;
                 }
             }
+            Some(git2::ObjectType::Blob) => match repo.find_blob(entry.id()) {
+                Ok(obj) => {
+                    if let Some(parent) = path.parent()
+                        && let Err(err) = std::fs::create_dir_all(parent)
+                    {
+                        io_error = Some(err);
+                        return git2::TreeWalkResult::Abort;
+                    }
+                    if let Err(err) = std::fs::write(&path, obj.content()) {
+                        io_error = Some(err);
+                        return git2::TreeWalkResult::Abort;
+                    }
+                }
+                Err(err) => {
+                    git_error = Some(err);
+                    return git2::TreeWalkResult::Abort;
+                }
+            },
             _ => {}
         }
 
         git2::TreeWalkResult::Ok
     })?;
+
+    if let Some(err) = io_error {
+        return Err(err.into());
+    }
+    if let Some(err) = git_error {
+        return Err(err.into());
+    }
 
     Ok(())
 }
@@ -249,4 +295,58 @@ pub fn default_branch(repo_path: &Path) -> Result<String> {
     Err(QuiverError::Other(
         "could not determine default branch".to_string(),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_repo_dir(label: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "quiver_git_test_{}_{}_{}",
+            label,
+            std::process::id(),
+            unique
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn url_cache_key_is_stable_and_not_lossy() {
+        let first = url_to_dirname("https://github.com/org/repo.with.dot");
+        let second = url_to_dirname("https://github.com/org_repo/with/dot");
+        assert_ne!(first, second);
+        assert_eq!(
+            first,
+            url_to_dirname("https://github.com/org/repo.with.dot")
+        );
+    }
+
+    #[test]
+    fn origin_match_allows_normalized_git_urls() {
+        let dir = temp_repo_dir("origin_normalized");
+        let repo = Repository::init(&dir).unwrap();
+        repo.remote("origin", "https://github.com/example/project.git")
+            .unwrap();
+
+        assert!(ensure_origin_matches(&repo, "https://github.com/example/project").is_ok());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn origin_match_rejects_mismatched_cached_repo() {
+        let dir = temp_repo_dir("origin_mismatch");
+        let repo = Repository::init(&dir).unwrap();
+        repo.remote("origin", "https://github.com/example/project.git")
+            .unwrap();
+
+        assert!(ensure_origin_matches(&repo, "https://github.com/example/other").is_err());
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

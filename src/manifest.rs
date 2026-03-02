@@ -4,6 +4,7 @@ use std::path::Path;
 
 use crate::error::{QuiverError, Result};
 use crate::nu;
+use crate::safety;
 
 /// The top-level `nupackage.toml` manifest.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -253,10 +254,15 @@ impl Manifest {
             })?;
         }
         for (name, spec) in &self.dependencies.modules {
+            safety::validate_dependency_name(name, "module dependency")?;
             spec.validate(name)?;
         }
         for (name, spec) in &self.dependencies.plugins {
+            safety::validate_dependency_name(name, "plugin dependency")?;
             spec.validate(name)?;
+            if let Some(bin) = spec.bin.as_deref() {
+                safety::validate_binary_name(bin, "plugin dependency bin")?;
+            }
         }
         Ok(())
     }

@@ -8,6 +8,7 @@ mod lockfile;
 mod manifest;
 mod nu;
 mod resolver;
+mod safety;
 mod ui;
 
 use std::io::{self, Write};
@@ -18,6 +19,7 @@ use cli::Commands;
 use config::GlobalConfig;
 use error::Result;
 use manifest::{DependencySpec, Manifest, Package, PluginDependencySpec};
+use safety::{validate_binary_name, validate_dependency_name};
 
 fn main() {
     let cli = cli::parse();
@@ -222,6 +224,7 @@ fn cmd_add(
     let pkg_name = git::repo_name_from_url(&url).ok_or_else(|| {
         error::QuiverError::Other(format!("could not determine package name from URL: {url}"))
     })?;
+    validate_dependency_name(&pkg_name, "module dependency")?;
 
     // Check if already added
     if manifest.dependencies.modules.contains_key(&pkg_name) {
@@ -304,6 +307,10 @@ fn cmd_add_plugin(
     let pkg_name = git::repo_name_from_url(&url).ok_or_else(|| {
         error::QuiverError::Other(format!("could not determine package name from URL: {url}"))
     })?;
+    validate_dependency_name(&pkg_name, "plugin dependency")?;
+    if let Some(ref bin_name) = bin {
+        validate_binary_name(bin_name, "plugin dependency bin")?;
+    }
 
     if manifest.dependencies.plugins.contains_key(&pkg_name) {
         return Err(error::QuiverError::Manifest(format!(
@@ -385,6 +392,7 @@ fn cmd_add_global(
     let pkg_name = git::repo_name_from_url(&url).ok_or_else(|| {
         error::QuiverError::Other(format!("could not determine package name from URL: {url}"))
     })?;
+    validate_dependency_name(&pkg_name, "module dependency")?;
 
     // Check if already added
     if config.dependencies.contains_key(&pkg_name) {
@@ -408,6 +416,7 @@ fn cmd_add_global(
 }
 
 fn cmd_remove(dir: &Path, name: String) -> Result<()> {
+    validate_dependency_name(&name, "dependency")?;
     // Load existing manifest
     let mut manifest = Manifest::from_dir(dir)?;
 
@@ -443,6 +452,7 @@ fn cmd_remove(dir: &Path, name: String) -> Result<()> {
 
         // Remove plugin binary symlink from .nu-env/bin/
         let bin_name = plugin_spec.bin.as_deref().unwrap_or(&name);
+        validate_binary_name(bin_name, "plugin dependency bin")?;
         let binary_filename = if cfg!(windows) && !bin_name.ends_with(".exe") {
             format!("{bin_name}.exe")
         } else {
@@ -478,6 +488,7 @@ fn cmd_remove(dir: &Path, name: String) -> Result<()> {
 }
 
 fn cmd_remove_global(name: String) -> Result<()> {
+    validate_dependency_name(&name, "dependency")?;
     let mut config = GlobalConfig::load()?;
 
     // Check the dep exists
