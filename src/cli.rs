@@ -78,7 +78,7 @@ pub enum Commands {
 
     /// Add a plugin dependency from a git URL or owner/repo shorthand
     AddPlugin {
-        /// Git URL (e.g. https://github.com/user/nu_plugin_inc) or owner/repo shorthand
+        /// Git URL, owner/repo shorthand, or core plugin name (e.g. polars)
         url: String,
 
         /// Pin to a specific tag

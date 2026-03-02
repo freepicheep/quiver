@@ -63,6 +63,18 @@ pub fn resolve_plugins_from_deps(
     let mut resolved = Vec::new();
 
     for (name, spec) in deps {
+        let source = spec.source.as_deref().unwrap_or("git");
+        if source == "nu-core" {
+            resolved.push(ResolvedPlugin {
+                name: name.clone(),
+                git: "nu-core".to_string(),
+                tag: None,
+                rev: "nu-core".to_string(),
+                bin: spec.bin.clone(),
+            });
+            continue;
+        }
+
         eprintln!("  Fetching plugin {name} from {}...", spec.git);
         let repo_path = git::clone_or_fetch(&spec.git)?;
         let kind = RefKind::from_spec(&spec.tag, &spec.rev, &spec.branch);

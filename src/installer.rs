@@ -257,16 +257,30 @@ fn install_resolved(
             plugin.name,
             &plugin.rev[..12.min(plugin.rev.len())]
         );
-        let (installed_bin, bin_name, version_dir) = install_plugin(plugin)?;
+        let (installed_bin, bin_name, version_dir) = install_plugin(plugin, nu_version_req)?;
         link_plugin_into_env(&installed_bin, bin_dir, &bin_name)?;
         let sha256 = resolver::compute_checksum(&version_dir)?;
+        let locked_tag = if plugin.git == "nu-core" {
+            None
+        } else {
+            plugin.tag.clone()
+        };
+        let locked_rev = if plugin.git == "nu-core" {
+            version_dir
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("nu-core")
+                .to_string()
+        } else {
+            plugin.rev.clone()
+        };
 
         locked_packages.push(LockedPackage {
             name: plugin.name.clone(),
             kind: LockedPackageKind::Plugin,
             git: plugin.git.clone(),
-            tag: plugin.tag.clone(),
-            rev: plugin.rev.clone(),
+            tag: locked_tag,
+            rev: locked_rev,
             path: Some(bin_name),
             sha256,
         });
@@ -382,19 +396,9 @@ pub fn create_nu_symlink(nu_env_dir: &Path, nu_version_req: Option<&str>) -> Res
         std::fs::remove_file(&symlink_path)?;
     }
 
-    let requirement = nu_version_req
-        .map(|raw| {
-            nu::parse_nu_version_requirement(raw).map_err(|err| {
-                crate::error::QuiverError::Manifest(format!(
-                    "package nu-version '{raw}' is invalid: {err}"
-                ))
-            })
-        })
-        .transpose()?;
-
-    let nu_path = match resolve_nu_binary(requirement.as_ref())? {
+    let nu_path = match resolve_nu_binary_for_requirement(nu_version_req)? {
         Some(path) => path,
-        None if requirement.is_none() => {
+        None if nu_version_req.is_none() => {
             eprintln!("Warning: could not find 'nu' in PATH; skipping .nu-env/bin/nu symlink.");
             return Ok(());
         }
@@ -416,6 +420,19 @@ pub fn create_nu_symlink(nu_env_dir: &Path, nu_version_req: Option<&str>) -> Res
 
     eprintln!("Linked .nu-env/bin/nu -> {}", nu_path.display());
     Ok(())
+}
+
+fn resolve_nu_binary_for_requirement(nu_version_req: Option<&str>) -> Result<Option<PathBuf>> {
+    let requirement = nu_version_req
+        .map(|raw| {
+            nu::parse_nu_version_requirement(raw).map_err(|err| {
+                crate::error::QuiverError::Manifest(format!(
+                    "package nu-version '{raw}' is invalid: {err}"
+                ))
+            })
+        })
+        .transpose()?;
+    resolve_nu_binary(requirement.as_ref())
 }
 
 fn resolve_nu_binary(requirement: Option<&VersionReq>) -> Result<Option<PathBuf>> {
@@ -449,6 +466,27 @@ fn resolve_nu_binary(requirement: Option<&VersionReq>) -> Result<Option<PathBuf>
     }
 
     Ok(None)
+}
+
+fn core_plugin_candidate_paths(nu_path: &Path, binary_filename: &str) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+
+    if let Some(nu_bin_dir) = nu_path.parent() {
+        candidates.push(nu_bin_dir.join(binary_filename));
+        if nu_bin_dir.file_name().and_then(|name| name.to_str()) == Some("bin")
+            && let Some(version_dir) = nu_bin_dir.parent()
+        {
+            candidates.push(version_dir.join("plugins").join(binary_filename));
+        }
+    }
+
+    candidates
+}
+
+fn find_core_plugin_binary_for_nu(nu_path: &Path, binary_filename: &str) -> Option<PathBuf> {
+    core_plugin_candidate_paths(nu_path, binary_filename)
+        .into_iter()
+        .find(|candidate| candidate.is_file())
 }
 
 /// Detect the absolute path to the user's `nu` binary from PATH.
@@ -863,7 +901,14 @@ fn make_executable(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn install_plugin(plugin: &ResolvedPlugin) -> Result<(PathBuf, String, PathBuf)> {
+fn install_plugin(
+    plugin: &ResolvedPlugin,
+    nu_version_req: Option<&str>,
+) -> Result<(PathBuf, String, PathBuf)> {
+    if plugin.git == "nu-core" {
+        return install_core_plugin(plugin, nu_version_req);
+    }
+
     let bin_name = plugin.bin.clone().unwrap_or_else(|| plugin.name.clone());
     let binary_filename = plugin_binary_filename(&bin_name);
     let version = plugin.tag.clone().unwrap_or_else(|| plugin.rev.clone());
@@ -891,6 +936,49 @@ fn install_plugin(plugin: &ResolvedPlugin) -> Result<(PathBuf, String, PathBuf)>
             binary_filename, plugin.name
         )));
     }
+
+    Ok((installed_bin, binary_filename, version_dir))
+}
+
+fn install_core_plugin(
+    plugin: &ResolvedPlugin,
+    nu_version_req: Option<&str>,
+) -> Result<(PathBuf, String, PathBuf)> {
+    let bin_name = plugin.bin.clone().unwrap_or_else(|| plugin.name.clone());
+    let binary_filename = plugin_binary_filename(&bin_name);
+
+    let nu_path = resolve_nu_binary_for_requirement(nu_version_req)?.ok_or_else(|| {
+        crate::error::QuiverError::Other(
+            "could not resolve a Nushell binary while installing core plugin".to_string(),
+        )
+    })?;
+    let nu_version = detect_nu_binary_version(&nu_path).ok_or_else(|| {
+        crate::error::QuiverError::Other(format!(
+            "failed to detect Nushell version from {} while installing core plugin '{}'",
+            nu_path.display(),
+            plugin.name
+        ))
+    })?;
+    let source_binary = find_core_plugin_binary_for_nu(&nu_path, &binary_filename).ok_or_else(|| {
+        crate::error::QuiverError::Other(format!(
+            "core plugin '{}' ({}) was not found next to '{}' or in quiver's nu-version plugin store",
+            plugin.name,
+            binary_filename,
+            nu_path.display()
+        ))
+    })?;
+
+    let version_dir = config::installs_plugins_dir()?
+        .join(&plugin.name)
+        .join(format!("nu-{nu_version}"));
+    let installed_bin = version_dir.join("bin").join(&binary_filename);
+    if installed_bin.is_file() {
+        return Ok((installed_bin, binary_filename, version_dir));
+    }
+
+    std::fs::create_dir_all(version_dir.join("bin"))?;
+    std::fs::copy(&source_binary, &installed_bin)?;
+    make_executable(&installed_bin)?;
 
     Ok((installed_bin, binary_filename, version_dir))
 }
@@ -2106,6 +2194,44 @@ nu_plugin_inc = { git = "https://github.com/nushell/nu_plugin_inc", tag = "v0.91
         assert_eq!(count, 2);
         assert!(version_dir.join("plugins").join(formats).is_file());
         assert!(version_dir.join("plugins").join(query).is_file());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn find_core_plugin_binary_prefers_same_dir_as_nu() {
+        let root = make_temp_dir("core_plugin_same_dir");
+        let nu_dir = root.join("usr").join("local").join("bin");
+        std::fs::create_dir_all(&nu_dir).unwrap();
+        let nu_path = nu_dir.join("nu");
+        std::fs::write(&nu_path, "nu").unwrap();
+        let plugin_name = plugin_test_name("nu_plugin_query");
+        let plugin_path = nu_dir.join(&plugin_name);
+        std::fs::write(&plugin_path, "query").unwrap();
+
+        let found =
+            find_core_plugin_binary_for_nu(&nu_path, &plugin_name.to_string_lossy()).unwrap();
+        assert_eq!(found, plugin_path);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn find_core_plugin_binary_checks_quiver_version_plugins_dir() {
+        let root = make_temp_dir("core_plugin_quiver_store");
+        let version_bin = root.join("nu_versions").join("0.110.0").join("bin");
+        std::fs::create_dir_all(&version_bin).unwrap();
+        let nu_path = version_bin.join("nu");
+        std::fs::write(&nu_path, "nu").unwrap();
+        let plugin_name = plugin_test_name("nu_plugin_polars");
+        let plugins_dir = root.join("nu_versions").join("0.110.0").join("plugins");
+        std::fs::create_dir_all(&plugins_dir).unwrap();
+        let plugin_path = plugins_dir.join(&plugin_name);
+        std::fs::write(&plugin_path, "polars").unwrap();
+
+        let found =
+            find_core_plugin_binary_for_nu(&nu_path, &plugin_name.to_string_lossy()).unwrap();
+        assert_eq!(found, plugin_path);
 
         let _ = std::fs::remove_dir_all(root);
     }

@@ -248,6 +248,35 @@ fn cmd_add_plugin(
     bin: Option<String>,
 ) -> Result<()> {
     let mut manifest = Manifest::from_dir(dir)?;
+
+    if !is_git_url(url.trim())
+        && let Some(core_plugin_name) = resolve_core_plugin_name(&url)
+    {
+        if manifest.dependencies.plugins.contains_key(&core_plugin_name) {
+            return Err(error::QuiverError::Manifest(format!(
+                "plugin dependency '{core_plugin_name}' already exists in nupackage.toml"
+            )));
+        }
+
+        let dep_spec = PluginDependencySpec {
+            source: Some("nu-core".to_string()),
+            git: String::new(),
+            tag: None,
+            rev: None,
+            branch: None,
+            bin: Some(core_plugin_name.clone()),
+        };
+        dep_spec.validate(&core_plugin_name)?;
+        manifest
+            .dependencies
+            .plugins
+            .insert(core_plugin_name.clone(), dep_spec);
+        let content = manifest.to_toml_string()?;
+        std::fs::write(dir.join("nupackage.toml"), content)?;
+        eprintln!("Added core plugin '{core_plugin_name}' to nupackage.toml");
+        return installer::install(dir, false);
+    }
+
     let provider_base = if is_git_url(url.trim()) {
         None
     } else {
@@ -272,6 +301,7 @@ fn cmd_add_plugin(
         if let Some(latest) = git::latest_tag(&repo_path)? {
             eprintln!("  Found latest tag: {latest}");
             PluginDependencySpec {
+                source: None,
                 git: url.to_string(),
                 tag: Some(latest),
                 rev: None,
@@ -282,6 +312,7 @@ fn cmd_add_plugin(
             let default_br = git::default_branch(&repo_path)?;
             eprintln!("  No tags found, using branch: {default_br}");
             PluginDependencySpec {
+                source: None,
                 git: url.to_string(),
                 tag: None,
                 rev: None,
@@ -291,6 +322,7 @@ fn cmd_add_plugin(
         }
     } else {
         PluginDependencySpec {
+            source: None,
             git: url.to_string(),
             tag,
             rev,
@@ -828,6 +860,36 @@ fn normalize_dependency_source(input: &str, provider_base_url: Option<&str>) -> 
     )))
 }
 
+fn resolve_core_plugin_name(input: &str) -> Option<String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let normalized = trimmed.to_ascii_lowercase().replace('-', "_");
+    let alias = match normalized.as_str() {
+        "custom_values" => "nu_plugin_custom_values",
+        "example" => "nu_plugin_example",
+        "formats" => "nu_plugin_formats",
+        "gstat" => "nu_plugin_gstat",
+        "inc" => "nu_plugin_inc",
+        "polars" | "polors" => "nu_plugin_polars",
+        "query" => "nu_plugin_query",
+        "stress_internals" => "nu_plugin_stress_internals",
+        _ => "",
+    };
+
+    if !alias.is_empty() {
+        return Some(alias.to_string());
+    }
+
+    if normalized.starts_with("nu_plugin_") {
+        return Some(normalized);
+    }
+
+    None
+}
+
 fn is_git_url(value: &str) -> bool {
     value.contains("://") || value.starts_with("git@")
 }
@@ -964,6 +1026,30 @@ mod tests {
     fn normalize_dependency_source_requires_provider_for_shorthand() {
         let err = normalize_dependency_source("owner/repo", None).unwrap_err();
         assert!(err.to_string().contains("default git provider"));
+    }
+
+    #[test]
+    fn resolve_core_plugin_name_handles_short_aliases_and_typos() {
+        assert_eq!(
+            resolve_core_plugin_name("polars"),
+            Some("nu_plugin_polars".to_string())
+        );
+        assert_eq!(
+            resolve_core_plugin_name("polors"),
+            Some("nu_plugin_polars".to_string())
+        );
+        assert_eq!(
+            resolve_core_plugin_name("gstat"),
+            Some("nu_plugin_gstat".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_core_plugin_name_accepts_full_name() {
+        assert_eq!(
+            resolve_core_plugin_name("nu_plugin_query"),
+            Some("nu_plugin_query".to_string())
+        );
     }
 
     #[test]

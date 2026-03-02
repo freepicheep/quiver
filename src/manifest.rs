@@ -58,6 +58,9 @@ pub struct DependencySpec {
 /// A single plugin dependency specification from `[dependencies.plugins]`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PluginDependencySpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default)]
     pub git: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tag: Option<String>,
@@ -106,8 +109,34 @@ impl DependencySpec {
 }
 
 impl PluginDependencySpec {
-    /// Validate that exactly one of tag/rev/branch is specified.
+    /// Validate plugin dependency source and ref requirements.
     pub fn validate(&self, name: &str) -> Result<()> {
+        let source = self.source.as_deref().unwrap_or("git");
+        if !matches!(source, "git" | "nu-core") {
+            return Err(QuiverError::Manifest(format!(
+                "plugin dependency '{name}': unsupported source '{source}' (expected 'git' or 'nu-core')"
+            )));
+        }
+
+        if source == "nu-core" {
+            if !self.git.trim().is_empty() {
+                return Err(QuiverError::Manifest(format!(
+                    "plugin dependency '{name}': git is not allowed when source = 'nu-core'"
+                )));
+            }
+            if self.tag.is_some() || self.rev.is_some() || self.branch.is_some() {
+                return Err(QuiverError::Manifest(format!(
+                    "plugin dependency '{name}': tag/rev/branch are not allowed when source = 'nu-core'"
+                )));
+            }
+            if self.bin.as_deref().is_some_and(|bin| bin.trim().is_empty()) {
+                return Err(QuiverError::Manifest(format!(
+                    "plugin dependency '{name}': bin cannot be empty when set"
+                )));
+            }
+            return Ok(());
+        }
+
         validate_ref_fields(
             name,
             "plugin dependency",
@@ -140,7 +169,14 @@ impl PluginDependencySpec {
     }
 
     fn to_inline_toml(&self) -> Result<String> {
-        let mut parts = vec![format!("git = {}", toml_scalar(&self.git)?)];
+        let source = self.source.as_deref().unwrap_or("git");
+        let mut parts = Vec::new();
+        if self.source.is_some() {
+            parts.push(format!("source = {}", toml_scalar(&source)?));
+        }
+        if source != "nu-core" {
+            parts.push(format!("git = {}", toml_scalar(&self.git)?));
+        }
         if let Some(tag) = &self.tag {
             parts.push(format!("tag = {}", toml_scalar(tag)?));
         }
@@ -394,6 +430,7 @@ x = { git = "https://example.com/x" }
                 plugins: HashMap::from([(
                     "nu_plugin_inc".to_string(),
                     PluginDependencySpec {
+                        source: None,
                         git: "https://github.com/user/nu_plugin_inc".to_string(),
                         tag: Some("v0.9.0".to_string()),
                         rev: None,
@@ -493,5 +530,40 @@ x = { git = "https://example.com/x", tag = "v1.0.0", bin = "   " }
 
         let err = Manifest::from_str(toml).unwrap_err();
         assert!(err.to_string().contains("bin cannot be empty"));
+    }
+
+    #[test]
+    fn accepts_core_plugin_source_without_git_or_refs() {
+        let toml = r#"
+[package]
+name = "ok"
+version = "0.1.0"
+
+[dependencies.plugins]
+nu_plugin_polars = { source = "nu-core", bin = "nu_plugin_polars" }
+"#;
+
+        let manifest = Manifest::from_str(toml).unwrap();
+        let plugin = manifest.dependencies.plugins.get("nu_plugin_polars").unwrap();
+        assert_eq!(plugin.source.as_deref(), Some("nu-core"));
+        assert!(plugin.git.is_empty());
+        assert!(plugin.tag.is_none());
+        assert!(plugin.rev.is_none());
+        assert!(plugin.branch.is_none());
+    }
+
+    #[test]
+    fn reject_core_plugin_source_with_git_or_refs() {
+        let toml = r#"
+[package]
+name = "bad"
+version = "0.1.0"
+
+[dependencies.plugins]
+nu_plugin_polars = { source = "nu-core", git = "https://example.com/x", tag = "v1.0.0" }
+"#;
+
+        let err = Manifest::from_str(toml).unwrap_err();
+        assert!(err.to_string().contains("source = 'nu-core'"));
     }
 }
