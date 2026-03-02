@@ -691,13 +691,24 @@ fn install_nu_version_from_github_release(version: &Version) -> Result<PathBuf> 
     std::fs::create_dir_all(&target_bin_dir)?;
     std::fs::copy(&extracted_binary, &installed_path)?;
     make_executable(&installed_path)?;
+    let installed_plugins = install_extracted_nu_plugins(&extract_dir, &version_dir)?;
     let _ = std::fs::remove_dir_all(&temp_root);
 
-    eprintln!(
-        "Installed Nushell {} from GitHub releases into {}",
-        version,
-        version_dir.display()
-    );
+    if installed_plugins == 0 {
+        eprintln!(
+            "Installed Nushell {} from GitHub releases into {}",
+            version,
+            version_dir.display()
+        );
+    } else {
+        eprintln!(
+            "Installed Nushell {} from GitHub releases into {} ({} bundled plugin{})",
+            version,
+            version_dir.display(),
+            installed_plugins,
+            if installed_plugins == 1 { "" } else { "s" }
+        );
+    }
 
     Ok(installed_path)
 }
@@ -786,6 +797,58 @@ fn find_extracted_nu_binary(extract_dir: &Path) -> Option<PathBuf> {
         }
     }
     None
+}
+
+fn install_extracted_nu_plugins(extract_dir: &Path, version_dir: &Path) -> Result<usize> {
+    let plugins = find_extracted_nu_plugins(extract_dir);
+    if plugins.is_empty() {
+        return Ok(0);
+    }
+
+    let plugins_dir = version_dir.join("plugins");
+    std::fs::create_dir_all(&plugins_dir)?;
+
+    for plugin in &plugins {
+        let plugin_name = plugin.file_name().ok_or_else(|| {
+            crate::error::QuiverError::Other(format!(
+                "failed to determine bundled plugin file name for {}",
+                plugin.display()
+            ))
+        })?;
+        let target = plugins_dir.join(plugin_name);
+        std::fs::copy(plugin, &target)?;
+        make_executable(&target)?;
+    }
+
+    Ok(plugins.len())
+}
+
+fn find_extracted_nu_plugins(extract_dir: &Path) -> Vec<PathBuf> {
+    let prefix = "nu_plugin_";
+    let suffix = if cfg!(windows) { ".exe" } else { "" };
+
+    let mut plugins = Vec::new();
+    for entry in WalkDir::new(extract_dir)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(std::result::Result::ok)
+    {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+
+        let name = entry.file_name().to_string_lossy();
+        if !name.starts_with(prefix) {
+            continue;
+        }
+        if !suffix.is_empty() && !name.ends_with(suffix) {
+            continue;
+        }
+        plugins.push(entry.into_path());
+    }
+
+    plugins.sort();
+    plugins
 }
 
 fn make_executable(path: &Path) -> Result<()> {
@@ -1597,6 +1660,7 @@ fn is_global_lockfile_stale(config: &GlobalConfig, lock_path: &Path) -> Result<b
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::ffi::OsString;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1613,6 +1677,14 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    fn plugin_test_name(base: &str) -> OsString {
+        if cfg!(windows) {
+            OsString::from(format!("{base}.exe"))
+        } else {
+            OsString::from(base)
+        }
     }
 
     #[test]
@@ -1984,6 +2056,56 @@ nu_plugin_inc = { git = "https://github.com/nushell/nu_plugin_inc", tag = "v0.91
         assert!(linked.exists());
         #[cfg(unix)]
         assert!(linked.symlink_metadata().unwrap().file_type().is_symlink());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn find_extracted_nu_plugins_finds_only_core_plugins() {
+        let root = make_temp_dir("nu_release_plugins");
+        let extracted = root.join("extract");
+        let nested = extracted.join("nu-0.110.0");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        std::fs::write(nested.join("nu"), "nu").unwrap();
+        std::fs::write(nested.join("README.txt"), "readme").unwrap();
+        let formats = plugin_test_name("nu_plugin_formats");
+        let query = plugin_test_name("nu_plugin_query");
+        std::fs::write(nested.join(&formats), "formats").unwrap();
+        std::fs::write(nested.join(&query), "query").unwrap();
+
+        let plugins = find_extracted_nu_plugins(&extracted);
+        let names: Vec<String> = plugins
+            .iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+
+        assert_eq!(
+            names,
+            vec![
+                formats.to_string_lossy().into_owned(),
+                query.to_string_lossy().into_owned()
+            ]
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn install_extracted_nu_plugins_copies_into_version_plugins_dir() {
+        let root = make_temp_dir("nu_release_plugin_install");
+        let extracted = root.join("extract");
+        std::fs::create_dir_all(&extracted).unwrap();
+        let formats = plugin_test_name("nu_plugin_formats");
+        let query = plugin_test_name("nu_plugin_query");
+        std::fs::write(extracted.join(&formats), "formats").unwrap();
+        std::fs::write(extracted.join(&query), "query").unwrap();
+
+        let version_dir = root.join("nu_versions").join("0.110.0");
+        let count = install_extracted_nu_plugins(&extracted, &version_dir).unwrap();
+        assert_eq!(count, 2);
+        assert!(version_dir.join("plugins").join(formats).is_file());
+        assert!(version_dir.join("plugins").join(query).is_file());
 
         let _ = std::fs::remove_dir_all(root);
     }
