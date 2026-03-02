@@ -35,6 +35,10 @@ pub enum Commands {
         #[arg(long, default_value = "0.1.0")]
         version: String,
 
+        /// Nushell version requirement for this project (e.g. 0.109.0, >=0.109,<0.111)
+        #[arg(long = "nu-version")]
+        nu_version: Option<String>,
+
         /// Package description
         #[arg(long)]
         description: Option<String>,
@@ -74,6 +78,28 @@ pub enum Commands {
         /// Track a branch
         #[arg(long)]
         branch: Option<String>,
+    },
+
+    /// Add a plugin dependency from a git URL or owner/repo shorthand
+    AddPlugin {
+        /// Git URL, owner/repo shorthand, or core plugin name (e.g. polars)
+        url: String,
+
+        /// Pin to a specific tag
+        #[arg(long)]
+        tag: Option<String>,
+
+        /// Pin to a specific commit SHA
+        #[arg(long)]
+        rev: Option<String>,
+
+        /// Track a branch
+        #[arg(long)]
+        branch: Option<String>,
+
+        /// Binary target name if it differs from the repo/package name
+        #[arg(long)]
+        bin: Option<String>,
     },
 
     /// Remove a module dependency from nupackage.toml and .nu_modules/
@@ -166,5 +192,54 @@ mod tests {
     fn short_uppercase_v_displays_version() {
         let err = Cli::try_parse_from(["quiver", "-V"]).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::DisplayVersion);
+    }
+
+    #[test]
+    fn add_plugin_parses_with_bin() {
+        let cli = Cli::try_parse_from([
+            "quiver",
+            "add-plugin",
+            "nushell/nu_plugin_inc",
+            "--tag",
+            "v0.91.0",
+            "--bin",
+            "nu_plugin_inc",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::AddPlugin {
+                url,
+                tag,
+                rev,
+                branch,
+                bin,
+            } => {
+                assert_eq!(url, "nushell/nu_plugin_inc");
+                assert_eq!(tag.as_deref(), Some("v0.91.0"));
+                assert!(rev.is_none());
+                assert!(branch.is_none());
+                assert_eq!(bin.as_deref(), Some("nu_plugin_inc"));
+            }
+            _ => panic!("expected add-plugin command"),
+        }
+    }
+
+    #[test]
+    fn init_parses_with_nu_version() {
+        let cli = Cli::try_parse_from(["quiver", "init", "--nu-version", "0.109.0"]).unwrap();
+        match cli.command {
+            Commands::Init {
+                name,
+                version,
+                nu_version,
+                description,
+            } => {
+                assert!(name.is_none());
+                assert_eq!(version, "0.1.0");
+                assert_eq!(nu_version.as_deref(), Some("0.109.0"));
+                assert!(description.is_none());
+            }
+            _ => panic!("expected init command"),
+        }
     }
 }

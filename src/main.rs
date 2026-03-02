@@ -6,7 +6,9 @@ mod git;
 mod installer;
 mod lockfile;
 mod manifest;
+mod nu;
 mod resolver;
+mod ui;
 
 use std::io::{self, Write};
 use std::path::Path;
@@ -15,13 +17,13 @@ use std::process::Command;
 use cli::Commands;
 use config::GlobalConfig;
 use error::Result;
-use manifest::{DependencySpec, Manifest, Package};
+use manifest::{DependencySpec, Manifest, Package, PluginDependencySpec};
 
 fn main() {
     let cli = cli::parse();
 
     if let Err(e) = run(cli.command) {
-        eprintln!("error: {e}");
+        ui::error(format!("{e}"));
         std::process::exit(1);
     }
 }
@@ -33,8 +35,9 @@ fn run(command: Commands) -> Result<()> {
         Commands::Init {
             name,
             version,
+            nu_version,
             description,
-        } => cmd_init(&cwd, name, version, description),
+        } => cmd_init(&cwd, name, version, nu_version, description),
         Commands::Install { global, frozen } => {
             if global {
                 cmd_install_global(frozen)
@@ -56,6 +59,13 @@ fn run(command: Commands) -> Result<()> {
                 cmd_add(&cwd, url, tag, rev, branch)
             }
         }
+        Commands::AddPlugin {
+            url,
+            tag,
+            rev,
+            branch,
+            bin,
+        } => cmd_add_plugin(&cwd, url, tag, rev, branch, bin),
         Commands::Remove { global, name } => {
             if global {
                 cmd_remove_global(name)
@@ -75,6 +85,7 @@ fn cmd_init(
     dir: &Path,
     name: Option<String>,
     version: String,
+    nu_version: Option<String>,
     description: Option<String>,
 ) -> Result<()> {
     let nupackage_toml = dir.join("nupackage.toml");
@@ -91,6 +102,13 @@ fn cmd_init(
             .unwrap_or("my-module")
             .to_string()
     });
+    if let Some(ref requested_nu_version) = nu_version {
+        nu::parse_nu_version_requirement(requested_nu_version).map_err(|err| {
+            error::QuiverError::Manifest(format!(
+                "package nu-version '{requested_nu_version}' is invalid: {err}"
+            ))
+        })?;
+    }
 
     let manifest = Manifest {
         package: Package {
@@ -99,7 +117,7 @@ fn cmd_init(
             description: Some(description.unwrap_or_default()),
             license: Some(String::new()),
             authors: Some(Vec::new()),
-            nu_version: Some(detect_nu_version().unwrap_or_default()),
+            nu_version: nu_version.or_else(detect_nu_version),
         },
         dependencies: Default::default(),
     };
@@ -129,12 +147,12 @@ fn cmd_init(
         eprintln!("Created {}", mod_nu.display());
     }
 
-    // Generate .nu-env/ with activate.nu, env.nu, and bin/nu symlink
+    // Generate .nu-env/ with activate.nu, config.nu, and bin/nu symlink
     let nu_env_dir = dir.join(".nu-env");
     let modules_dir = nu_env_dir.join("modules");
     std::fs::create_dir_all(&modules_dir)?;
-    installer::write_env_nu(&nu_env_dir, &modules_dir)?;
-    installer::create_nu_symlink(&nu_env_dir)?;
+    installer::write_config_nu(&nu_env_dir, &modules_dir)?;
+    installer::create_nu_symlink(&nu_env_dir, manifest.package.nu_version.as_deref())?;
     installer::write_activate_overlay(&nu_env_dir, dir)?;
     ensure_gitignore_ignores_nu_env(dir)?;
 
@@ -225,9 +243,127 @@ fn cmd_add(
     let content = manifest.to_toml_string()?;
     std::fs::write(dir.join("nupackage.toml"), content)?;
 
-    eprintln!("Added module '{pkg_name}' to nupackage.toml");
+    ui::success(format!("Added module '{pkg_name}' to nupackage.toml"));
 
     // Run install
+    installer::install(dir, false)
+}
+
+fn cmd_add_plugin(
+    dir: &Path,
+    url: String,
+    tag: Option<String>,
+    rev: Option<String>,
+    branch: Option<String>,
+    bin: Option<String>,
+) -> Result<()> {
+    let mut manifest = Manifest::from_dir(dir)?;
+
+    if !is_git_url(url.trim())
+        && let Some(core_plugin_name) = resolve_core_plugin_name(&url)
+    {
+        if manifest
+            .dependencies
+            .plugins
+            .contains_key(&core_plugin_name)
+        {
+            return Err(error::QuiverError::Manifest(format!(
+                "plugin dependency '{core_plugin_name}' already exists in nupackage.toml"
+            )));
+        }
+
+        let dep_spec = PluginDependencySpec {
+            source: Some("nu-core".to_string()),
+            git: String::new(),
+            tag: None,
+            rev: None,
+            branch: None,
+            bin: Some(core_plugin_name.clone()),
+        };
+        dep_spec.validate(&core_plugin_name)?;
+        manifest
+            .dependencies
+            .plugins
+            .insert(core_plugin_name.clone(), dep_spec);
+        let content = manifest.to_toml_string()?;
+        std::fs::write(dir.join("nupackage.toml"), content)?;
+        ui::success(format!(
+            "Added core plugin '{core_plugin_name}' to nupackage.toml"
+        ));
+        return installer::install(dir, false);
+    }
+
+    let provider_base = if is_git_url(url.trim()) {
+        None
+    } else {
+        let config = GlobalConfig::load_or_default()?;
+        Some(config.default_git_provider_base_url()?)
+    };
+    let url = normalize_dependency_source(&url, provider_base.as_deref())?;
+
+    let pkg_name = git::repo_name_from_url(&url).ok_or_else(|| {
+        error::QuiverError::Other(format!("could not determine package name from URL: {url}"))
+    })?;
+
+    if manifest.dependencies.plugins.contains_key(&pkg_name) {
+        return Err(error::QuiverError::Manifest(format!(
+            "plugin dependency '{pkg_name}' already exists in nupackage.toml"
+        )));
+    }
+
+    let dep_spec = if tag.is_none() && rev.is_none() && branch.is_none() {
+        ui::info(format!(
+            "{} plugin source {} to detect version",
+            ui::keyword("Fetching"),
+            url
+        ));
+        let repo_path = git::clone_or_fetch(&url)?;
+        if let Some(latest) = git::latest_tag(&repo_path)? {
+            ui::info(format!("{} latest tag {}", ui::keyword("Found"), latest));
+            PluginDependencySpec {
+                source: None,
+                git: url.to_string(),
+                tag: Some(latest),
+                rev: None,
+                branch: None,
+                bin,
+            }
+        } else {
+            let default_br = git::default_branch(&repo_path)?;
+            ui::warn(format!(
+                "{} tags found; using branch {}",
+                ui::keyword("No"),
+                default_br
+            ));
+            PluginDependencySpec {
+                source: None,
+                git: url.to_string(),
+                tag: None,
+                rev: None,
+                branch: Some(default_br),
+                bin,
+            }
+        }
+    } else {
+        PluginDependencySpec {
+            source: None,
+            git: url.to_string(),
+            tag,
+            rev,
+            branch,
+            bin,
+        }
+    };
+
+    dep_spec.validate(&pkg_name)?;
+    manifest
+        .dependencies
+        .plugins
+        .insert(pkg_name.clone(), dep_spec);
+    let content = manifest.to_toml_string()?;
+    std::fs::write(dir.join("nupackage.toml"), content)?;
+    ui::success(format!("Added plugin '{pkg_name}' to nupackage.toml"));
+
     installer::install(dir, false)
 }
 
@@ -275,34 +411,63 @@ fn cmd_remove(dir: &Path, name: String) -> Result<()> {
     // Load existing manifest
     let mut manifest = Manifest::from_dir(dir)?;
 
-    // Check the module dep exists
-    if manifest.dependencies.modules.remove(&name).is_none() {
+    // Try removing as a module first
+    if manifest.dependencies.modules.remove(&name).is_some() {
+        // Write updated manifest
+        let content = manifest.to_toml_string()?;
+        std::fs::write(dir.join("nupackage.toml"), content)?;
+        eprintln!("Removed module '{name}' from nupackage.toml");
+
+        // Remove from .nu-env/modules/
+        let module_dir = dir.join(".nu-env").join("modules").join(&name);
+        if module_dir.exists() {
+            std::fs::remove_dir_all(&module_dir)?;
+            eprintln!("Removed .nu-env/modules/{name}/");
+        }
+
+        // Update lockfile: remove the module package entry
+        let lock_path = dir.join("quiver.lock");
+        if lock_path.exists() {
+            let mut lockfile = lockfile::Lockfile::from_path(&lock_path)?;
+            lockfile
+                .packages
+                .retain(|p| !(p.name == name && p.kind == lockfile::LockedPackageKind::Module));
+            lockfile.write_to(&lock_path)?;
+            eprintln!("Updated quiver.lock");
+        }
+    } else if let Some(plugin_spec) = manifest.dependencies.plugins.remove(&name) {
+        // Removing a plugin dependency
+        let content = manifest.to_toml_string()?;
+        std::fs::write(dir.join("nupackage.toml"), content)?;
+        eprintln!("Removed plugin '{name}' from nupackage.toml");
+
+        // Remove plugin binary symlink from .nu-env/bin/
+        let bin_name = plugin_spec.bin.as_deref().unwrap_or(&name);
+        let binary_filename = if cfg!(windows) && !bin_name.ends_with(".exe") {
+            format!("{bin_name}.exe")
+        } else {
+            bin_name.to_string()
+        };
+        let plugin_link = dir.join(".nu-env").join("bin").join(&binary_filename);
+        if plugin_link.exists() || plugin_link.symlink_metadata().is_ok() {
+            std::fs::remove_file(&plugin_link)?;
+            eprintln!("Removed .nu-env/bin/{binary_filename}");
+        }
+
+        // Update lockfile: remove the plugin package entry
+        let lock_path = dir.join("quiver.lock");
+        if lock_path.exists() {
+            let mut lockfile = lockfile::Lockfile::from_path(&lock_path)?;
+            lockfile
+                .packages
+                .retain(|p| !(p.name == name && p.kind == lockfile::LockedPackageKind::Plugin));
+            lockfile.write_to(&lock_path)?;
+            eprintln!("Updated quiver.lock");
+        }
+    } else {
         return Err(error::QuiverError::Manifest(format!(
-            "module dependency '{name}' not found in nupackage.toml"
+            "dependency '{name}' not found in nupackage.toml"
         )));
-    }
-
-    // Write updated manifest
-    let content = manifest.to_toml_string()?;
-    std::fs::write(dir.join("nupackage.toml"), content)?;
-    eprintln!("Removed module '{name}' from nupackage.toml");
-
-    // Remove from .nu-env/modules/
-    let module_dir = dir.join(".nu-env").join("modules").join(&name);
-    if module_dir.exists() {
-        std::fs::remove_dir_all(&module_dir)?;
-        eprintln!("Removed .nu-env/modules/{name}/");
-    }
-
-    // Update lockfile: remove the package entry
-    let lock_path = dir.join("quiver.lock");
-    if lock_path.exists() {
-        let mut lockfile = lockfile::Lockfile::from_path(&lock_path)?;
-        lockfile
-            .packages
-            .retain(|p| !(p.name == name && p.kind == lockfile::LockedPackageKind::Module));
-        lockfile.write_to(&lock_path)?;
-        eprintln!("Updated quiver.lock");
     }
 
     // Regenerate activate.nu from the updated manifest and lockfile state.
@@ -363,19 +528,19 @@ fn cmd_run(cwd: &Path, command: Vec<String>) -> Result<()> {
         return Err(error::QuiverError::NoManifest(cwd.to_path_buf()));
     }
 
-    let env_config_path = cwd.join(".nu-env").join("env.nu");
-    if !env_config_path.exists() {
+    let config_path = cwd.join(".nu-env").join("config.nu");
+    if !config_path.exists() {
         eprintln!("No .nu-env found; running install first...");
         installer::install(cwd, false)?;
     }
 
-    if !env_config_path.exists() {
+    if !config_path.exists() {
         return Err(error::QuiverError::Other(
-            "failed to create .nu-env/env.nu".to_string(),
+            "failed to create .nu-env/config.nu".to_string(),
         ));
     }
 
-    let (program, args) = resolve_run_invocation(&command, &env_config_path, cwd);
+    let (program, args) = resolve_run_invocation(&command, &config_path, cwd);
     let status = Command::new(&program)
         .args(&args)
         .current_dir(cwd)
@@ -390,23 +555,23 @@ fn cmd_run(cwd: &Path, command: Vec<String>) -> Result<()> {
 
 fn resolve_run_invocation(
     command: &[String],
-    env_config_path: &Path,
+    config_path: &Path,
     cwd: &Path,
 ) -> (String, Vec<String>) {
     let executable = command[0].clone();
     let mut args = command[1..].to_vec();
-    let env_config = env_config_path.to_string_lossy().to_string();
+    let config = config_path.to_string_lossy().to_string();
 
     if executable == "nu" {
-        if !args.iter().any(|arg| arg == "--env-config") {
-            args.insert(0, env_config);
-            args.insert(0, "--env-config".to_string());
+        if !args.iter().any(|arg| arg == "--config") {
+            args.insert(0, config);
+            args.insert(0, "--config".to_string());
         }
         return (executable, args);
     }
 
     if is_nushell_script_command(&executable, cwd) {
-        let mut nu_args = vec!["--env-config".to_string(), env_config, executable];
+        let mut nu_args = vec!["--config".to_string(), config, executable];
         nu_args.extend(args);
         return ("nu".to_string(), nu_args);
     }
@@ -628,8 +793,8 @@ fn write_helix_lsp_config(project_dir: &Path) -> Result<()> {
 
     let config_path = helix_dir.join("languages.toml");
     let config = r#"[language-server.nu-lsp]
-command = "nu"
-args = ["--env-config .nu-env/env.nu", "--lsp"]
+command = ".nu-env/bin/nu"
+args = ["--config .nu-env/config.nu", "--plugin-config .nu-env/plugins.msgpackz", "--lsp"]
 "#;
 
     std::fs::write(&config_path, config)?;
@@ -646,8 +811,8 @@ fn write_zed_lsp_config(project_dir: &Path) -> Result<()> {
   "lsp": {
     "nu": {
       "binary": {
-        "path": "nu",
-        "arguments": ["--env-config", ".nu-env/env.nu", "--lsp"]
+        "path": ".nu-env/bin/nu",
+        "arguments": ["--config .nu-env/config.nu", "--plugin-config .nu-env/plugins.msgpackz", "--lsp"]
       }
     }
   }
@@ -662,19 +827,30 @@ fn write_zed_lsp_config(project_dir: &Path) -> Result<()> {
 fn cmd_list(cwd: &Path) -> Result<()> {
     if cwd.join("nupackage.toml").exists() {
         let modules_dir = cwd.join(".nu-env").join("modules");
+        let bin_dir = cwd.join(".nu-env").join("bin");
         let modules = list_installed_module_names(&modules_dir)?;
+        let plugins = list_installed_plugin_names(&bin_dir)?;
 
-        if modules.is_empty() {
-            eprintln!(
-                "No installed project dependencies found in {}",
-                modules_dir.display(),
-            );
+        if modules.is_empty() && plugins.is_empty() {
+            eprintln!("No installed project dependencies found.");
             return Ok(());
         }
 
-        eprintln!("Installed project modules from {}", modules_dir.display());
-        for module in modules {
-            eprintln!("{module}");
+        if !modules.is_empty() {
+            eprintln!("Installed project modules:");
+            for module in &modules {
+                eprintln!("  {module}");
+            }
+        }
+
+        if !plugins.is_empty() {
+            if !modules.is_empty() {
+                eprintln!();
+            }
+            eprintln!("Installed project plugins:");
+            for plugin in &plugins {
+                eprintln!("  {plugin}");
+            }
         }
     } else {
         let config = GlobalConfig::load_or_default()?;
@@ -721,6 +897,31 @@ fn list_installed_module_names(modules_dir: &Path) -> Result<Vec<String>> {
     Ok(modules)
 }
 
+fn list_installed_plugin_names(bin_dir: &Path) -> Result<Vec<String>> {
+    if !bin_dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut plugins = Vec::new();
+
+    for entry in std::fs::read_dir(bin_dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+
+        // Strip .exe on Windows for display; only include nu_plugin_* entries
+        let base_name = name_str.strip_suffix(".exe").unwrap_or(name_str);
+        if base_name.starts_with("nu_plugin_") {
+            plugins.push(base_name.to_string());
+        }
+    }
+
+    plugins.sort();
+    Ok(plugins)
+}
+
 fn normalize_dependency_source(input: &str, provider_base_url: Option<&str>) -> Result<String> {
     let trimmed = input.trim();
 
@@ -746,6 +947,36 @@ fn normalize_dependency_source(input: &str, provider_base_url: Option<&str>) -> 
     Err(error::QuiverError::Other(format!(
         "invalid dependency source '{input}'; expected a git URL or owner/repo shorthand"
     )))
+}
+
+fn resolve_core_plugin_name(input: &str) -> Option<String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let normalized = trimmed.to_ascii_lowercase().replace('-', "_");
+    let alias = match normalized.as_str() {
+        "custom_values" => "nu_plugin_custom_values",
+        "example" => "nu_plugin_example",
+        "formats" => "nu_plugin_formats",
+        "gstat" => "nu_plugin_gstat",
+        "inc" => "nu_plugin_inc",
+        "polars" | "polors" => "nu_plugin_polars",
+        "query" => "nu_plugin_query",
+        "stress_internals" => "nu_plugin_stress_internals",
+        _ => "",
+    };
+
+    if !alias.is_empty() {
+        return Some(alias.to_string());
+    }
+
+    if normalized.starts_with("nu_plugin_") {
+        return Some(normalized);
+    }
+
+    None
 }
 
 fn is_git_url(value: &str) -> bool {
@@ -775,11 +1006,15 @@ fn auto_detect_dep_spec(
     branch: Option<String>,
 ) -> Result<DependencySpec> {
     if tag.is_none() && rev.is_none() && branch.is_none() {
-        eprintln!("Fetching {url} to detect version...");
+        ui::info(format!(
+            "{} dependency source {} to detect version",
+            ui::keyword("Fetching"),
+            url
+        ));
         let repo_path = git::clone_or_fetch(url)?;
 
         if let Some(latest) = git::latest_tag(&repo_path)? {
-            eprintln!("  Found latest tag: {latest}");
+            ui::info(format!("{} latest tag {}", ui::keyword("Found"), latest));
             Ok(DependencySpec {
                 git: url.to_string(),
                 tag: Some(latest),
@@ -788,7 +1023,11 @@ fn auto_detect_dep_spec(
             })
         } else {
             let default_br = git::default_branch(&repo_path)?;
-            eprintln!("  No tags found, using branch: {default_br}");
+            ui::warn(format!(
+                "{} tags found; using branch {}",
+                ui::keyword("No"),
+                default_br
+            ));
             Ok(DependencySpec {
                 git: url.to_string(),
                 tag: None,
@@ -813,12 +1052,7 @@ fn detect_nu_version() -> Option<String> {
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let version = stdout.trim();
-    if version.is_empty() {
-        None
-    } else {
-        Some(version.to_string())
-    }
+    nu::extract_semver_from_text(&stdout).map(|version| version.to_string())
 }
 
 #[cfg(test)]
@@ -832,6 +1066,7 @@ mod tests {
         GlobalConfig {
             modules_dir: None,
             default_git_provider: provider.to_string(),
+            install_mode: config::InstallMode::Copy,
             dependencies: HashMap::new(),
         }
     }
@@ -891,6 +1126,30 @@ mod tests {
     }
 
     #[test]
+    fn resolve_core_plugin_name_handles_short_aliases_and_typos() {
+        assert_eq!(
+            resolve_core_plugin_name("polars"),
+            Some("nu_plugin_polars".to_string())
+        );
+        assert_eq!(
+            resolve_core_plugin_name("polors"),
+            Some("nu_plugin_polars".to_string())
+        );
+        assert_eq!(
+            resolve_core_plugin_name("gstat"),
+            Some("nu_plugin_gstat".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_core_plugin_name_accepts_full_name() {
+        assert_eq!(
+            resolve_core_plugin_name("nu_plugin_query"),
+            Some("nu_plugin_query".to_string())
+        );
+    }
+
+    #[test]
     fn list_installed_module_names_returns_sorted_directories_only() {
         let modules_dir = make_temp_dir("list_modules");
         std::fs::create_dir_all(modules_dir.join("nu-zeta")).unwrap();
@@ -913,20 +1172,49 @@ mod tests {
     }
 
     #[test]
-    fn resolve_run_invocation_injects_env_config_for_nu() {
+    fn list_installed_plugin_names_returns_sorted_plugin_binaries() {
+        let bin_dir = make_temp_dir("list_plugins");
+        std::fs::write(bin_dir.join("nu_plugin_query"), "binary").unwrap();
+        std::fs::write(bin_dir.join("nu_plugin_polars"), "binary").unwrap();
+        std::fs::write(bin_dir.join("nu"), "binary").unwrap(); // should be excluded
+        std::fs::write(bin_dir.join("other_file"), "binary").unwrap(); // should be excluded
+
+        let plugins = list_installed_plugin_names(&bin_dir).unwrap();
+
+        assert_eq!(
+            plugins,
+            vec![
+                "nu_plugin_polars".to_string(),
+                "nu_plugin_query".to_string()
+            ]
+        );
+
+        let _ = std::fs::remove_dir_all(bin_dir);
+    }
+
+    #[test]
+    fn list_installed_plugin_names_handles_missing_directory() {
+        let root_dir = make_temp_dir("list_plugins_missing");
+        let plugins = list_installed_plugin_names(&root_dir.join("missing")).unwrap();
+        assert!(plugins.is_empty());
+        let _ = std::fs::remove_dir_all(root_dir);
+    }
+
+    #[test]
+    fn resolve_run_invocation_injects_config_for_nu() {
         let cwd = make_temp_dir("run_inject_nu");
-        let env_config = cwd.join(".nu-env").join("env.nu");
+        let config = cwd.join(".nu-env").join("config.nu");
         let command = vec![
             "nu".to_string(),
             "script.nu".to_string(),
             "--flag".to_string(),
         ];
 
-        let (program, args) = resolve_run_invocation(&command, &env_config, &cwd);
+        let (program, args) = resolve_run_invocation(&command, &config, &cwd);
 
         assert_eq!(program, "nu");
-        assert_eq!(args[0], "--env-config");
-        assert_eq!(args[1], env_config.to_string_lossy());
+        assert_eq!(args[0], "--config");
+        assert_eq!(args[1], config.to_string_lossy());
         assert_eq!(args[2], "script.nu");
         assert_eq!(args[3], "--flag");
 
@@ -938,14 +1226,14 @@ mod tests {
         let cwd = make_temp_dir("run_wrap_script");
         let script_path = cwd.join("tool.nu");
         std::fs::write(&script_path, "print 'ok'").unwrap();
-        let env_config = cwd.join(".nu-env").join("env.nu");
+        let config = cwd.join(".nu-env").join("config.nu");
         let command = vec!["tool.nu".to_string(), "arg1".to_string()];
 
-        let (program, args) = resolve_run_invocation(&command, &env_config, &cwd);
+        let (program, args) = resolve_run_invocation(&command, &config, &cwd);
 
         assert_eq!(program, "nu");
-        assert_eq!(args[0], "--env-config");
-        assert_eq!(args[1], env_config.to_string_lossy());
+        assert_eq!(args[0], "--config");
+        assert_eq!(args[1], config.to_string_lossy());
         assert_eq!(args[2], "tool.nu");
         assert_eq!(args[3], "arg1");
 
@@ -955,10 +1243,10 @@ mod tests {
     #[test]
     fn resolve_run_invocation_leaves_other_commands_unchanged() {
         let cwd = make_temp_dir("run_other_cmd");
-        let env_config = cwd.join(".nu-env").join("env.nu");
+        let config = cwd.join(".nu-env").join("config.nu");
         let command = vec!["echo".to_string(), "hello".to_string()];
 
-        let (program, args) = resolve_run_invocation(&command, &env_config, &cwd);
+        let (program, args) = resolve_run_invocation(&command, &config, &cwd);
 
         assert_eq!(program, "echo");
         assert_eq!(args, vec!["hello".to_string()]);
@@ -984,7 +1272,7 @@ mod tests {
     fn init_creates_mod_nu_in_subdir_named_after_current_dir() {
         let project_dir = make_temp_dir("init_subdir");
 
-        cmd_init(&project_dir, None, "0.1.0".to_string(), None).unwrap();
+        cmd_init(&project_dir, None, "0.1.0".to_string(), None, None).unwrap();
 
         let dir_name = project_dir
             .file_name()
@@ -998,18 +1286,18 @@ mod tests {
         // Verify .nu-env files are generated
         let nu_env = project_dir.join(".nu-env");
         assert!(nu_env.join("activate.nu").exists());
-        assert!(nu_env.join("env.nu").exists());
+        assert!(nu_env.join("config.nu").exists());
         assert!(nu_env.join("modules").is_dir());
 
         let activate = std::fs::read_to_string(nu_env.join("activate.nu")).unwrap();
         assert!(activate.contains("export-env {"));
         assert!(activate.contains("source-env"));
-        assert!(activate.contains("export def --wrapped nu [...rest]"));
+        assert!(activate.contains("export alias nu = ^"));
         assert!(activate.contains("export alias deactivate = overlay hide activate"));
 
-        let env_nu = std::fs::read_to_string(nu_env.join("env.nu")).unwrap();
-        assert!(env_nu.contains("export const NU_LIB_DIRS"));
-        assert!(env_nu.contains(".nu-env/modules"));
+        let config_nu = std::fs::read_to_string(nu_env.join("config.nu")).unwrap();
+        assert!(config_nu.contains("export const NU_LIB_DIRS"));
+        assert!(config_nu.contains(".nu-env/modules"));
 
         let _ = std::fs::remove_dir_all(project_dir);
     }
@@ -1022,6 +1310,7 @@ mod tests {
             &project_dir,
             Some("custom-module-name".to_string()),
             "0.1.0".to_string(),
+            None,
             None,
         )
         .unwrap();
@@ -1040,7 +1329,51 @@ mod tests {
 
         // Verify .nu-env files are generated
         assert!(project_dir.join(".nu-env").join("activate.nu").exists());
-        assert!(project_dir.join(".nu-env").join("env.nu").exists());
+        assert!(project_dir.join(".nu-env").join("config.nu").exists());
+
+        let _ = std::fs::remove_dir_all(project_dir);
+    }
+
+    #[test]
+    fn init_uses_explicit_nu_version_when_provided() {
+        let project_dir = make_temp_dir("init_nu_version");
+        let Some(local_nu_version) = detect_nu_version() else {
+            let _ = std::fs::remove_dir_all(project_dir);
+            return;
+        };
+
+        cmd_init(
+            &project_dir,
+            None,
+            "0.1.0".to_string(),
+            Some(local_nu_version.clone()),
+            None,
+        )
+        .unwrap();
+
+        let manifest_text = std::fs::read_to_string(project_dir.join("nupackage.toml")).unwrap();
+        let manifest = Manifest::from_str(&manifest_text).unwrap();
+        assert_eq!(
+            manifest.package.nu_version.as_deref(),
+            Some(local_nu_version.as_str())
+        );
+
+        let _ = std::fs::remove_dir_all(project_dir);
+    }
+
+    #[test]
+    fn init_rejects_invalid_explicit_nu_version() {
+        let project_dir = make_temp_dir("init_bad_nu_version");
+
+        let err = cmd_init(
+            &project_dir,
+            None,
+            "0.1.0".to_string(),
+            Some("definitely-not-semver".to_string()),
+            None,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("package nu-version"));
 
         let _ = std::fs::remove_dir_all(project_dir);
     }
@@ -1049,7 +1382,7 @@ mod tests {
     fn init_creates_gitignore_with_nu_env_entry() {
         let project_dir = make_temp_dir("init_gitignore_create");
 
-        cmd_init(&project_dir, None, "0.1.0".to_string(), None).unwrap();
+        cmd_init(&project_dir, None, "0.1.0".to_string(), None, None).unwrap();
 
         let gitignore = std::fs::read_to_string(project_dir.join(".gitignore")).unwrap();
         assert!(gitignore.lines().any(|line| line.trim() == ".nu-env/"));
@@ -1062,7 +1395,7 @@ mod tests {
         let project_dir = make_temp_dir("init_gitignore_append");
         std::fs::write(project_dir.join(".gitignore"), "target/\n").unwrap();
 
-        cmd_init(&project_dir, None, "0.1.0".to_string(), None).unwrap();
+        cmd_init(&project_dir, None, "0.1.0".to_string(), None, None).unwrap();
 
         let gitignore = std::fs::read_to_string(project_dir.join(".gitignore")).unwrap();
         assert!(gitignore.lines().any(|line| line.trim() == "target/"));
@@ -1082,8 +1415,9 @@ mod tests {
 
         let content = std::fs::read_to_string(&config_path).unwrap();
         assert!(content.contains("[language-server.nu-lsp]"));
-        assert!(content.contains("command = \"nu\""));
-        assert!(content.contains("--env-config .nu-env/env.nu"));
+        assert!(content.contains("command = \".nu-env/bin/nu\""));
+        assert!(content.contains("--config .nu-env/config.nu"));
+        assert!(content.contains("--plugin-config .nu-env/plugins.msgpackz"));
         assert!(content.contains("--lsp"));
 
         let _ = std::fs::remove_dir_all(project_dir);
@@ -1100,9 +1434,11 @@ mod tests {
 
         let content = std::fs::read_to_string(&config_path).unwrap();
         assert!(content.contains("\"nu\""));
-        assert!(content.contains("\"path\": \"nu\""));
-        assert!(content.contains("--env-config"));
-        assert!(content.contains(".nu-env/env.nu"));
+        assert!(content.contains("\"path\": \".nu-env/bin/nu\""));
+        assert!(content.contains("--config"));
+        assert!(content.contains(".nu-env/config.nu"));
+        assert!(content.contains("--plugin-config"));
+        assert!(content.contains(".nu-env/plugins.msgpackz"));
         assert!(content.contains("--lsp"));
 
         let _ = std::fs::remove_dir_all(project_dir);

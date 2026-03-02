@@ -1,13 +1,19 @@
 use std::collections::HashSet;
+use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
-use crate::config::{self, GlobalConfig};
+use semver::{Version, VersionReq};
+use serde::Deserialize;
+
+use crate::config::{self, GlobalConfig, InstallMode};
 use crate::error::Result;
 use crate::git;
 use crate::lockfile::{LockedPackage, LockedPackageKind, Lockfile};
 use crate::manifest::Manifest;
-use crate::resolver::{self, ResolvedDep};
+use crate::nu;
+use crate::resolver::{self, ResolvedDep, ResolvedPlugin};
+use crate::ui;
 use walkdir::WalkDir;
 
 /// The name of the local environment directory.
@@ -26,21 +32,24 @@ struct NupmMetadataHints {
 /// Run a full local install: resolve -> fetch -> checksum -> place -> lock.
 pub fn install(project_dir: &Path, frozen: bool) -> Result<()> {
     let manifest = Manifest::from_dir(project_dir)?;
+    let global_config = GlobalConfig::load_or_default()?;
+    let install_mode = global_config.install_mode;
     let lock_path = project_dir.join("quiver.lock");
     let nu_env_dir = project_dir.join(NU_ENV_DIR);
     let modules_dir = nu_env_dir.join(MODULES_SUBDIR);
+    let bin_dir = nu_env_dir.join(BIN_SUBDIR);
     let display_name = format!("{NU_ENV_DIR}/{MODULES_SUBDIR}");
 
     if manifest.dependencies.is_empty() {
-        eprintln!("No dependencies declared in nupackage.toml.");
-        write_env_nu(&nu_env_dir, &modules_dir)?;
-        create_nu_symlink(&nu_env_dir)?;
+        ui::warn("No dependencies declared in nupackage.toml.");
+        write_config_nu(&nu_env_dir, &modules_dir)?;
+        create_nu_symlink(&nu_env_dir, manifest.package.nu_version.as_deref())?;
         write_activate_overlay(&nu_env_dir, project_dir)?;
         return Ok(());
     }
 
     // Determine whether to re-resolve or use the lockfile
-    let resolved_modules = if frozen {
+    let (resolved_modules, resolved_plugins) = if frozen {
         // --frozen: use lockfile only
         if !lock_path.exists() {
             return Err(crate::error::QuiverError::Lockfile(
@@ -48,35 +57,60 @@ pub fn install(project_dir: &Path, frozen: bool) -> Result<()> {
             ));
         }
         let lockfile = Lockfile::from_path(&lock_path)?;
-        eprintln!("Using locked dependencies (--frozen).");
-        resolver::resolve_from_lock(&lockfile.packages)
+        ui::info(format!(
+            "{} locked dependencies (--frozen)",
+            ui::keyword("Using")
+        ));
+        (
+            resolver::resolve_modules_from_lock(&lockfile.packages),
+            resolver::resolve_plugins_from_lock(&lockfile.packages),
+        )
     } else if lock_path.exists() {
         let lockfile = Lockfile::from_path(&lock_path)?;
 
         if !local_lockfile_is_stale(&manifest, &lockfile) {
-            eprintln!("Using existing lockfile.");
-            resolver::resolve_from_lock(&lockfile.packages)
+            ui::info(format!("{} existing lockfile", ui::keyword("Using")));
+            (
+                resolver::resolve_modules_from_lock(&lockfile.packages),
+                resolver::resolve_plugins_from_lock(&lockfile.packages),
+            )
         } else {
             if !manifest.dependencies.modules.is_empty() {
-                eprintln!("Resolving module dependencies...");
+                ui::info(format!("{} module dependencies", ui::keyword("Resolving")));
             }
-            resolver::resolve_from_deps(&manifest.dependencies.modules)?
+            if !manifest.dependencies.plugins.is_empty() {
+                ui::info(format!("{} plugin dependencies", ui::keyword("Resolving")));
+            }
+            (
+                resolver::resolve_modules_from_deps(&manifest.dependencies.modules)?,
+                resolver::resolve_plugins_from_deps(&manifest.dependencies.plugins)?,
+            )
         }
-    } else if manifest.dependencies.modules.is_empty() {
-        Vec::new()
+    } else if manifest.dependencies.modules.is_empty() && manifest.dependencies.plugins.is_empty() {
+        (Vec::new(), Vec::new())
     } else {
         // No lockfile yet: resolve from manifest.
-        eprintln!("Resolving module dependencies...");
-        resolver::resolve_from_deps(&manifest.dependencies.modules)?
+        ui::info(format!("{} module dependencies", ui::keyword("Resolving")));
+        if !manifest.dependencies.plugins.is_empty() {
+            ui::info(format!("{} plugin dependencies", ui::keyword("Resolving")));
+        }
+        (
+            resolver::resolve_modules_from_deps(&manifest.dependencies.modules)?,
+            resolver::resolve_plugins_from_deps(&manifest.dependencies.plugins)?,
+        )
     };
 
     // Install each dependency
     install_resolved(
         &resolved_modules,
+        &resolved_plugins,
         &modules_dir,
+        &bin_dir,
         &lock_path,
         &nu_env_dir,
+        manifest.package.nu_version.as_deref(),
         &display_name,
+        install_mode,
     )
 }
 
@@ -94,12 +128,13 @@ pub fn update(project_dir: &Path) -> Result<()> {
 /// modules to the configured global directory.
 pub fn install_global(frozen: bool) -> Result<()> {
     let config = GlobalConfig::load()?;
+    let install_mode = config.install_mode;
     let modules_dir = config.modules_dir()?;
     let lock_path = config::global_lock_path()?;
     let display_dir = modules_dir.display().to_string();
 
     if config.dependencies.is_empty() {
-        eprintln!("No dependencies declared in global config.");
+        ui::warn("No dependencies declared in global config.");
         return Ok(());
     }
 
@@ -110,20 +145,32 @@ pub fn install_global(frozen: bool) -> Result<()> {
             ));
         }
         let lockfile = Lockfile::from_path(&lock_path)?;
-        eprintln!("Using locked global dependencies (--frozen).");
-        resolver::resolve_from_lock(&lockfile.packages)
+        ui::info(format!(
+            "{} locked global dependencies (--frozen)",
+            ui::keyword("Using")
+        ));
+        resolver::resolve_modules_from_lock(&lockfile.packages)
     } else if lock_path.exists() && !is_global_lockfile_stale(&config, &lock_path)? {
         let lockfile = Lockfile::from_path(&lock_path)?;
-        eprintln!("Using existing global lockfile.");
-        resolver::resolve_from_lock(&lockfile.packages)
+        ui::info(format!("{} existing global lockfile", ui::keyword("Using")));
+        resolver::resolve_modules_from_lock(&lockfile.packages)
     } else if config.dependencies.is_empty() {
         Vec::new()
     } else {
-        eprintln!("Resolving global module dependencies...");
-        resolver::resolve_from_deps(&config.dependencies)?
+        ui::info(format!(
+            "{} global module dependencies",
+            ui::keyword("Resolving")
+        ));
+        resolver::resolve_modules_from_deps(&config.dependencies)?
     };
 
-    install_resolved_global(&resolved_modules, &modules_dir, &lock_path, &display_dir)
+    install_resolved_global(
+        &resolved_modules,
+        &modules_dir,
+        &lock_path,
+        &display_dir,
+        install_mode,
+    )
 }
 
 /// Install resolved global dependencies and write `config.lock`.
@@ -132,18 +179,20 @@ fn install_resolved_global(
     modules_dir: &Path,
     lock_path: &Path,
     modules_display_name: &str,
+    install_mode: InstallMode,
 ) -> Result<()> {
     std::fs::create_dir_all(modules_dir)?;
 
     let mut locked_packages = Vec::new();
 
     for dep in modules {
-        eprintln!(
-            "  Installing {}@{}...",
+        ui::info(format!(
+            "{} module {}@{}",
+            ui::keyword("Installing"),
             dep.name,
             &dep.rev[..12.min(dep.rev.len())]
-        );
-        install_dep(dep, modules_dir)?;
+        ));
+        install_dep(dep, modules_dir, install_mode)?;
 
         let dest = modules_dir.join(&dep.name);
         let sha256 = resolver::compute_checksum(&dest)?;
@@ -170,8 +219,9 @@ fn install_resolved_global(
     let module_count = modules.len();
     let module_suffix = if module_count == 1 { "" } else { "s" };
 
-    eprintln!();
-    eprintln!("Installed {module_count} module{module_suffix} into {modules_display_name}/");
+    ui::success(format!(
+        "Installed {module_count} module{module_suffix} into {modules_display_name}/"
+    ));
 
     Ok(())
 }
@@ -179,21 +229,27 @@ fn install_resolved_global(
 /// Install a list of resolved dependencies into a target directory and write the lockfile.
 fn install_resolved(
     modules: &[ResolvedDep],
+    plugins: &[ResolvedPlugin],
     modules_dir: &Path,
+    bin_dir: &Path,
     lock_path: &Path,
     nu_env_dir: &Path,
+    nu_version_req: Option<&str>,
     display_name: &str,
+    install_mode: InstallMode,
 ) -> Result<()> {
     std::fs::create_dir_all(modules_dir)?;
+    std::fs::create_dir_all(bin_dir)?;
     let mut locked_packages = Vec::new();
 
     for dep in modules {
-        eprintln!(
-            "  Installing {}@{}...",
+        ui::info(format!(
+            "{} module {}@{}",
+            ui::keyword("Installing"),
             dep.name,
             &dep.rev[..12.min(dep.rev.len())]
-        );
-        install_dep(dep, modules_dir)?;
+        ));
+        install_dep(dep, modules_dir, install_mode)?;
 
         let dest = modules_dir.join(&dep.name);
         let sha256 = resolver::compute_checksum(&dest)?;
@@ -205,6 +261,42 @@ fn install_resolved(
             tag: dep.tag.clone(),
             rev: dep.rev.clone(),
             path: None,
+            sha256,
+        });
+    }
+
+    for plugin in plugins {
+        ui::info(format!(
+            "{} plugin {}@{}",
+            ui::keyword("Installing"),
+            plugin.name,
+            &plugin.rev[..12.min(plugin.rev.len())]
+        ));
+        let (installed_bin, bin_name, version_dir) = install_plugin(plugin, nu_version_req)?;
+        link_plugin_into_env(&installed_bin, bin_dir, &bin_name)?;
+        let sha256 = resolver::compute_checksum(&version_dir)?;
+        let locked_tag = if plugin.git == "nu-core" {
+            None
+        } else {
+            plugin.tag.clone()
+        };
+        let locked_rev = if plugin.git == "nu-core" {
+            version_dir
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("nu-core")
+                .to_string()
+        } else {
+            plugin.rev.clone()
+        };
+
+        locked_packages.push(LockedPackage {
+            name: plugin.name.clone(),
+            kind: LockedPackageKind::Plugin,
+            git: plugin.git.clone(),
+            tag: locked_tag,
+            rev: locked_rev,
+            path: Some(bin_name),
             sha256,
         });
     }
@@ -219,18 +311,74 @@ fn install_resolved(
     lockfile.write_to(lock_path)?;
 
     let module_count = modules.len();
+    let plugin_count = plugins.len();
     let module_suffix = if module_count == 1 { "" } else { "s" };
-    eprintln!();
-    eprintln!("Installed {module_count} module{module_suffix} into {display_name}/");
+    let plugin_suffix = if plugin_count == 1 { "" } else { "s" };
+    ui::success(format!(
+        "Installed {module_count} module{module_suffix} and {plugin_count} plugin{plugin_suffix} into {display_name}/"
+    ));
 
     // Derive project_dir from nu_env_dir (parent of .nu-env)
     let project_dir = nu_env_dir.parent().unwrap_or(nu_env_dir);
 
-    write_env_nu(nu_env_dir, modules_dir)?;
-    create_nu_symlink(nu_env_dir)?;
+    write_config_nu(nu_env_dir, modules_dir)?;
+    create_nu_symlink(nu_env_dir, nu_version_req)?;
     write_activate_overlay(nu_env_dir, project_dir)?;
+    print_plugin_registration_instructions(plugins);
 
     Ok(())
+}
+
+fn print_plugin_registration_instructions(plugins: &[ResolvedPlugin]) {
+    let commands = plugin_registration_commands(plugins);
+    if commands.is_empty() {
+        return;
+    }
+
+    ui::info("Run the following to finish enabling your new plugin(s) for this shell:");
+    eprintln!(
+        "  {}",
+        ui::command_with_inline_comment("overlay use .nu-env/activate.nu # sets the nushell env")
+    );
+    eprintln!(
+        "  {}",
+        ui::command_with_inline_comment(
+            "nu # runs the proper version of nu for this project with the module and plugin configs"
+        )
+    );
+    for (plugin_name, use_name) in commands {
+        eprintln!("  {}", ui::command(format!("plugin add {plugin_name}")));
+        eprintln!("  {}", ui::command(format!("plugin use {use_name}")));
+    }
+}
+
+fn plugin_registration_commands(plugins: &[ResolvedPlugin]) -> Vec<(String, String)> {
+    let mut commands = Vec::new();
+    let mut seen = HashSet::new();
+
+    for plugin in plugins {
+        let plugin_name = plugin
+            .bin
+            .clone()
+            .unwrap_or_else(|| plugin.name.clone())
+            .trim()
+            .to_string();
+        if plugin_name.is_empty() {
+            continue;
+        }
+
+        if seen.insert(plugin_name.clone()) {
+            commands.push((plugin_name.clone(), plugin_use_name(&plugin_name)));
+        }
+    }
+
+    commands.sort_by(|a, b| a.0.cmp(&b.0));
+    commands
+}
+
+fn plugin_use_name(plugin_name: &str) -> String {
+    let base = plugin_name.strip_suffix(".exe").unwrap_or(plugin_name);
+    base.strip_prefix("nu_plugin_").unwrap_or(base).to_string()
 }
 
 /// Generate `.nu-env/activate.nu` with a `nu` alias and deactivate alias.
@@ -238,20 +386,24 @@ pub fn write_activate_overlay(nu_env_dir: &Path, project_dir: &Path) -> Result<(
     std::fs::create_dir_all(nu_env_dir)?;
 
     let nu_bin = nu_env_dir.join(BIN_SUBDIR).join("nu");
-    let env_nu = nu_env_dir.join("env.nu");
+    let env_bin_dir = nu_env_dir.join(BIN_SUBDIR);
+    let config_nu = nu_env_dir.join("config.nu");
+    let plugin_config = nu_env_dir.join("plugins.msgpackz");
     let nu_bin_literal = nu_string_literal(&nu_bin);
-    let env_nu_literal = nu_string_literal(&env_nu);
+    let env_bin_literal = nu_string_literal(&env_bin_dir);
+    let config_nu_literal = nu_string_literal(&config_nu);
+    let plugin_config_literal = nu_string_literal(&plugin_config);
 
     let activate_script = format!(
         r#"# Generated by quiver - do not edit
+use std [ 'path add' ]
+
 export-env {{
-    source-env {env_nu_literal}
+    source-env {config_nu_literal}
+    path add {env_bin_literal}
 }}
 
-# run nu with the env config for this project
-export def --wrapped nu [...rest] {{
-    ^{nu_bin_literal} --env-config {env_nu_literal} ...$rest
-}}
+export alias nu = ^{nu_bin_literal} --config {config_nu_literal} --plugin-config {plugin_config_literal}
 
 # deactivate the virtual environment for this project
 export alias deactivate = overlay hide activate
@@ -260,37 +412,62 @@ export alias deactivate = overlay hide activate
 
     let activate_path = nu_env_dir.join("activate.nu");
     std::fs::write(&activate_path, activate_script)?;
-    eprintln!(
+    ui::success(format!(
         "Generated {}",
         activate_path
             .strip_prefix(project_dir)
             .unwrap_or(&activate_path)
             .display()
-    );
+    ));
     Ok(())
 }
 
-/// Generate `.nu-env/env.nu` with `NU_LIB_DIRS` pointing to the modules directory.
-pub fn write_env_nu(nu_env_dir: &Path, modules_dir: &Path) -> Result<()> {
+/// Generate `.nu-env/config.nu` with `NU_LIB_DIRS` pointing to the modules directory.
+pub fn write_config_nu(nu_env_dir: &Path, modules_dir: &Path) -> Result<()> {
     std::fs::create_dir_all(nu_env_dir)?;
 
     let modules_literal = nu_string_literal(modules_dir);
+    let bin_literal = nu_string_literal(&nu_env_dir.join(BIN_SUBDIR));
+    let nu_bin_literal = nu_string_literal(&nu_env_dir.join(BIN_SUBDIR).join("nu"));
+    let plugin_config_literal = nu_string_literal(&nu_env_dir.join("plugins.msgpackz"));
+    let config_literal = nu_string_literal(&nu_env_dir.join("config.nu"));
+
     let env_script = format!(
         r#"# Generated by quiver - do not edit
+use std [ 'path add' ]
+
+export-env {{
+    path add {bin_literal}
+}}
+
 export const NU_LIB_DIRS = [
     {modules_literal}
 ]
+
+export const NU_PLUGIN_DIRS = [
+    {bin_literal}
+]
+
+$env.NU_LIB_DIRS = [
+    {modules_literal}
+]
+
+export alias nu = ^{nu_bin_literal} --config {config_literal} --plugin-config {plugin_config_literal}
 "#,
     );
 
-    let env_path = nu_env_dir.join("env.nu");
-    std::fs::write(&env_path, env_script)?;
-    eprintln!("Generated {}", env_path.display());
+    let config_path = nu_env_dir.join("config.nu");
+    std::fs::write(&config_path, env_script)?;
+    ui::success(format!("Generated {}", config_path.display()));
     Ok(())
 }
 
-/// Create a symlink at `.nu-env/bin/nu` pointing to the user's `nu` binary.
-pub fn create_nu_symlink(nu_env_dir: &Path) -> Result<()> {
+/// Create a symlink at `.nu-env/bin/nu` pointing to a matching `nu` binary.
+///
+/// Resolution order:
+/// 1. `nu` in PATH (if present and matches `nu-version` when provided)
+/// 2. `~/.local/share/quiver/installs/nu_versions/<version>/` store
+pub fn create_nu_symlink(nu_env_dir: &Path, nu_version_req: Option<&str>) -> Result<()> {
     let bin_dir = nu_env_dir.join(BIN_SUBDIR);
     std::fs::create_dir_all(&bin_dir)?;
 
@@ -301,11 +478,20 @@ pub fn create_nu_symlink(nu_env_dir: &Path) -> Result<()> {
         std::fs::remove_file(&symlink_path)?;
     }
 
-    let nu_path = match detect_nu_path() {
+    let nu_path = match resolve_nu_binary_for_requirement(nu_version_req)? {
         Some(path) => path,
-        None => {
-            eprintln!("Warning: could not find 'nu' in PATH; skipping .nu-env/bin/nu symlink.");
+        None if nu_version_req.is_none() => {
+            ui::warn("could not find 'nu' in PATH; skipping .nu-env/bin/nu symlink.");
             return Ok(());
+        }
+        None => {
+            let required = nu_version_req.unwrap_or_default();
+            let installs = config::installs_nu_versions_dir()?;
+            return Err(crate::error::QuiverError::Other(format!(
+                "could not find a Nushell binary matching '{required}' in PATH or {}; install it under {}/<version>/nu",
+                installs.display(),
+                installs.display()
+            )));
         }
     };
 
@@ -314,18 +500,89 @@ pub fn create_nu_symlink(nu_env_dir: &Path) -> Result<()> {
     #[cfg(windows)]
     std::os::windows::fs::symlink_file(&nu_path, &symlink_path)?;
 
-    eprintln!("Linked .nu-env/bin/nu -> {}", nu_path.display());
+    ui::success(format!("Linked .nu-env/bin/nu -> {}", nu_path.display()));
     Ok(())
 }
 
-/// Detect the absolute path to the user's `nu` binary.
+fn resolve_nu_binary_for_requirement(nu_version_req: Option<&str>) -> Result<Option<PathBuf>> {
+    let requirement = nu_version_req
+        .map(|raw| {
+            nu::parse_nu_version_requirement(raw).map_err(|err| {
+                crate::error::QuiverError::Manifest(format!(
+                    "package nu-version '{raw}' is invalid: {err}"
+                ))
+            })
+        })
+        .transpose()?;
+    resolve_nu_binary(requirement.as_ref())
+}
+
+fn resolve_nu_binary(requirement: Option<&VersionReq>) -> Result<Option<PathBuf>> {
+    if let Some(nu_path) = detect_nu_path() {
+        if let Some(req) = requirement {
+            if detect_nu_binary_version(&nu_path).is_some_and(|v| req.matches(&v)) {
+                return Ok(Some(nu_path));
+            }
+        } else {
+            return Ok(Some(nu_path));
+        }
+    }
+
+    let mut candidates = discover_installed_nu_binaries()?;
+
+    if let Some(req) = requirement {
+        candidates.retain(|candidate| req.matches(&candidate.version));
+    }
+
+    if let Some(selected) = candidates
+        .into_iter()
+        .max_by(|a, b| a.version.cmp(&b.version))
+    {
+        return Ok(Some(selected.path));
+    }
+
+    if let Some(req) = requirement {
+        let target = select_nu_version_to_install(req)?;
+        let path = install_nu_version_from_github_release(&target)?;
+        return Ok(Some(path));
+    }
+
+    Ok(None)
+}
+
+fn core_plugin_candidate_paths(nu_path: &Path, binary_filename: &str) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+
+    if let Some(nu_bin_dir) = nu_path.parent() {
+        candidates.push(nu_bin_dir.join(binary_filename));
+        if nu_bin_dir.file_name().and_then(|name| name.to_str()) == Some("bin")
+            && let Some(version_dir) = nu_bin_dir.parent()
+        {
+            candidates.push(version_dir.join("plugins").join(binary_filename));
+        }
+    }
+
+    candidates
+}
+
+fn find_core_plugin_binary_for_nu(nu_path: &Path, binary_filename: &str) -> Option<PathBuf> {
+    core_plugin_candidate_paths(nu_path, binary_filename)
+        .into_iter()
+        .find(|candidate| candidate.is_file())
+}
+
+/// Detect the absolute path to the user's `nu` binary from PATH.
 fn detect_nu_path() -> Option<PathBuf> {
-    let output = Command::new("which").arg("nu").output().ok()?;
+    let output = if cfg!(windows) {
+        Command::new("where").arg("nu").output().ok()?
+    } else {
+        Command::new("which").arg("nu").output().ok()?
+    };
     if !output.status.success() {
         return None;
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let path_str = stdout.trim();
+    let path_str = stdout.lines().next()?.trim();
     if path_str.is_empty() {
         None
     } else {
@@ -333,16 +590,998 @@ fn detect_nu_path() -> Option<PathBuf> {
     }
 }
 
+fn detect_nu_binary_version(path: &Path) -> Option<Version> {
+    let output = Command::new(path).arg("--version").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    nu::extract_semver_from_text(&stdout)
+}
+
+#[derive(Debug, Clone)]
+struct NuBinaryCandidate {
+    path: PathBuf,
+    version: Version,
+}
+
+fn discover_installed_nu_binaries() -> Result<Vec<NuBinaryCandidate>> {
+    let nu_versions_dir = config::installs_nu_versions_dir()?;
+    if !nu_versions_dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut candidates = Vec::new();
+    for entry in std::fs::read_dir(&nu_versions_dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+
+        let version_name = entry.file_name();
+        let version_name = version_name.to_string_lossy();
+        let Ok(version) = Version::parse(&version_name) else {
+            continue;
+        };
+
+        if let Some(path) = find_nu_binary_in_version_dir(&entry.path()) {
+            candidates.push(NuBinaryCandidate { path, version });
+        }
+    }
+
+    Ok(candidates)
+}
+
+fn find_nu_binary_in_version_dir(version_dir: &Path) -> Option<PathBuf> {
+    let binary_name = if cfg!(windows) { "nu.exe" } else { "nu" };
+    let direct = version_dir.join(binary_name);
+    if direct.is_file() {
+        return Some(direct);
+    }
+
+    let in_bin_dir = version_dir.join("bin").join(binary_name);
+    if in_bin_dir.is_file() {
+        return Some(in_bin_dir);
+    }
+
+    None
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct GitHubRelease {
+    tag_name: String,
+    draft: bool,
+    prerelease: bool,
+    #[serde(default)]
+    assets: Vec<GitHubReleaseAsset>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct GitHubReleaseAsset {
+    name: String,
+    #[serde(default)]
+    browser_download_url: String,
+}
+
+fn select_nu_version_to_install(requirement: &VersionReq) -> Result<Version> {
+    if let Some(exact) = exact_required_version(requirement) {
+        return Ok(exact);
+    }
+
+    let releases = fetch_nu_github_releases()?;
+    let expected_asset_suffix = nu_release_asset_suffix()?;
+
+    let mut candidates = Vec::new();
+    for release in releases {
+        if release.draft || release.prerelease {
+            continue;
+        }
+        let Some(version) = parse_version_from_release_tag(&release.tag_name) else {
+            continue;
+        };
+        if !requirement.matches(&version) {
+            continue;
+        }
+
+        let asset_name = format!("nu-{version}-{expected_asset_suffix}");
+        if release.assets.iter().any(|asset| asset.name == asset_name) {
+            candidates.push(version);
+        }
+    }
+
+    candidates.into_iter().max().ok_or_else(|| {
+        crate::error::QuiverError::Other(format!(
+            "could not find a Nushell GitHub release matching requirement '{requirement}' for target '{}'",
+            nu_release_target_triple().unwrap_or_else(|_| "unknown".to_string())
+        ))
+    })
+}
+
+fn exact_required_version(requirement: &VersionReq) -> Option<Version> {
+    if requirement.comparators.len() != 1 {
+        return None;
+    }
+
+    let comparator = &requirement.comparators[0];
+    if comparator.op != semver::Op::Exact
+        || comparator.minor.is_none()
+        || comparator.patch.is_none()
+        || !comparator.pre.is_empty()
+    {
+        return None;
+    }
+
+    Some(Version {
+        major: comparator.major,
+        minor: comparator.minor?,
+        patch: comparator.patch?,
+        pre: semver::Prerelease::EMPTY,
+        build: semver::BuildMetadata::EMPTY,
+    })
+}
+
+fn fetch_nu_github_releases() -> Result<Vec<GitHubRelease>> {
+    ui::info(format!(
+        "{} Nushell release metadata from GitHub",
+        ui::keyword("Querying")
+    ));
+    let output = Command::new("curl")
+        .args([
+            "-fsSL",
+            "-H",
+            "Accept: application/vnd.github+json",
+            "-H",
+            "User-Agent: quiver",
+            "https://api.github.com/repos/nushell/nushell/releases?per_page=100",
+        ])
+        .output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(crate::error::QuiverError::Other(format!(
+            "failed to query Nushell releases from GitHub: {stderr}"
+        )));
+    }
+
+    serde_json::from_slice(&output.stdout).map_err(|err| {
+        crate::error::QuiverError::Other(format!("invalid GitHub release response: {err}"))
+    })
+}
+
+fn parse_version_from_release_tag(tag: &str) -> Option<Version> {
+    let trimmed = tag.trim().trim_start_matches('v');
+    Version::parse(trimmed).ok()
+}
+
+fn download_file_with_progress(url: &str, output_path: &Path, label: &str) -> Result<()> {
+    ui::info(format!("{} {label}", ui::keyword("Downloading")));
+    let progress = if let Some(total_bytes) = probe_content_length(url) {
+        let pb = ui::bytes_progress(format!("downloading {label}"));
+        pb.set_length(total_bytes);
+        pb
+    } else {
+        ui::bytes_progress_unknown(format!("downloading {label}"))
+    };
+
+    let mut child = Command::new("curl")
+        .args(["-fL", "-H", "User-Agent: quiver"])
+        .arg(url)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+
+    let mut stdout = child.stdout.take().ok_or_else(|| {
+        crate::error::QuiverError::Other("failed to capture curl output stream".to_string())
+    })?;
+    let mut file = std::fs::File::create(output_path)?;
+    let mut buffer = [0_u8; 64 * 1024];
+
+    loop {
+        let read = stdout.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        file.write_all(&buffer[..read])?;
+        progress.inc(read as u64);
+    }
+
+    let status = child.wait()?;
+
+    if status.success() {
+        progress.finish_and_clear();
+        ui::success(format!("Downloaded {label} -> {}", output_path.display()));
+        return Ok(());
+    }
+
+    progress.finish_and_clear();
+    let _ = std::fs::remove_file(output_path);
+
+    Err(crate::error::QuiverError::Other(format!(
+        "curl download failed for {label} (exit status: {status})"
+    )))
+}
+
+fn probe_content_length(url: &str) -> Option<u64> {
+    let output = Command::new("curl")
+        .args(["-fsSLI", "-H", "User-Agent: quiver"])
+        .arg(url)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout.lines().rev().find_map(|line| {
+        let mut parts = line.splitn(2, ':');
+        let key = parts.next()?.trim();
+        if !key.eq_ignore_ascii_case("content-length") {
+            return None;
+        }
+        let value = parts.next()?.trim();
+        value.parse::<u64>().ok()
+    })
+}
+
+fn install_nu_version_from_github_release(version: &Version) -> Result<PathBuf> {
+    let version_dir = config::installs_nu_versions_dir()?.join(version.to_string());
+    let binary_name = if cfg!(windows) { "nu.exe" } else { "nu" };
+    let installed_path = version_dir.join("bin").join(binary_name);
+    if installed_path.is_file() {
+        return Ok(installed_path);
+    }
+
+    std::fs::create_dir_all(&version_dir)?;
+
+    let asset_suffix = nu_release_asset_suffix()?;
+    let asset_name = format!("nu-{version}-{asset_suffix}");
+    let tag_candidates = [version.to_string(), format!("v{version}")];
+
+    let temp_root = config::installs_root_dir()?.join(format!(
+        ".nu-download-{}-{}",
+        version,
+        std::process::id()
+    ));
+    if temp_root.exists() {
+        let _ = std::fs::remove_dir_all(&temp_root);
+    }
+    std::fs::create_dir_all(&temp_root)?;
+
+    let archive_path = temp_root.join(&asset_name);
+    let mut downloaded = false;
+    let mut last_download_error = String::new();
+    for tag in &tag_candidates {
+        let url =
+            format!("https://github.com/nushell/nushell/releases/download/{tag}/{asset_name}");
+        match download_file_with_progress(
+            &url,
+            &archive_path,
+            &format!("Nushell {version} release artifact"),
+        ) {
+            Ok(()) => {
+                downloaded = true;
+                break;
+            }
+            Err(err) => {
+                last_download_error = err.to_string();
+            }
+        }
+    }
+
+    if !downloaded {
+        let _ = std::fs::remove_dir_all(&temp_root);
+        return Err(crate::error::QuiverError::Other(format!(
+            "failed to download Nushell {} release artifact '{}' from GitHub: {}",
+            version,
+            asset_name,
+            if last_download_error.is_empty() {
+                "unknown error"
+            } else {
+                &last_download_error
+            }
+        )));
+    }
+
+    let extract_dir = temp_root.join("extract");
+    std::fs::create_dir_all(&extract_dir)?;
+    extract_archive(&archive_path, &extract_dir)?;
+
+    let extracted_binary = find_extracted_nu_binary(&extract_dir).ok_or_else(|| {
+        crate::error::QuiverError::Other(format!(
+            "downloaded Nushell archive did not contain '{}'",
+            binary_name
+        ))
+    })?;
+
+    let target_bin_dir = version_dir.join("bin");
+    std::fs::create_dir_all(&target_bin_dir)?;
+    std::fs::copy(&extracted_binary, &installed_path)?;
+    make_executable(&installed_path)?;
+    let installed_plugins = install_extracted_nu_plugins(&extract_dir, &version_dir)?;
+    let _ = std::fs::remove_dir_all(&temp_root);
+
+    if installed_plugins == 0 {
+        ui::success(format!(
+            "Installed Nushell {} from GitHub releases into {}",
+            version,
+            version_dir.display()
+        ));
+    } else {
+        ui::success(format!(
+            "Installed Nushell {} from GitHub releases into {} ({} bundled plugin{})",
+            version,
+            version_dir.display(),
+            installed_plugins,
+            if installed_plugins == 1 { "" } else { "s" }
+        ));
+    }
+
+    Ok(installed_path)
+}
+
+fn nu_release_target_triple() -> Result<String> {
+    let triple = match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "aarch64") => "aarch64-apple-darwin",
+        ("macos", "x86_64") => "x86_64-apple-darwin",
+        ("linux", "aarch64") => "aarch64-unknown-linux-gnu",
+        ("linux", "x86_64") => "x86_64-unknown-linux-gnu",
+        ("windows", "aarch64") => "aarch64-pc-windows-msvc",
+        ("windows", "x86_64") => "x86_64-pc-windows-msvc",
+        (os, arch) => {
+            return Err(crate::error::QuiverError::Other(format!(
+                "unsupported platform for Nushell release downloads: {os}/{arch}"
+            )));
+        }
+    };
+    Ok(triple.to_string())
+}
+
+fn nu_release_asset_suffix() -> Result<String> {
+    let triple = nu_release_target_triple()?;
+    if cfg!(windows) {
+        Ok(format!("{triple}.zip"))
+    } else {
+        Ok(format!("{triple}.tar.gz"))
+    }
+}
+
+fn extract_archive(archive_path: &Path, extract_dir: &Path) -> Result<()> {
+    let archive_name = archive_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+
+    if archive_name.ends_with(".tar.gz") {
+        let output = Command::new("tar")
+            .arg("-xzf")
+            .arg(archive_path)
+            .arg("-C")
+            .arg(extract_dir)
+            .output()?;
+        if output.status.success() {
+            return Ok(());
+        }
+
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(crate::error::QuiverError::Other(format!(
+            "failed to extract Nushell tar archive: {stderr}"
+        )));
+    }
+
+    if archive_name.ends_with(".zip") {
+        let output = Command::new("unzip")
+            .args(["-q"])
+            .arg(archive_path)
+            .arg("-d")
+            .arg(extract_dir)
+            .output()?;
+        if output.status.success() {
+            return Ok(());
+        }
+
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(crate::error::QuiverError::Other(format!(
+            "failed to extract Nushell zip archive: {stderr}"
+        )));
+    }
+
+    Err(crate::error::QuiverError::Other(format!(
+        "unsupported Nushell archive format: {}",
+        archive_path.display()
+    )))
+}
+
+fn find_extracted_nu_binary(extract_dir: &Path) -> Option<PathBuf> {
+    let binary_name = if cfg!(windows) { "nu.exe" } else { "nu" };
+    for entry in WalkDir::new(extract_dir)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(std::result::Result::ok)
+    {
+        if entry.file_type().is_file() && entry.file_name().to_string_lossy() == binary_name {
+            return Some(entry.into_path());
+        }
+    }
+    None
+}
+
+fn install_extracted_nu_plugins(extract_dir: &Path, version_dir: &Path) -> Result<usize> {
+    let plugins = find_extracted_nu_plugins(extract_dir);
+    if plugins.is_empty() {
+        return Ok(0);
+    }
+
+    let plugins_dir = version_dir.join("plugins");
+    std::fs::create_dir_all(&plugins_dir)?;
+
+    for plugin in &plugins {
+        let plugin_name = plugin.file_name().ok_or_else(|| {
+            crate::error::QuiverError::Other(format!(
+                "failed to determine bundled plugin file name for {}",
+                plugin.display()
+            ))
+        })?;
+        let target = plugins_dir.join(plugin_name);
+        std::fs::copy(plugin, &target)?;
+        make_executable(&target)?;
+    }
+
+    Ok(plugins.len())
+}
+
+fn find_extracted_nu_plugins(extract_dir: &Path) -> Vec<PathBuf> {
+    let prefix = "nu_plugin_";
+    let suffix = if cfg!(windows) { ".exe" } else { "" };
+
+    let mut plugins = Vec::new();
+    for entry in WalkDir::new(extract_dir)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(std::result::Result::ok)
+    {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+
+        let name = entry.file_name().to_string_lossy();
+        if !name.starts_with(prefix) {
+            continue;
+        }
+        if !suffix.is_empty() && !name.ends_with(suffix) {
+            continue;
+        }
+        plugins.push(entry.into_path());
+    }
+
+    plugins.sort();
+    plugins
+}
+
+fn make_executable(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(path)?.permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(path, permissions)?;
+    }
+    let _ = path;
+    Ok(())
+}
+
+fn install_plugin(
+    plugin: &ResolvedPlugin,
+    nu_version_req: Option<&str>,
+) -> Result<(PathBuf, String, PathBuf)> {
+    if plugin.git == "nu-core" {
+        return install_core_plugin(plugin, nu_version_req);
+    }
+
+    let bin_name = plugin.bin.clone().unwrap_or_else(|| plugin.name.clone());
+    let binary_filename = plugin_binary_filename(&bin_name);
+    let version = plugin.tag.clone().unwrap_or_else(|| plugin.rev.clone());
+    let version_dir = config::installs_plugins_dir()?
+        .join(&plugin.name)
+        .join(version);
+    let installed_bin = version_dir.join("bin").join(&binary_filename);
+    if installed_bin.is_file() {
+        return Ok((installed_bin, binary_filename, version_dir));
+    }
+
+    std::fs::create_dir_all(version_dir.join("bin"))?;
+
+    if let Err(err) = install_plugin_from_github_release(plugin, &version_dir, &binary_filename) {
+        ui::warn(format!(
+            "release install for plugin '{}' failed ({err}); falling back to cargo build",
+            plugin.name
+        ));
+        install_plugin_from_cargo_source(plugin, &version_dir, &binary_filename)?;
+    }
+
+    if !installed_bin.is_file() {
+        return Err(crate::error::QuiverError::Other(format!(
+            "plugin binary '{}' was not produced for {}",
+            binary_filename, plugin.name
+        )));
+    }
+
+    Ok((installed_bin, binary_filename, version_dir))
+}
+
+fn install_core_plugin(
+    plugin: &ResolvedPlugin,
+    nu_version_req: Option<&str>,
+) -> Result<(PathBuf, String, PathBuf)> {
+    let bin_name = plugin.bin.clone().unwrap_or_else(|| plugin.name.clone());
+    let binary_filename = plugin_binary_filename(&bin_name);
+
+    let nu_path = resolve_nu_binary_for_requirement(nu_version_req)?.ok_or_else(|| {
+        crate::error::QuiverError::Other(
+            "could not resolve a Nushell binary while installing core plugin".to_string(),
+        )
+    })?;
+    let nu_version = detect_nu_binary_version(&nu_path).ok_or_else(|| {
+        crate::error::QuiverError::Other(format!(
+            "failed to detect Nushell version from {} while installing core plugin '{}'",
+            nu_path.display(),
+            plugin.name
+        ))
+    })?;
+    let source_binary = find_core_plugin_binary_for_nu(&nu_path, &binary_filename).ok_or_else(|| {
+        crate::error::QuiverError::Other(format!(
+            "core plugin '{}' ({}) was not found next to '{}' or in quiver's nu-version plugin store",
+            plugin.name,
+            binary_filename,
+            nu_path.display()
+        ))
+    })?;
+
+    let version_dir = config::installs_plugins_dir()?
+        .join(&plugin.name)
+        .join(format!("nu-{nu_version}"));
+    let installed_bin = version_dir.join("bin").join(&binary_filename);
+    if installed_bin.is_file() {
+        return Ok((installed_bin, binary_filename, version_dir));
+    }
+
+    std::fs::create_dir_all(version_dir.join("bin"))?;
+    std::fs::copy(&source_binary, &installed_bin)?;
+    make_executable(&installed_bin)?;
+
+    Ok((installed_bin, binary_filename, version_dir))
+}
+
+fn plugin_binary_filename(bin_name: &str) -> String {
+    if cfg!(windows) && !bin_name.ends_with(".exe") {
+        format!("{bin_name}.exe")
+    } else {
+        bin_name.to_string()
+    }
+}
+
+fn install_plugin_from_github_release(
+    plugin: &ResolvedPlugin,
+    version_dir: &Path,
+    binary_filename: &str,
+) -> Result<()> {
+    let (owner, repo) = parse_github_owner_repo(&plugin.git).ok_or_else(|| {
+        crate::error::QuiverError::Other(format!(
+            "plugin '{}' git source is not a supported GitHub repo URL",
+            plugin.name
+        ))
+    })?;
+    let releases = fetch_repo_github_releases(&owner, &repo)?;
+    let asset = select_plugin_release_asset(&releases, plugin.tag.as_deref(), binary_filename)
+        .ok_or_else(|| {
+            crate::error::QuiverError::Other(format!(
+                "no suitable release asset found for plugin '{}' ({}/{})",
+                plugin.name, owner, repo
+            ))
+        })?;
+    if asset.browser_download_url.trim().is_empty() {
+        return Err(crate::error::QuiverError::Other(format!(
+            "release asset '{}' did not include a download URL",
+            asset.name
+        )));
+    }
+
+    let temp_root = config::installs_root_dir()?.join(format!(
+        ".plugin-download-{}-{}",
+        plugin.name,
+        std::process::id()
+    ));
+    if temp_root.exists() {
+        let _ = std::fs::remove_dir_all(&temp_root);
+    }
+    std::fs::create_dir_all(&temp_root)?;
+
+    let downloaded_path = temp_root.join(&asset.name);
+    if let Err(err) = download_file_with_progress(
+        &asset.browser_download_url,
+        &downloaded_path,
+        &format!("plugin {} asset {}", plugin.name, asset.name),
+    ) {
+        let _ = std::fs::remove_dir_all(&temp_root);
+        return Err(crate::error::QuiverError::Other(format!(
+            "failed downloading plugin release asset '{}': {err}",
+            asset.name,
+        )));
+    }
+
+    let binary = if asset.name.ends_with(".tar.gz") || asset.name.ends_with(".zip") {
+        let extract_dir = temp_root.join("extract");
+        std::fs::create_dir_all(&extract_dir)?;
+        extract_archive(&downloaded_path, &extract_dir)?;
+        find_extracted_binary_named(&extract_dir, binary_filename).ok_or_else(|| {
+            crate::error::QuiverError::Other(format!(
+                "release asset '{}' did not contain '{}'",
+                asset.name, binary_filename
+            ))
+        })?
+    } else {
+        downloaded_path.clone()
+    };
+
+    let target = version_dir.join("bin").join(binary_filename);
+    std::fs::copy(&binary, &target)?;
+    make_executable(&target)?;
+    let _ = std::fs::remove_dir_all(&temp_root);
+
+    Ok(())
+}
+
+fn install_plugin_from_cargo_source(
+    plugin: &ResolvedPlugin,
+    version_dir: &Path,
+    binary_filename: &str,
+) -> Result<()> {
+    let repo_path = git::clone_or_fetch(&plugin.git)?;
+    let staging = config::installs_root_dir()?.join(format!(
+        ".plugin-build-{}-{}",
+        plugin.name,
+        std::process::id()
+    ));
+    if staging.exists() {
+        let _ = std::fs::remove_dir_all(&staging);
+    }
+    std::fs::create_dir_all(&staging)?;
+    git::export_to(&repo_path, &plugin.rev, &staging)?;
+
+    let build_bin_name = plugin.bin.as_deref().unwrap_or(&plugin.name);
+    let output = Command::new("cargo")
+        .current_dir(&staging)
+        .args(["build", "--release", "--bin", build_bin_name])
+        .output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(crate::error::QuiverError::Other(format!(
+            "cargo fallback build failed for plugin '{}': {stderr}",
+            plugin.name
+        )));
+    }
+
+    let built_binary = staging.join("target").join("release").join(binary_filename);
+    if !built_binary.is_file() {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(crate::error::QuiverError::Other(format!(
+            "cargo build succeeded but '{}' was not found for plugin '{}'",
+            binary_filename, plugin.name
+        )));
+    }
+
+    let target = version_dir.join("bin").join(binary_filename);
+    std::fs::copy(&built_binary, &target)?;
+    make_executable(&target)?;
+    let _ = std::fs::remove_dir_all(&staging);
+    Ok(())
+}
+
+fn link_plugin_into_env(
+    installed_binary: &Path,
+    bin_dir: &Path,
+    binary_filename: &str,
+) -> Result<()> {
+    std::fs::create_dir_all(bin_dir)?;
+    let link_path = bin_dir.join(binary_filename);
+    if link_path.exists() || link_path.symlink_metadata().is_ok() {
+        std::fs::remove_file(&link_path)?;
+    }
+
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(installed_binary, &link_path)?;
+    #[cfg(windows)]
+    {
+        if let Err(err) = std::os::windows::fs::symlink_file(installed_binary, &link_path) {
+            ui::warn(format!(
+                "symlink failed ({err}); copying plugin binary instead"
+            ));
+            std::fs::copy(installed_binary, &link_path)?;
+        }
+    }
+
+    ui::success(format!(
+        "Linked .nu-env/bin/{} -> {}",
+        binary_filename,
+        installed_binary.display()
+    ));
+    Ok(())
+}
+
+fn parse_github_owner_repo(git_url: &str) -> Option<(String, String)> {
+    let trimmed = git_url
+        .trim()
+        .trim_end_matches('/')
+        .trim_end_matches(".git");
+    if let Some(rest) = trimmed
+        .strip_prefix("https://github.com/")
+        .or_else(|| trimmed.strip_prefix("http://github.com/"))
+    {
+        let mut parts = rest.split('/');
+        let owner = parts.next()?;
+        let repo = parts.next()?;
+        if owner.is_empty() || repo.is_empty() || parts.next().is_some() {
+            return None;
+        }
+        return Some((owner.to_string(), repo.to_string()));
+    }
+
+    if let Some(rest) = trimmed.strip_prefix("git@github.com:") {
+        let mut parts = rest.split('/');
+        let owner = parts.next()?;
+        let repo = parts.next()?;
+        if owner.is_empty() || repo.is_empty() || parts.next().is_some() {
+            return None;
+        }
+        return Some((owner.to_string(), repo.to_string()));
+    }
+
+    None
+}
+
+fn fetch_repo_github_releases(owner: &str, repo: &str) -> Result<Vec<GitHubRelease>> {
+    let url = format!("https://api.github.com/repos/{owner}/{repo}/releases?per_page=100");
+    ui::info(format!(
+        "{} release metadata for {owner}/{repo}",
+        ui::keyword("Querying")
+    ));
+    let output = Command::new("curl")
+        .args([
+            "-fsSL",
+            "-H",
+            "Accept: application/vnd.github+json",
+            "-H",
+            "User-Agent: quiver",
+        ])
+        .arg(&url)
+        .output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(crate::error::QuiverError::Other(format!(
+            "failed to query plugin releases from GitHub: {stderr}"
+        )));
+    }
+
+    serde_json::from_slice(&output.stdout).map_err(|err| {
+        crate::error::QuiverError::Other(format!("invalid GitHub release response: {err}"))
+    })
+}
+
+fn select_plugin_release_asset(
+    releases: &[GitHubRelease],
+    preferred_tag: Option<&str>,
+    binary_filename: &str,
+) -> Option<GitHubReleaseAsset> {
+    for release in releases {
+        if release.draft || release.prerelease {
+            continue;
+        }
+        if let Some(tag) = preferred_tag {
+            if !release_tag_matches(&release.tag_name, tag) {
+                continue;
+            }
+        }
+
+        let mut candidates: Vec<(i32, GitHubReleaseAsset)> = release
+            .assets
+            .iter()
+            .filter_map(|asset| {
+                let score = score_plugin_asset_name(&asset.name, binary_filename)?;
+                Some((score, asset.clone()))
+            })
+            .collect();
+        candidates.sort_by(|a, b| b.0.cmp(&a.0));
+        if let Some((_, asset)) = candidates.into_iter().next() {
+            return Some(asset);
+        }
+    }
+    None
+}
+
+fn release_tag_matches(actual: &str, expected: &str) -> bool {
+    actual == expected || actual.trim_start_matches('v') == expected.trim_start_matches('v')
+}
+
+fn score_plugin_asset_name(asset_name: &str, binary_filename: &str) -> Option<i32> {
+    let lower = asset_name.to_ascii_lowercase();
+    let os_ok = match std::env::consts::OS {
+        "macos" => lower.contains("darwin") || lower.contains("apple") || lower.contains("macos"),
+        "linux" => lower.contains("linux"),
+        "windows" => lower.contains("windows") || lower.contains("win"),
+        _ => false,
+    };
+    if !os_ok {
+        return None;
+    }
+
+    let arch_ok = match std::env::consts::ARCH {
+        "aarch64" => lower.contains("aarch64") || lower.contains("arm64"),
+        "x86_64" => lower.contains("x86_64") || lower.contains("amd64"),
+        _ => false,
+    };
+    if !arch_ok {
+        return None;
+    }
+
+    let mut score = 10;
+    if lower.contains(&binary_filename.to_ascii_lowercase()) {
+        score += 5;
+    }
+    if lower.ends_with(".tar.gz") || lower.ends_with(".zip") {
+        score += 3;
+    }
+    if lower.ends_with(binary_filename) {
+        score += 2;
+    }
+
+    Some(score)
+}
+
+fn find_extracted_binary_named(root: &Path, binary_filename: &str) -> Option<PathBuf> {
+    for entry in WalkDir::new(root)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(std::result::Result::ok)
+    {
+        if entry.file_type().is_file()
+            && entry
+                .file_name()
+                .to_string_lossy()
+                .eq_ignore_ascii_case(binary_filename)
+        {
+            return Some(entry.into_path());
+        }
+    }
+    None
+}
+
 fn nu_string_literal(path: &Path) -> String {
     format!("{:?}", path.to_string_lossy())
 }
 
 /// Install a single resolved dependency into the modules directory.
-fn install_dep(dep: &ResolvedDep, modules_dir: &Path) -> Result<String> {
+fn install_dep(dep: &ResolvedDep, modules_dir: &Path, install_mode: InstallMode) -> Result<String> {
     let repo_path = git::clone_or_fetch(&dep.git)?;
     let dest = modules_dir.join(&dep.name);
-    git::export_to(&repo_path, &dep.rev, &dest)?;
+    let staging = modules_dir.join(format!(
+        ".quiver-staging-{}-{}",
+        dep.name,
+        std::process::id()
+    ));
+    if staging.exists() {
+        std::fs::remove_dir_all(&staging)?;
+    }
+
+    git::export_to(&repo_path, &dep.rev, &staging)?;
+    materialize_module_dir(&staging, &dest, install_mode)?;
+    std::fs::remove_dir_all(&staging)?;
     discover_module_use_path(&dest, &dep.name)
+}
+
+fn materialize_module_dir(src: &Path, dest: &Path, mode: InstallMode) -> Result<()> {
+    if dest.exists() {
+        std::fs::remove_dir_all(dest)?;
+    }
+
+    match mode {
+        InstallMode::Clone => {
+            if let Err(err) = clone_dir(src, dest) {
+                ui::warn(format!("clone mode failed ({err}); falling back to copy"));
+                copy_dir(src, dest)?;
+            }
+            Ok(())
+        }
+        InstallMode::Hardlink => hardlink_dir(src, dest),
+        InstallMode::Copy => copy_dir(src, dest),
+    }
+}
+
+fn clone_dir(src: &Path, dest: &Path) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        copy_with_cp(src, dest, &["-cR"])
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        copy_with_cp(src, dest, &["-a", "--reflink=always"])
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = (src, dest);
+        Err(crate::error::QuiverError::Other(
+            "clone mode is not supported on this platform".to_string(),
+        ))
+    }
+}
+
+fn copy_with_cp(src: &Path, dest: &Path, flags: &[&str]) -> Result<()> {
+    let output = Command::new("cp").args(flags).arg(src).arg(dest).output()?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let message = if stderr.is_empty() {
+        "cp failed with unknown error".to_string()
+    } else {
+        stderr
+    };
+    Err(crate::error::QuiverError::Other(message))
+}
+
+fn hardlink_dir(src: &Path, dest: &Path) -> Result<()> {
+    std::fs::create_dir_all(dest)?;
+    for entry in WalkDir::new(src)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(std::result::Result::ok)
+    {
+        let relative = entry
+            .path()
+            .strip_prefix(src)
+            .map_err(|e| crate::error::QuiverError::Other(e.to_string()))?;
+        if relative.as_os_str().is_empty() {
+            continue;
+        }
+        let target = dest.join(relative);
+        if entry.file_type().is_dir() {
+            std::fs::create_dir_all(&target)?;
+        } else if entry.file_type().is_file() {
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::hard_link(entry.path(), &target)?;
+        }
+    }
+    Ok(())
+}
+
+fn copy_dir(src: &Path, dest: &Path) -> Result<()> {
+    std::fs::create_dir_all(dest)?;
+    for entry in WalkDir::new(src)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(std::result::Result::ok)
+    {
+        let relative = entry
+            .path()
+            .strip_prefix(src)
+            .map_err(|e| crate::error::QuiverError::Other(e.to_string()))?;
+        if relative.as_os_str().is_empty() {
+            continue;
+        }
+        let target = dest.join(relative);
+        if entry.file_type().is_dir() {
+            std::fs::create_dir_all(&target)?;
+        } else if entry.file_type().is_file() {
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::copy(entry.path(), &target)?;
+        }
+    }
+    Ok(())
 }
 
 fn discover_module_use_path(module_root: &Path, dep_name: &str) -> Result<String> {
@@ -392,9 +1631,9 @@ fn discover_module_use_path(module_root: &Path, dep_name: &str) -> Result<String
         return Ok(module_use_path(dep_name, best));
     }
 
-    eprintln!(
-        "Warning: could not locate mod.nu for module '{dep_name}' after install; defaulting to '{dep_name}'."
-    );
+    ui::warn(format!(
+        "could not locate mod.nu for module '{dep_name}' after install; defaulting to '{dep_name}'"
+    ));
     Ok(dep_name.to_string())
 }
 
@@ -615,12 +1854,25 @@ fn local_lockfile_is_stale(manifest: &Manifest, lockfile: &Lockfile) -> bool {
             return true;
         }
     }
+    for name in manifest.dependencies.plugins.keys() {
+        if lockfile
+            .find_package(name, LockedPackageKind::Plugin)
+            .is_none()
+        {
+            return true;
+        }
+    }
 
     // Check if lockfile has deps not in manifest or unsupported kinds.
     for pkg in &lockfile.packages {
         match pkg.kind {
             LockedPackageKind::Module => {
                 if !manifest.dependencies.modules.contains_key(&pkg.name) {
+                    return true;
+                }
+            }
+            LockedPackageKind::Plugin => {
+                if !manifest.dependencies.plugins.contains_key(&pkg.name) {
                     return true;
                 }
             }
@@ -655,6 +1907,7 @@ fn is_global_lockfile_stale(config: &GlobalConfig, lock_path: &Path) -> Result<b
                     return Ok(true);
                 }
             }
+            LockedPackageKind::Plugin => return Ok(true),
             LockedPackageKind::Other => return Ok(true),
         }
     }
@@ -666,6 +1919,7 @@ fn is_global_lockfile_stale(config: &GlobalConfig, lock_path: &Path) -> Result<b
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::ffi::OsString;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -684,6 +1938,14 @@ mod tests {
         dir
     }
 
+    fn plugin_test_name(base: &str) -> OsString {
+        if cfg!(windows) {
+            OsString::from(format!("{base}.exe"))
+        } else {
+            OsString::from(base)
+        }
+    }
+
     #[test]
     fn writes_activate_overlay() {
         let project_dir = make_temp_dir("activate_overlay");
@@ -694,27 +1956,34 @@ mod tests {
         let activate = std::fs::read_to_string(nu_env_dir.join("activate.nu")).unwrap();
         assert!(activate.contains("export-env {"));
         assert!(activate.contains("source-env"));
-        assert!(activate.contains("export def --wrapped nu [...rest]"));
+        assert!(activate.contains("export alias nu = ^"));
         assert!(activate.contains("^"));
         assert!(activate.contains(".nu-env/bin/nu"));
-        assert!(activate.contains("--env-config"));
-        assert!(activate.contains(".nu-env/env.nu"));
+        assert!(activate.contains("--config"));
+        assert!(activate.contains(".nu-env/config.nu"));
+        assert!(activate.contains("use std [ 'path add' ]"));
+        assert!(activate.contains("path add"));
         assert!(activate.contains("export alias deactivate = overlay hide activate"));
 
         let _ = std::fs::remove_dir_all(project_dir);
     }
 
     #[test]
-    fn writes_env_nu() {
-        let nu_env_dir = make_temp_dir("env_nu");
+    fn writes_config_nu() {
+        let nu_env_dir = make_temp_dir("config_nu");
         let modules_dir = nu_env_dir.join("modules");
         std::fs::create_dir_all(&modules_dir).unwrap();
 
-        write_env_nu(&nu_env_dir, &modules_dir).unwrap();
+        write_config_nu(&nu_env_dir, &modules_dir).unwrap();
 
-        let env_nu = std::fs::read_to_string(nu_env_dir.join("env.nu")).unwrap();
-        assert!(env_nu.contains("export const NU_LIB_DIRS"));
-        assert!(env_nu.contains(&modules_dir.display().to_string()));
+        let config_nu = std::fs::read_to_string(nu_env_dir.join("config.nu")).unwrap();
+        assert!(config_nu.contains("export const NU_LIB_DIRS"));
+        assert!(config_nu.contains(&modules_dir.display().to_string()));
+        assert!(config_nu.contains("$env.NU_LIB_DIRS"));
+        assert!(config_nu.contains("use std [ 'path add' ]"));
+        assert!(config_nu.contains("path add"));
+        assert!(config_nu.contains("export alias nu = ^"));
+        assert!(config_nu.contains("--config"));
 
         let _ = std::fs::remove_dir_all(nu_env_dir);
     }
@@ -837,13 +2106,13 @@ version = "0.1.0"
 
         let nu_env = project_dir.join(".nu-env");
         let activate = std::fs::read_to_string(nu_env.join("activate.nu")).unwrap();
-        assert!(activate.contains("export def --wrapped nu [...rest]"));
+        assert!(activate.contains("export alias nu = ^"));
         assert!(activate.contains("source-env"));
         assert!(activate.contains("export alias deactivate = overlay hide activate"));
 
-        let env_nu = std::fs::read_to_string(nu_env.join("env.nu")).unwrap();
-        assert!(env_nu.contains("export const NU_LIB_DIRS"));
-        assert!(env_nu.contains(".nu-env/modules"));
+        let config_nu = std::fs::read_to_string(nu_env.join("config.nu")).unwrap();
+        assert!(config_nu.contains("export const NU_LIB_DIRS"));
+        assert!(config_nu.contains(".nu-env/modules"));
 
         let _ = std::fs::remove_dir_all(project_dir);
     }
@@ -869,6 +2138,7 @@ sha256 = "aaa"
         let config = GlobalConfig {
             modules_dir: None,
             default_git_provider: "github".to_string(),
+            install_mode: InstallMode::Copy,
             dependencies: HashMap::from([(
                 "nu-utils".to_string(),
                 crate::manifest::DependencySpec {
@@ -905,6 +2175,7 @@ sha256 = "aaa"
         let config = GlobalConfig {
             modules_dir: None,
             default_git_provider: "github".to_string(),
+            install_mode: InstallMode::Copy,
             dependencies: HashMap::from([(
                 "nu-utils".to_string(),
                 crate::manifest::DependencySpec {
@@ -924,7 +2195,7 @@ sha256 = "aaa"
     fn create_nu_symlink_creates_symlink() {
         let nu_env_dir = make_temp_dir("symlink_test");
 
-        create_nu_symlink(&nu_env_dir).unwrap();
+        create_nu_symlink(&nu_env_dir, None).unwrap();
 
         let symlink_path = nu_env_dir.join("bin").join("nu");
         // If nu is available in PATH, symlink should exist
@@ -952,7 +2223,7 @@ sha256 = "aaa"
         // Create a dummy file where the symlink would go
         std::fs::write(bin_dir.join("nu"), "dummy").unwrap();
 
-        create_nu_symlink(&nu_env_dir).unwrap();
+        create_nu_symlink(&nu_env_dir, None).unwrap();
 
         let symlink_path = bin_dir.join("nu");
         if symlink_path.exists() {
@@ -970,8 +2241,221 @@ sha256 = "aaa"
     }
 
     #[test]
+    fn local_lockfile_staleness_detects_missing_plugin_entry() {
+        let manifest = Manifest::from_str(
+            r#"
+[package]
+name = "demo"
+version = "0.1.0"
+
+[dependencies.modules]
+nu-utils = { git = "https://github.com/example/nu-utils", tag = "v1.0.0" }
+
+[dependencies.plugins]
+nu_plugin_inc = { git = "https://github.com/nushell/nu_plugin_inc", tag = "v0.91.0", bin = "nu_plugin_inc" }
+"#,
+        )
+        .unwrap();
+
+        let lockfile = Lockfile {
+            version: 1,
+            packages: vec![LockedPackage {
+                name: "nu-utils".to_string(),
+                kind: LockedPackageKind::Module,
+                git: "https://github.com/example/nu-utils".to_string(),
+                tag: Some("v1.0.0".to_string()),
+                rev: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+                path: None,
+                sha256: "aaa".to_string(),
+            }],
+        };
+
+        assert!(local_lockfile_is_stale(&manifest, &lockfile));
+    }
+
+    #[test]
+    fn select_plugin_release_asset_prefers_matching_tag_and_platform() {
+        let binary = plugin_binary_filename("nu_plugin_inc");
+        let releases = vec![
+            GitHubRelease {
+                tag_name: "v0.90.0".to_string(),
+                draft: false,
+                prerelease: false,
+                assets: vec![GitHubReleaseAsset {
+                    name: "nu_plugin_inc-x86_64-unknown-linux-gnu.tar.gz".to_string(),
+                    browser_download_url: "https://example.com/old".to_string(),
+                }],
+            },
+            GitHubRelease {
+                tag_name: "v0.91.0".to_string(),
+                draft: false,
+                prerelease: false,
+                assets: vec![GitHubReleaseAsset {
+                    name: format!(
+                        "nu_plugin_inc-{}-{}.tar.gz",
+                        std::env::consts::ARCH,
+                        std::env::consts::OS
+                    ),
+                    browser_download_url: "https://example.com/new".to_string(),
+                }],
+            },
+        ];
+
+        let selected = select_plugin_release_asset(&releases, Some("v0.91.0"), &binary);
+        assert!(selected.is_some());
+    }
+
+    #[test]
+    fn link_plugin_into_env_creates_link() {
+        let root = make_temp_dir("plugin_link");
+        let store_bin = root.join("store").join("nu_plugin_inc");
+        let env_bin = root.join(".nu-env").join("bin");
+        std::fs::create_dir_all(store_bin.parent().unwrap()).unwrap();
+        std::fs::write(&store_bin, "plugin-binary").unwrap();
+
+        link_plugin_into_env(&store_bin, &env_bin, "nu_plugin_inc").unwrap();
+
+        let linked = env_bin.join("nu_plugin_inc");
+        assert!(linked.exists());
+        #[cfg(unix)]
+        assert!(linked.symlink_metadata().unwrap().file_type().is_symlink());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn find_extracted_nu_plugins_finds_only_core_plugins() {
+        let root = make_temp_dir("nu_release_plugins");
+        let extracted = root.join("extract");
+        let nested = extracted.join("nu-0.110.0");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        std::fs::write(nested.join("nu"), "nu").unwrap();
+        std::fs::write(nested.join("README.txt"), "readme").unwrap();
+        let formats = plugin_test_name("nu_plugin_formats");
+        let query = plugin_test_name("nu_plugin_query");
+        std::fs::write(nested.join(&formats), "formats").unwrap();
+        std::fs::write(nested.join(&query), "query").unwrap();
+
+        let plugins = find_extracted_nu_plugins(&extracted);
+        let names: Vec<String> = plugins
+            .iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+
+        assert_eq!(
+            names,
+            vec![
+                formats.to_string_lossy().into_owned(),
+                query.to_string_lossy().into_owned()
+            ]
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn install_extracted_nu_plugins_copies_into_version_plugins_dir() {
+        let root = make_temp_dir("nu_release_plugin_install");
+        let extracted = root.join("extract");
+        std::fs::create_dir_all(&extracted).unwrap();
+        let formats = plugin_test_name("nu_plugin_formats");
+        let query = plugin_test_name("nu_plugin_query");
+        std::fs::write(extracted.join(&formats), "formats").unwrap();
+        std::fs::write(extracted.join(&query), "query").unwrap();
+
+        let version_dir = root.join("nu_versions").join("0.110.0");
+        let count = install_extracted_nu_plugins(&extracted, &version_dir).unwrap();
+        assert_eq!(count, 2);
+        assert!(version_dir.join("plugins").join(formats).is_file());
+        assert!(version_dir.join("plugins").join(query).is_file());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn find_core_plugin_binary_prefers_same_dir_as_nu() {
+        let root = make_temp_dir("core_plugin_same_dir");
+        let nu_dir = root.join("usr").join("local").join("bin");
+        std::fs::create_dir_all(&nu_dir).unwrap();
+        let nu_path = nu_dir.join("nu");
+        std::fs::write(&nu_path, "nu").unwrap();
+        let plugin_name = plugin_test_name("nu_plugin_query");
+        let plugin_path = nu_dir.join(&plugin_name);
+        std::fs::write(&plugin_path, "query").unwrap();
+
+        let found =
+            find_core_plugin_binary_for_nu(&nu_path, &plugin_name.to_string_lossy()).unwrap();
+        assert_eq!(found, plugin_path);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn find_core_plugin_binary_checks_quiver_version_plugins_dir() {
+        let root = make_temp_dir("core_plugin_quiver_store");
+        let version_bin = root.join("nu_versions").join("0.110.0").join("bin");
+        std::fs::create_dir_all(&version_bin).unwrap();
+        let nu_path = version_bin.join("nu");
+        std::fs::write(&nu_path, "nu").unwrap();
+        let plugin_name = plugin_test_name("nu_plugin_polars");
+        let plugins_dir = root.join("nu_versions").join("0.110.0").join("plugins");
+        std::fs::create_dir_all(&plugins_dir).unwrap();
+        let plugin_path = plugins_dir.join(&plugin_name);
+        std::fs::write(&plugin_path, "polars").unwrap();
+
+        let found =
+            find_core_plugin_binary_for_nu(&nu_path, &plugin_name.to_string_lossy()).unwrap();
+        assert_eq!(found, plugin_path);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn nu_string_literal_escapes_paths() {
         let literal = nu_string_literal(Path::new(r#"/tmp/dir "with quote"/nu"#));
         assert_eq!(literal, r#""/tmp/dir \"with quote\"/nu""#);
+    }
+
+    #[test]
+    fn plugin_registration_commands_are_sorted_and_deduped() {
+        let commands = plugin_registration_commands(&[
+            ResolvedPlugin {
+                name: "z_plugin".to_string(),
+                git: "nu-core".to_string(),
+                tag: None,
+                rev: "nu-core".to_string(),
+                bin: Some("nu_plugin_zeta".to_string()),
+            },
+            ResolvedPlugin {
+                name: "a_plugin".to_string(),
+                git: "nu-core".to_string(),
+                tag: None,
+                rev: "nu-core".to_string(),
+                bin: None,
+            },
+            ResolvedPlugin {
+                name: "duplicate".to_string(),
+                git: "nu-core".to_string(),
+                tag: None,
+                rev: "nu-core".to_string(),
+                bin: Some("nu_plugin_zeta".to_string()),
+            },
+        ]);
+
+        assert_eq!(
+            commands,
+            vec![
+                ("a_plugin".to_string(), "a_plugin".to_string()),
+                ("nu_plugin_zeta".to_string(), "zeta".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn plugin_use_name_strips_prefix_and_windows_suffix() {
+        assert_eq!(plugin_use_name("nu_plugin_inc"), "inc");
+        assert_eq!(plugin_use_name("nu_plugin_query.exe"), "query");
+        assert_eq!(plugin_use_name("custom_plugin"), "custom_plugin");
     }
 }

@@ -2,6 +2,14 @@
 
 ## Added
 - Ignore the `.nu-env` directory with a generated `.gitignore` upon `qv init` (appends to existing `.gitignore` if one already exists).
+- Added configurable `install_mode` in global config (`clone`, `hardlink`, `copy`) for module installation strategy.
+- Default install mode is now `clone` on macOS/Linux (with automatic fallback to `copy` if clone fails) and `hardlink` on Windows.
+- Enforcing semver `package.nu-version` in `nupackage.toml`.
+  - If present, it is enforced.
+  - If the specified version of `nu` is not installed, quiver will attempt to download it from the GitHub releases into `~/.local/share/quiver/installs/nu_versions/<version>/bin/nu`. This will be symlinked the projects `.nu-env/bin/` which is added to path with `activate.nu` and `env.nu`.
+
+## Changed
+- Quiver now installs modules (and plugins soon) to `~/.local/share/quiver/` now instead of using the `~/.cache/` dir. This is more like mise-en-place and works better for the binary installs of plugins.
 
 ## Fixed
 - The `mod.nu` generated with `qv init` now properly reflects the ability to use relative paths for nu modules since we have a better nu env.

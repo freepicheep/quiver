@@ -11,6 +11,14 @@ fn default_git_provider() -> String {
     DEFAULT_GIT_PROVIDER.to_string()
 }
 
+fn default_install_mode() -> InstallMode {
+    if cfg!(windows) {
+        InstallMode::Hardlink
+    } else {
+        InstallMode::Clone
+    }
+}
+
 fn known_provider_base_url(provider: &str) -> Option<&'static str> {
     match provider {
         "github" => Some("https://github.com"),
@@ -46,6 +54,17 @@ fn normalize_provider_base_url(provider: &str) -> Option<String> {
 /// The global quiver config file: `~/.config/quiver/config.toml`.
 ///
 /// Tracks globally-installed modules and optional path overrides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum InstallMode {
+    Clone,
+    Hardlink,
+    Copy,
+}
+
+/// The global quiver config file: `~/.config/quiver/config.toml`.
+///
+/// Tracks globally-installed modules and optional path overrides.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GlobalConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -53,6 +72,9 @@ pub struct GlobalConfig {
 
     #[serde(default = "default_git_provider")]
     pub default_git_provider: String,
+
+    #[serde(default = "default_install_mode")]
+    pub install_mode: InstallMode,
 
     #[serde(default)]
     pub dependencies: HashMap<String, DependencySpec>,
@@ -63,6 +85,7 @@ impl Default for GlobalConfig {
         Self {
             modules_dir: None,
             default_git_provider: default_git_provider(),
+            install_mode: default_install_mode(),
             dependencies: HashMap::new(),
         }
     }
@@ -154,6 +177,42 @@ pub fn global_lock_path() -> Result<PathBuf> {
     Ok(global_config_dir()?.join("config.lock"))
 }
 
+/// Returns the root install directory.
+///
+/// Uses `~/.local/share/quiver/installs/` on macOS/Linux and
+/// `%APPDATA%/quiver/installs/` on Windows.
+pub fn installs_root_dir() -> Result<PathBuf> {
+    #[cfg(windows)]
+    {
+        let data = dirs::data_dir()
+            .ok_or_else(|| QuiverError::Config("could not determine data directory".to_string()))?;
+        return Ok(data.join("quiver").join("installs"));
+    }
+
+    #[cfg(not(windows))]
+    {
+        let home = dirs::home_dir()
+            .ok_or_else(|| QuiverError::Config("could not determine home directory".to_string()))?;
+        return Ok(home
+            .join(".local")
+            .join("share")
+            .join("quiver")
+            .join("installs"));
+    }
+}
+
+/// Returns the shared plugin install store:
+/// `~/.local/share/quiver/installs/plugins/` on Linux.
+pub fn installs_plugins_dir() -> Result<PathBuf> {
+    Ok(installs_root_dir()?.join("plugins"))
+}
+
+/// Returns the shared Nushell-version install store:
+/// `~/.local/share/quiver/installs/nu_versions/` on macOS/Linux.
+pub fn installs_nu_versions_dir() -> Result<PathBuf> {
+    Ok(installs_root_dir()?.join("nu_versions"))
+}
+
 /// Returns the default global modules directory, using the platform config
 /// directory (where Nushell stores its config) + `vendor/quiver/modules/`.
 ///
@@ -178,6 +237,7 @@ mod tests {
         let config = GlobalConfig {
             modules_dir: None,
             default_git_provider: "github".to_string(),
+            install_mode: default_install_mode(),
             dependencies: HashMap::from([(
                 "nu-utils".to_string(),
                 DependencySpec {
@@ -196,6 +256,7 @@ mod tests {
         assert!(parsed.dependencies.contains_key("nu-utils"));
         assert!(parsed.modules_dir.is_none());
         assert_eq!(parsed.default_git_provider, "github");
+        assert_eq!(parsed.install_mode, default_install_mode());
     }
 
     #[test]
@@ -203,6 +264,7 @@ mod tests {
         let config = GlobalConfig {
             modules_dir: Some("/custom/path".to_string()),
             default_git_provider: "gitlab".to_string(),
+            install_mode: InstallMode::Copy,
             dependencies: HashMap::new(),
         };
 
@@ -211,6 +273,7 @@ mod tests {
 
         assert_eq!(parsed.modules_dir.as_deref(), Some("/custom/path"));
         assert_eq!(parsed.default_git_provider, "gitlab");
+        assert_eq!(parsed.install_mode, InstallMode::Copy);
     }
 
     #[test]
@@ -218,6 +281,7 @@ mod tests {
         let config = GlobalConfig {
             modules_dir: Some("/custom/modules".to_string()),
             default_git_provider: "github".to_string(),
+            install_mode: default_install_mode(),
             dependencies: HashMap::new(),
         };
         assert_eq!(
@@ -231,6 +295,7 @@ mod tests {
         let config = GlobalConfig {
             modules_dir: None,
             default_git_provider: "github".to_string(),
+            install_mode: default_install_mode(),
             dependencies: HashMap::new(),
         };
         let dir = config.modules_dir().unwrap();
@@ -252,6 +317,21 @@ mod tests {
     }
 
     #[test]
+    fn install_store_paths() {
+        let root = installs_root_dir().unwrap();
+        assert!(root.ends_with("quiver/installs"));
+
+        let modules = installs_root_dir().unwrap().join("modules");
+        assert!(modules.ends_with("quiver/installs/modules"));
+
+        let plugins = installs_plugins_dir().unwrap();
+        assert!(plugins.ends_with("quiver/installs/plugins"));
+
+        let nu_versions = installs_nu_versions_dir().unwrap();
+        assert!(nu_versions.ends_with("quiver/installs/nu_versions"));
+    }
+
+    #[test]
     fn missing_provider_defaults_to_github() {
         let toml = r#"
 modules_dir = "/tmp/quiver-modules"
@@ -260,6 +340,7 @@ modules_dir = "/tmp/quiver-modules"
 "#;
         let parsed: GlobalConfig = toml::from_str(toml).unwrap();
         assert_eq!(parsed.default_git_provider, "github");
+        assert_eq!(parsed.install_mode, default_install_mode());
     }
 
     #[test]
@@ -282,6 +363,7 @@ modules_dir = "/tmp/quiver-modules"
         let config = GlobalConfig {
             modules_dir: None,
             default_git_provider: "git.example.com".to_string(),
+            install_mode: default_install_mode(),
             dependencies: HashMap::new(),
         };
         assert_eq!(
@@ -295,9 +377,24 @@ modules_dir = "/tmp/quiver-modules"
         let config = GlobalConfig {
             modules_dir: None,
             default_git_provider: "not-a-provider".to_string(),
+            install_mode: default_install_mode(),
             dependencies: HashMap::new(),
         };
         let err = config.default_git_provider_base_url().unwrap_err();
         assert!(err.to_string().contains("unsupported default_git_provider"));
+    }
+
+    #[test]
+    fn install_mode_round_trip() {
+        let config = GlobalConfig {
+            modules_dir: None,
+            default_git_provider: "github".to_string(),
+            install_mode: InstallMode::Hardlink,
+            dependencies: HashMap::new(),
+        };
+
+        let serialized = toml::to_string_pretty(&config).unwrap();
+        let parsed: GlobalConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(parsed.install_mode, InstallMode::Hardlink);
     }
 }
