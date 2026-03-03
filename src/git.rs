@@ -379,9 +379,7 @@ mod tests {
         std::fs::write(dir.join("README.md"), "test").unwrap();
 
         let mut index = repo.index().unwrap();
-        index
-            .add_all(["*"], IndexAddOption::DEFAULT, None)
-            .unwrap();
+        index.add_all(["*"], IndexAddOption::DEFAULT, None).unwrap();
         index.write().unwrap();
         let tree_id = index.write_tree().unwrap();
         let tree = repo.find_tree(tree_id).unwrap();

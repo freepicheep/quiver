@@ -3,9 +3,13 @@ use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use flate2::read::GzDecoder;
 use semver::{Version, VersionReq};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use tar::Archive as TarArchive;
+use xz2::read::XzDecoder;
+use zip::ZipArchive;
 
 use crate::config::{self, GlobalConfig, InstallMode};
 use crate::error::Result;
@@ -1429,60 +1433,140 @@ fn extract_archive(archive_path: &Path, extract_dir: &Path) -> Result<()> {
         .unwrap_or_default();
 
     if archive_name.ends_with(".tar.gz") || archive_name.ends_with(".tgz") {
-        let output = Command::new("tar")
-            .arg("-xzf")
-            .arg(archive_path)
-            .arg("-C")
-            .arg(extract_dir)
-            .output()?;
-        if output.status.success() {
-            return Ok(());
-        }
-
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(crate::error::QuiverError::Other(format!(
-            "failed to extract Nushell tar archive: {stderr}"
-        )));
+        return extract_tar_archive(archive_path, extract_dir, TarCompression::Gzip);
     }
 
     if archive_name.ends_with(".tar.xz") {
-        let output = Command::new("tar")
-            .arg("-xJf")
-            .arg(archive_path)
-            .arg("-C")
-            .arg(extract_dir)
-            .output()?;
-        if output.status.success() {
-            return Ok(());
-        }
-
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(crate::error::QuiverError::Other(format!(
-            "failed to extract Nushell tar.xz archive: {stderr}"
-        )));
+        return extract_tar_archive(archive_path, extract_dir, TarCompression::Xz);
     }
 
     if archive_name.ends_with(".zip") {
-        let output = Command::new("unzip")
-            .args(["-q"])
-            .arg(archive_path)
-            .arg("-d")
-            .arg(extract_dir)
-            .output()?;
-        if output.status.success() {
-            return Ok(());
-        }
-
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(crate::error::QuiverError::Other(format!(
-            "failed to extract Nushell zip archive: {stderr}"
-        )));
+        return extract_zip_archive(archive_path, extract_dir);
     }
 
     Err(crate::error::QuiverError::Other(format!(
         "unsupported Nushell archive format: {}",
         archive_path.display()
     )))
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TarCompression {
+    Gzip,
+    Xz,
+}
+
+fn extract_tar_archive(
+    archive_path: &Path,
+    extract_dir: &Path,
+    compression: TarCompression,
+) -> Result<()> {
+    let file = std::fs::File::open(archive_path)?;
+    match compression {
+        TarCompression::Gzip => {
+            let decoder = GzDecoder::new(file);
+            let archive = TarArchive::new(decoder);
+            extract_tar_entries(archive, extract_dir)
+        }
+        TarCompression::Xz => {
+            let decoder = XzDecoder::new(file);
+            let archive = TarArchive::new(decoder);
+            extract_tar_entries(archive, extract_dir)
+        }
+    }
+}
+
+fn extract_tar_entries<R: Read>(mut archive: TarArchive<R>, extract_dir: &Path) -> Result<()> {
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let entry_type = entry.header().entry_type();
+        if entry_type.is_symlink() || entry_type.is_hard_link() {
+            let path = entry.path()?;
+            return Err(crate::error::QuiverError::Other(format!(
+                "archive contains unsupported link entry '{}'",
+                path.display()
+            )));
+        }
+
+        let relative_path = entry.path()?;
+        let Some(safe_relative) = safety::normalized_relative_path(relative_path.as_ref()) else {
+            return Err(crate::error::QuiverError::Other(format!(
+                "archive contains unsafe path '{}'",
+                relative_path.display()
+            )));
+        };
+
+        if safe_relative.as_os_str().is_empty() {
+            continue;
+        }
+
+        let target = extract_dir.join(&safe_relative);
+        if entry_type.is_dir() {
+            std::fs::create_dir_all(&target)?;
+            continue;
+        }
+        if !entry_type.is_file() {
+            return Err(crate::error::QuiverError::Other(format!(
+                "archive contains unsupported entry type at '{}'",
+                safe_relative.display()
+            )));
+        }
+
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        entry.unpack(&target)?;
+    }
+    Ok(())
+}
+
+fn extract_zip_archive(archive_path: &Path, extract_dir: &Path) -> Result<()> {
+    let file = std::fs::File::open(archive_path)?;
+    let mut archive = ZipArchive::new(file).map_err(|err| {
+        crate::error::QuiverError::Other(format!("failed to read zip archive: {err}"))
+    })?;
+
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index).map_err(|err| {
+            crate::error::QuiverError::Other(format!("failed to read zip entry #{index}: {err}"))
+        })?;
+        let raw_name = entry.name().to_string();
+        let enclosed = entry.enclosed_name().ok_or_else(|| {
+            crate::error::QuiverError::Other(format!("archive contains unsafe path '{}'", raw_name))
+        })?;
+        let Some(safe_relative) = safety::normalized_relative_path(enclosed) else {
+            return Err(crate::error::QuiverError::Other(format!(
+                "archive contains unsafe path '{}'",
+                raw_name
+            )));
+        };
+
+        if safe_relative.as_os_str().is_empty() {
+            continue;
+        }
+
+        if let Some(mode) = entry.unix_mode()
+            && (mode & 0o170000) == 0o120000
+        {
+            return Err(crate::error::QuiverError::Other(format!(
+                "archive contains unsupported symlink entry '{}'",
+                raw_name
+            )));
+        }
+
+        let target = extract_dir.join(&safe_relative);
+        if entry.is_dir() {
+            std::fs::create_dir_all(&target)?;
+            continue;
+        }
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut output = std::fs::File::create(&target)?;
+        std::io::copy(&mut entry, &mut output)?;
+    }
+
+    Ok(())
 }
 
 fn find_extracted_nu_binary(extract_dir: &Path) -> Option<PathBuf> {
@@ -1824,18 +1908,18 @@ fn install_plugin_from_github_release(
     }
 
     let binary = if is_supported_archive_asset_name(&selected.asset.name.to_ascii_lowercase()) {
-            let extract_dir = temp_root.join("extract");
-            std::fs::create_dir_all(&extract_dir)?;
-            extract_archive(&downloaded_path, &extract_dir)?;
-            find_extracted_binary_named(&extract_dir, binary_filename).ok_or_else(|| {
-                crate::error::QuiverError::Other(format!(
-                    "release asset '{}' did not contain '{}'",
-                    selected.asset.name, binary_filename
-                ))
-            })?
-        } else {
-            downloaded_path.clone()
-        };
+        let extract_dir = temp_root.join("extract");
+        std::fs::create_dir_all(&extract_dir)?;
+        extract_archive(&downloaded_path, &extract_dir)?;
+        find_extracted_binary_named(&extract_dir, binary_filename).ok_or_else(|| {
+            crate::error::QuiverError::Other(format!(
+                "release asset '{}' did not contain '{}'",
+                selected.asset.name, binary_filename
+            ))
+        })?
+    } else {
+        downloaded_path.clone()
+    };
 
     let target = version_dir.join("bin").join(binary_filename);
     std::fs::copy(&binary, &target)?;
@@ -2014,11 +2098,12 @@ fn link_points_to_target(link_path: &Path, target: &Path) -> bool {
     } else {
         link_path
             .parent()
-            .map_or(raw_link_target.clone(), |parent| parent.join(raw_link_target))
+            .map_or(raw_link_target.clone(), |parent| {
+                parent.join(raw_link_target)
+            })
     };
 
-    if let (Ok(actual), Ok(expected)) =
-        (resolved_link_target.canonicalize(), target.canonicalize())
+    if let (Ok(actual), Ok(expected)) = (resolved_link_target.canonicalize(), target.canonicalize())
     {
         return actual == expected;
     }
@@ -2655,7 +2740,11 @@ fn module_dep_matches_lock(spec: &DependencySpec, locked: &LockedPackage) -> boo
     true
 }
 
-fn plugin_dep_matches_lock(name: &str, spec: &PluginDependencySpec, locked: &LockedPackage) -> bool {
+fn plugin_dep_matches_lock(
+    name: &str,
+    spec: &PluginDependencySpec,
+    locked: &LockedPackage,
+) -> bool {
     let source = spec.source.as_deref().unwrap_or("git");
     if source == "nu-core" {
         if locked.git != "nu-core" {
@@ -2715,7 +2804,7 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::ffi::OsString;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn make_temp_dir(label: &str) -> PathBuf {
@@ -2739,6 +2828,23 @@ mod tests {
         } else {
             OsString::from(base)
         }
+    }
+
+    fn write_test_tar_gz_with_symlink(path: &Path, entry_path: &str, link_target: &str) {
+        let file = std::fs::File::create(path).unwrap();
+        let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+        let mut builder = tar::Builder::new(encoder);
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Symlink);
+        header.set_size(0);
+        header.set_mode(0o777);
+        header.set_link_name(link_target).unwrap();
+        header.set_cksum();
+        builder
+            .append_data(&mut header, entry_path, std::io::empty())
+            .unwrap();
+        let encoder = builder.into_inner().unwrap();
+        encoder.finish().unwrap();
     }
 
     #[test]
@@ -3233,8 +3339,53 @@ nu_plugin_inc = { git = "https://github.com/nushell/nu_plugin_inc", tag = "v0.91
 
     #[test]
     fn supported_plugin_archive_formats_include_tgz_and_tar_xz() {
-        assert!(is_supported_archive_asset_name("nu_plugin_inc-aarch64-apple-darwin.tgz"));
-        assert!(is_supported_archive_asset_name("nu_plugin_inc-aarch64-apple-darwin.tar.xz"));
+        assert!(is_supported_archive_asset_name(
+            "nu_plugin_inc-aarch64-apple-darwin.tgz"
+        ));
+        assert!(is_supported_archive_asset_name(
+            "nu_plugin_inc-aarch64-apple-darwin.tar.xz"
+        ));
+    }
+
+    #[test]
+    fn extract_archive_rejects_tar_symlink_entries() {
+        let root = make_temp_dir("extract_tar_symlink");
+        let archive_path = root.join("bad.tar.gz");
+        write_test_tar_gz_with_symlink(&archive_path, "link-out", "../escape.txt");
+
+        let extract_dir = root.join("extract");
+        std::fs::create_dir_all(&extract_dir).unwrap();
+
+        let error = extract_archive(&archive_path, &extract_dir)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unsupported link entry"));
+        assert!(!root.join("escape.txt").exists());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn extract_archive_rejects_zip_path_traversal_entries() {
+        let root = make_temp_dir("extract_zip_traversal");
+        let archive_path = root.join("bad.zip");
+        let file = std::fs::File::create(&archive_path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::FileOptions::default();
+        zip.start_file("../escape.txt", options).unwrap();
+        zip.write_all(b"malicious").unwrap();
+        zip.finish().unwrap();
+
+        let extract_dir = root.join("extract");
+        std::fs::create_dir_all(&extract_dir).unwrap();
+
+        let error = extract_archive(&archive_path, &extract_dir)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unsafe path"));
+        assert!(!root.join("escape.txt").exists());
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
