@@ -756,6 +756,19 @@ fn core_plugin_candidate_paths(nu_path: &Path, binary_filename: &str) -> Vec<Pat
         }
     }
 
+    if let Some(nu_version) = detect_nu_binary_version(nu_path)
+        && let Ok(plugins_root) = config::installs_plugins_dir()
+    {
+        let plugin_name = binary_filename.strip_suffix(".exe").unwrap_or(binary_filename);
+        candidates.push(
+            plugins_root
+                .join(plugin_name)
+                .join(format!("nu-{nu_version}"))
+                .join("bin")
+                .join(binary_filename),
+        );
+    }
+
     candidates
 }
 
@@ -1366,7 +1379,8 @@ fn install_nu_version_from_github_release(
     std::fs::create_dir_all(&target_bin_dir)?;
     std::fs::copy(&extracted_binary, &installed_path)?;
     make_executable(&installed_path)?;
-    let installed_plugins = install_extracted_nu_plugins(&extract_dir, &version_dir)?;
+    let plugins_root = config::installs_plugins_dir()?;
+    let installed_plugins = install_extracted_nu_plugins(&extract_dir, &plugins_root, version)?;
     let _ = std::fs::remove_dir_all(&temp_root);
 
     if installed_plugins == 0 {
@@ -1474,14 +1488,15 @@ fn find_extracted_nu_binary(extract_dir: &Path) -> Option<PathBuf> {
     None
 }
 
-fn install_extracted_nu_plugins(extract_dir: &Path, version_dir: &Path) -> Result<usize> {
+fn install_extracted_nu_plugins(
+    extract_dir: &Path,
+    plugins_root: &Path,
+    version: &Version,
+) -> Result<usize> {
     let plugins = find_extracted_nu_plugins(extract_dir);
     if plugins.is_empty() {
         return Ok(0);
     }
-
-    let plugins_dir = version_dir.join("plugins");
-    std::fs::create_dir_all(&plugins_dir)?;
 
     for plugin in &plugins {
         let plugin_name = plugin.file_name().ok_or_else(|| {
@@ -1490,7 +1505,18 @@ fn install_extracted_nu_plugins(extract_dir: &Path, version_dir: &Path) -> Resul
                 plugin.display()
             ))
         })?;
-        let target = plugins_dir.join(plugin_name);
+        let plugin_name_str = plugin_name.to_string_lossy();
+        let plugin_key = plugin_name_str
+            .strip_suffix(".exe")
+            .unwrap_or(&plugin_name_str);
+        let target = plugins_root
+            .join(plugin_key)
+            .join(format!("nu-{version}"))
+            .join("bin")
+            .join(plugin_name);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
         std::fs::copy(plugin, &target)?;
         make_executable(&target)?;
     }
@@ -1658,7 +1684,7 @@ fn install_core_plugin(
     })?;
     let source_binary = find_core_plugin_binary_for_nu(&nu_path, &binary_filename).ok_or_else(|| {
         crate::error::QuiverError::Other(format!(
-            "core plugin '{}' ({}) was not found next to '{}' or in quiver's nu-version plugin store",
+            "core plugin '{}' ({}) was not found next to '{}' or in quiver's shared plugin store",
             plugin.name,
             binary_filename,
             nu_path.display()
@@ -2926,7 +2952,7 @@ nu_plugin_inc = { git = "https://github.com/nushell/nu_plugin_inc", tag = "v0.91
     }
 
     #[test]
-    fn install_extracted_nu_plugins_copies_into_version_plugins_dir() {
+    fn install_extracted_nu_plugins_copies_into_shared_plugins_store() {
         let root = make_temp_dir("nu_release_plugin_install");
         let extracted = root.join("extract");
         std::fs::create_dir_all(&extracted).unwrap();
@@ -2935,11 +2961,26 @@ nu_plugin_inc = { git = "https://github.com/nushell/nu_plugin_inc", tag = "v0.91
         std::fs::write(extracted.join(&formats), "formats").unwrap();
         std::fs::write(extracted.join(&query), "query").unwrap();
 
-        let version_dir = root.join("nu_versions").join("0.110.0");
-        let count = install_extracted_nu_plugins(&extracted, &version_dir).unwrap();
+        let plugins_root = root.join("plugins");
+        let version = Version::parse("0.110.0").unwrap();
+        let count = install_extracted_nu_plugins(&extracted, &plugins_root, &version).unwrap();
         assert_eq!(count, 2);
-        assert!(version_dir.join("plugins").join(formats).is_file());
-        assert!(version_dir.join("plugins").join(query).is_file());
+        assert!(
+            plugins_root
+                .join("nu_plugin_formats")
+                .join("nu-0.110.0")
+                .join("bin")
+                .join(formats)
+                .is_file()
+        );
+        assert!(
+            plugins_root
+                .join("nu_plugin_query")
+                .join("nu-0.110.0")
+                .join("bin")
+                .join(query)
+                .is_file()
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }
