@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -11,7 +11,7 @@ use crate::config::{self, GlobalConfig, InstallMode};
 use crate::error::Result;
 use crate::git;
 use crate::lockfile::{LockedPackage, LockedPackageKind, Lockfile};
-use crate::manifest::Manifest;
+use crate::manifest::{DependencySpec, Manifest, PluginDependencySpec};
 use crate::nu;
 use crate::resolver::{self, ResolvedDep, ResolvedPlugin};
 use crate::safety;
@@ -759,7 +759,9 @@ fn core_plugin_candidate_paths(nu_path: &Path, binary_filename: &str) -> Vec<Pat
     if let Some(nu_version) = detect_nu_binary_version(nu_path)
         && let Ok(plugins_root) = config::installs_plugins_dir()
     {
-        let plugin_name = binary_filename.strip_suffix(".exe").unwrap_or(binary_filename);
+        let plugin_name = binary_filename
+            .strip_suffix(".exe")
+            .unwrap_or(binary_filename);
         candidates.push(
             plugins_root
                 .join(plugin_name)
@@ -1629,6 +1631,13 @@ fn install_plugin(
                     plugin.name
                 ));
             }
+            ensure_cargo_available(&plugin.name)?;
+            if !prompt_for_cargo_fallback_approval(plugin, &err)? {
+                return Err(crate::error::QuiverError::Other(format!(
+                    "release install for plugin '{}' failed and cargo fallback build was denied by user",
+                    plugin.name
+                )));
+            }
             ui::warn(format!(
                 "SECURITY WARNING: building plugin '{}' from source locally (trust mode changed)",
                 plugin.name
@@ -1873,6 +1882,60 @@ fn install_plugin_from_cargo_source(
     make_executable(&target)?;
     let _ = std::fs::remove_dir_all(&staging);
     Ok(())
+}
+
+fn ensure_cargo_available(plugin_name: &str) -> Result<()> {
+    match Command::new("cargo")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+    {
+        Ok(status) if status.success() => Ok(()),
+        Ok(_) => Err(crate::error::QuiverError::Other(format!(
+            "cargo is required for plugin '{}' source-build fallback, but `cargo --version` failed",
+            plugin_name
+        ))),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            Err(crate::error::QuiverError::Other(format!(
+                "cargo is not installed or not on PATH; cannot source-build plugin '{}'",
+                plugin_name
+            )))
+        }
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn prompt_for_cargo_fallback_approval(
+    plugin: &ResolvedPlugin,
+    release_error: &crate::error::QuiverError,
+) -> Result<bool> {
+    eprintln!("  Release install failed with: {}", release_error);
+
+    loop {
+        eprint!(
+            "{} Build plugin '{}' from source with `cargo build --release --bin {}`? [y/N]: ",
+            ui::keyword("Confirm"),
+            plugin.name,
+            plugin.bin.as_deref().unwrap_or(&plugin.name)
+        );
+        std::io::stderr().flush()?;
+
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+        match parse_yes_no(&input) {
+            Some(answer) => return Ok(answer),
+            None => eprintln!("Please answer 'y' or 'n'."),
+        }
+    }
+}
+
+fn parse_yes_no(input: &str) -> Option<bool> {
+    match input.trim().to_ascii_lowercase().as_str() {
+        "y" | "yes" => Some(true),
+        "n" | "no" | "" => Some(false),
+        _ => None,
+    }
 }
 
 fn link_plugin_into_env(
@@ -2439,19 +2502,19 @@ fn path_to_forward_slashes(path: &Path) -> String {
 /// Determine whether the module section is stale relative to the local lockfile.
 fn local_lockfile_is_stale(manifest: &Manifest, lockfile: &Lockfile) -> bool {
     // Check if all manifest module deps are in the lockfile
-    for name in manifest.dependencies.modules.keys() {
-        if lockfile
-            .find_package(name, LockedPackageKind::Module)
-            .is_none()
-        {
+    for (name, spec) in &manifest.dependencies.modules {
+        let Some(locked) = lockfile.find_package(name, LockedPackageKind::Module) else {
+            return true;
+        };
+        if !module_dep_matches_lock(spec, locked) {
             return true;
         }
     }
-    for name in manifest.dependencies.plugins.keys() {
-        if lockfile
-            .find_package(name, LockedPackageKind::Plugin)
-            .is_none()
-        {
+    for (name, spec) in &manifest.dependencies.plugins {
+        let Some(locked) = lockfile.find_package(name, LockedPackageKind::Plugin) else {
+            return true;
+        };
+        if !plugin_dep_matches_lock(name, spec, locked) {
             return true;
         }
     }
@@ -2474,6 +2537,44 @@ fn local_lockfile_is_stale(manifest: &Manifest, lockfile: &Lockfile) -> bool {
     }
 
     false
+}
+
+fn module_dep_matches_lock(spec: &DependencySpec, locked: &LockedPackage) -> bool {
+    if spec.git != locked.git {
+        return false;
+    }
+    if spec.tag != locked.tag {
+        return false;
+    }
+    if let Some(expected_rev) = &spec.rev
+        && expected_rev != &locked.rev
+    {
+        return false;
+    }
+    true
+}
+
+fn plugin_dep_matches_lock(name: &str, spec: &PluginDependencySpec, locked: &LockedPackage) -> bool {
+    let source = spec.source.as_deref().unwrap_or("git");
+    if source == "nu-core" {
+        if locked.git != "nu-core" {
+            return false;
+        }
+    } else if spec.git != locked.git {
+        return false;
+    }
+
+    if spec.tag != locked.tag {
+        return false;
+    }
+    if let Some(expected_rev) = &spec.rev
+        && expected_rev != &locked.rev
+    {
+        return false;
+    }
+
+    let expected_bin = spec.bin.as_deref().unwrap_or(name);
+    locked.path.as_deref() == Some(expected_bin)
 }
 
 /// Check if the global lockfile is stale relative to the global config.
@@ -2675,6 +2776,64 @@ kind = "plugin"
 git = "https://github.com/example/future"
 tag = "v1.0.0"
 rev = "dddddddddddddddddddddddddddddddddddddddd"
+sha256 = "ddd"
+"#,
+        )
+        .unwrap();
+
+        assert!(local_lockfile_is_stale(&manifest, &lockfile));
+    }
+
+    #[test]
+    fn local_lockfile_staleness_detects_changed_module_ref() {
+        let manifest = Manifest::from_str(
+            r#"[package]
+name = "demo"
+version = "0.1.0"
+
+[dependencies.modules]
+nu-salesforce = { git = "https://github.com/freepicheep/nu-salesforce", tag = "v0.4.0" }
+"#,
+        )
+        .unwrap();
+        let lockfile = Lockfile::from_str(
+            r#"version = 1
+
+[[package]]
+name = "nu-salesforce"
+git = "https://github.com/freepicheep/nu-salesforce"
+tag = "v0.3.0"
+rev = "cccccccccccccccccccccccccccccccccccccccc"
+sha256 = "ccc"
+"#,
+        )
+        .unwrap();
+
+        assert!(local_lockfile_is_stale(&manifest, &lockfile));
+    }
+
+    #[test]
+    fn local_lockfile_staleness_detects_changed_plugin_bin() {
+        let manifest = Manifest::from_str(
+            r#"[package]
+name = "demo"
+version = "0.1.0"
+
+[dependencies.plugins]
+nu_plugin_inc = { git = "https://github.com/nushell/nu_plugin_inc", tag = "v0.91.0", bin = "nu_plugin_inc_v2" }
+"#,
+        )
+        .unwrap();
+        let lockfile = Lockfile::from_str(
+            r#"version = 1
+
+[[package]]
+name = "nu_plugin_inc"
+kind = "plugin"
+git = "https://github.com/nushell/nu_plugin_inc"
+tag = "v0.91.0"
+rev = "dddddddddddddddddddddddddddddddddddddddd"
+path = "nu_plugin_inc"
 sha256 = "ddd"
 "#,
         )
@@ -3069,6 +3228,22 @@ nu_plugin_inc = { git = "https://github.com/nushell/nu_plugin_inc", tag = "v0.91
         assert_eq!(plugin_use_name("nu_plugin_inc"), "inc");
         assert_eq!(plugin_use_name("nu_plugin_query.exe"), "query");
         assert_eq!(plugin_use_name("custom_plugin"), "custom_plugin");
+    }
+
+    #[test]
+    fn parse_yes_no_accepts_expected_answers() {
+        assert_eq!(parse_yes_no("y"), Some(true));
+        assert_eq!(parse_yes_no("yes"), Some(true));
+        assert_eq!(parse_yes_no("Y"), Some(true));
+        assert_eq!(parse_yes_no(" n "), Some(false));
+        assert_eq!(parse_yes_no("no"), Some(false));
+        assert_eq!(parse_yes_no(""), Some(false));
+    }
+
+    #[test]
+    fn parse_yes_no_rejects_invalid_answers() {
+        assert_eq!(parse_yes_no("maybe"), None);
+        assert_eq!(parse_yes_no("1"), None);
     }
 
     #[test]
