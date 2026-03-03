@@ -1,11 +1,13 @@
 use std::collections::HashMap;
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::checksum;
 use crate::error::{QuiverError, Result};
 use crate::git::{self, RefKind};
 use crate::lockfile::{LockedPackage, LockedPackageKind};
 use crate::manifest::{DependencySpec, Manifest, PluginDependencySpec};
+use crate::safety;
 use crate::ui;
 
 /// A fully resolved dependency.
@@ -64,6 +66,10 @@ pub fn resolve_plugins_from_deps(
     let mut resolved = Vec::new();
 
     for (name, spec) in deps {
+        safety::validate_dependency_name(name, "plugin dependency")?;
+        if let Some(bin) = spec.bin.as_deref() {
+            safety::validate_binary_name(bin, "plugin dependency bin")?;
+        }
         let source = spec.source.as_deref().unwrap_or("git");
         if source == "nu-core" {
             resolved.push(ResolvedPlugin {
@@ -121,6 +127,7 @@ fn resolve_deps(
     resolved: &mut HashMap<String, ResolvedDep>,
 ) -> Result<()> {
     for (name, spec) in deps {
+        safety::validate_dependency_name(name, "module dependency")?;
         // Clone or fetch the repo
         ui::info(format!(
             "{} module {} from {}",
@@ -159,7 +166,16 @@ fn resolve_deps(
 
         // Check for transitive dependencies
         // Export the dep to a temp dir to read its nupackage.toml
-        let tmp = std::env::temp_dir().join("quiver_resolve").join(name);
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let tmp = std::env::temp_dir().join("quiver_resolve").join(format!(
+            "dep-{}-{}-{}",
+            std::process::id(),
+            unique,
+            resolved.len()
+        ));
         git::export_to(&repo_path, &rev, &tmp)?;
 
         if let Ok(dep_manifest) = Manifest::from_dir(&tmp) {

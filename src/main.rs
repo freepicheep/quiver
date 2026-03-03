@@ -8,6 +8,7 @@ mod lockfile;
 mod manifest;
 mod nu;
 mod resolver;
+mod safety;
 mod ui;
 
 use std::io::{self, Write};
@@ -18,6 +19,7 @@ use cli::Commands;
 use config::GlobalConfig;
 use error::Result;
 use manifest::{DependencySpec, Manifest, Package, PluginDependencySpec};
+use safety::{validate_binary_name, validate_dependency_name};
 
 fn main() {
     let cli = cli::parse();
@@ -38,11 +40,16 @@ fn run(command: Commands) -> Result<()> {
             nu_version,
             description,
         } => cmd_init(&cwd, name, version, nu_version, description),
-        Commands::Install { global, frozen } => {
+        Commands::Install {
+            global,
+            frozen,
+            allow_unsigned,
+            no_build_fallback,
+        } => {
             if global {
-                cmd_install_global(frozen)
+                cmd_install_global(frozen, allow_unsigned, no_build_fallback)
             } else {
-                cmd_install(&cwd, frozen)
+                cmd_install(&cwd, frozen, allow_unsigned, no_build_fallback)
             }
         }
         Commands::Update => cmd_update(&cwd),
@@ -189,12 +196,17 @@ fn ensure_gitignore_ignores_nu_env(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn cmd_install(dir: &Path, frozen: bool) -> Result<()> {
-    installer::install(dir, frozen)
+fn cmd_install(
+    dir: &Path,
+    frozen: bool,
+    allow_unsigned: bool,
+    no_build_fallback: bool,
+) -> Result<()> {
+    installer::install(dir, frozen, allow_unsigned, no_build_fallback)
 }
 
-fn cmd_install_global(frozen: bool) -> Result<()> {
-    installer::install_global(frozen)
+fn cmd_install_global(frozen: bool, allow_unsigned: bool, no_build_fallback: bool) -> Result<()> {
+    installer::install_global(frozen, allow_unsigned, no_build_fallback)
 }
 
 fn cmd_update(dir: &Path) -> Result<()> {
@@ -222,6 +234,7 @@ fn cmd_add(
     let pkg_name = git::repo_name_from_url(&url).ok_or_else(|| {
         error::QuiverError::Other(format!("could not determine package name from URL: {url}"))
     })?;
+    validate_dependency_name(&pkg_name, "module dependency")?;
 
     // Check if already added
     if manifest.dependencies.modules.contains_key(&pkg_name) {
@@ -246,7 +259,7 @@ fn cmd_add(
     ui::success(format!("Added module '{pkg_name}' to nupackage.toml"));
 
     // Run install
-    installer::install(dir, false)
+    installer::install_with_options(dir, false, false, false, false)
 }
 
 fn cmd_add_plugin(
@@ -290,7 +303,7 @@ fn cmd_add_plugin(
         ui::success(format!(
             "Added core plugin '{core_plugin_name}' to nupackage.toml"
         ));
-        return installer::install(dir, false);
+        return installer::install_with_options(dir, false, false, false, true);
     }
 
     let provider_base = if is_git_url(url.trim()) {
@@ -304,6 +317,10 @@ fn cmd_add_plugin(
     let pkg_name = git::repo_name_from_url(&url).ok_or_else(|| {
         error::QuiverError::Other(format!("could not determine package name from URL: {url}"))
     })?;
+    validate_dependency_name(&pkg_name, "plugin dependency")?;
+    if let Some(ref bin_name) = bin {
+        validate_binary_name(bin_name, "plugin dependency bin")?;
+    }
 
     if manifest.dependencies.plugins.contains_key(&pkg_name) {
         return Err(error::QuiverError::Manifest(format!(
@@ -364,7 +381,7 @@ fn cmd_add_plugin(
     std::fs::write(dir.join("nupackage.toml"), content)?;
     ui::success(format!("Added plugin '{pkg_name}' to nupackage.toml"));
 
-    installer::install(dir, false)
+    installer::install_with_options(dir, false, false, false, true)
 }
 
 fn cmd_add_global(
@@ -385,6 +402,7 @@ fn cmd_add_global(
     let pkg_name = git::repo_name_from_url(&url).ok_or_else(|| {
         error::QuiverError::Other(format!("could not determine package name from URL: {url}"))
     })?;
+    validate_dependency_name(&pkg_name, "module dependency")?;
 
     // Check if already added
     if config.dependencies.contains_key(&pkg_name) {
@@ -404,10 +422,11 @@ fn cmd_add_global(
     eprintln!("Added '{pkg_name}' to global config");
 
     // Run global install
-    installer::install_global(false)
+    installer::install_global(false, false, false)
 }
 
 fn cmd_remove(dir: &Path, name: String) -> Result<()> {
+    validate_dependency_name(&name, "dependency")?;
     // Load existing manifest
     let mut manifest = Manifest::from_dir(dir)?;
 
@@ -443,6 +462,7 @@ fn cmd_remove(dir: &Path, name: String) -> Result<()> {
 
         // Remove plugin binary symlink from .nu-env/bin/
         let bin_name = plugin_spec.bin.as_deref().unwrap_or(&name);
+        validate_binary_name(bin_name, "plugin dependency bin")?;
         let binary_filename = if cfg!(windows) && !bin_name.ends_with(".exe") {
             format!("{bin_name}.exe")
         } else {
@@ -472,12 +492,13 @@ fn cmd_remove(dir: &Path, name: String) -> Result<()> {
 
     // Regenerate activate.nu from the updated manifest and lockfile state.
     eprintln!("Regenerating activate.nu...");
-    installer::install(dir, false)?;
+    installer::install_with_options(dir, false, false, false, false)?;
 
     Ok(())
 }
 
 fn cmd_remove_global(name: String) -> Result<()> {
+    validate_dependency_name(&name, "dependency")?;
     let mut config = GlobalConfig::load()?;
 
     // Check the dep exists
@@ -512,7 +533,7 @@ fn cmd_remove_global(name: String) -> Result<()> {
 
     // Regenerate the activate.nu overlay with remaining global packages
     eprintln!("Regenerating global activate.nu...");
-    installer::install_global(false)?;
+    installer::install_global(false, false, false)?;
 
     Ok(())
 }
@@ -531,7 +552,7 @@ fn cmd_run(cwd: &Path, command: Vec<String>) -> Result<()> {
     let config_path = cwd.join(".nu-env").join("config.nu");
     if !config_path.exists() {
         eprintln!("No .nu-env found; running install first...");
-        installer::install(cwd, false)?;
+        installer::install_with_options(cwd, false, false, false, false)?;
     }
 
     if !config_path.exists() {
@@ -932,6 +953,7 @@ fn normalize_dependency_source(input: &str, provider_base_url: Option<&str>) -> 
     }
 
     if is_git_url(trimmed) {
+        safety::validate_secure_git_source(trimmed, "dependency source")?;
         return Ok(trimmed.to_string());
     }
 
@@ -941,7 +963,9 @@ fn normalize_dependency_source(input: &str, provider_base_url: Option<&str>) -> 
                 "a default git provider is required for owner/repo shorthand".to_string(),
             )
         })?;
-        return Ok(format!("{provider_base}/{trimmed}"));
+        let expanded = format!("{provider_base}/{trimmed}");
+        safety::validate_secure_git_source(&expanded, "dependency source")?;
+        return Ok(expanded);
     }
 
     Err(error::QuiverError::Other(format!(
@@ -1067,6 +1091,7 @@ mod tests {
             modules_dir: None,
             default_git_provider: provider.to_string(),
             install_mode: config::InstallMode::Copy,
+            security: config::SecurityConfig::default(),
             dependencies: HashMap::new(),
         }
     }
@@ -1093,6 +1118,12 @@ mod tests {
 
         let ssh = normalize_dependency_source("git@github.com:user/repo.git", None).unwrap();
         assert_eq!(ssh, "git@github.com:user/repo.git");
+    }
+
+    #[test]
+    fn normalize_dependency_source_rejects_insecure_http_url() {
+        let err = normalize_dependency_source("http://example.com/team/repo", None).unwrap_err();
+        assert!(err.to_string().contains("insecure HTTP"));
     }
 
     #[test]
@@ -1123,6 +1154,13 @@ mod tests {
     fn normalize_dependency_source_requires_provider_for_shorthand() {
         let err = normalize_dependency_source("owner/repo", None).unwrap_err();
         assert!(err.to_string().contains("default git provider"));
+    }
+
+    #[test]
+    fn normalize_dependency_source_rejects_insecure_provider_url() {
+        let err =
+            normalize_dependency_source("owner/repo", Some("http://example.com")).unwrap_err();
+        assert!(err.to_string().contains("insecure HTTP"));
     }
 
     #[test]

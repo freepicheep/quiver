@@ -53,6 +53,14 @@ pub enum Commands {
         /// Use lockfile only; error if missing or stale
         #[arg(long)]
         frozen: bool,
+
+        /// Allow unsigned release assets (insecure; disabled in --frozen mode)
+        #[arg(long)]
+        allow_unsigned: bool,
+
+        /// Disable cargo source-build fallback for plugins
+        #[arg(long)]
+        no_build_fallback: bool,
     },
 
     /// Re-resolve all dependencies (ignore existing lockfile)
@@ -240,6 +248,31 @@ mod tests {
                 assert!(description.is_none());
             }
             _ => panic!("expected init command"),
+        }
+    }
+
+    #[test]
+    fn install_parses_security_flags() {
+        let cli = Cli::try_parse_from([
+            "quiver",
+            "install",
+            "--allow-unsigned",
+            "--no-build-fallback",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Install {
+                global,
+                frozen,
+                allow_unsigned,
+                no_build_fallback,
+            } => {
+                assert!(!global);
+                assert!(!frozen);
+                assert!(allow_unsigned);
+                assert!(no_build_fallback);
+            }
+            _ => panic!("expected install command"),
         }
     }
 }

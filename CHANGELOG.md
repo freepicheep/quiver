@@ -1,5 +1,55 @@
 # Unreleased
 
+# Version 0.3.1 (2026-03-03)
+
+## Highlights
+
+- Added fail-closed checksum verification for downloaded Nushell/plugin release assets.
+- Hardened install security by rejecting insecure `http://` git sources.
+- Reworked archive extraction to avoid shell-based extraction and block unsafe archive entries.
+- Improved plugin install reliability (semver tag selection, `.tar.xz` support, stale lockfile detection fixes).
+
+## Added
+
+- `qv install --allow-unsigned` (explicit insecure override).
+- `qv install --no-build-fallback` (disable plugin source-build fallback).
+- `[security] require_signed_assets = true` config support (default enabled).
+- Lockfile metadata for plugin release assets:
+    - `asset_sha256`
+    - `asset_url`
+
+## Changed
+
+- `--frozen` now enforces strict security behavior:
+    - signed assets required
+    - unsigned override disabled
+    - build fallback disabled
+- Git cache directory naming now uses SHA-256 of the URL (collision-resistant).
+- Cached repo `origin` is validated to prevent mismatch/reuse of wrong repository.
+- Core Nushell plugins with a Nu version are installed directly into the shared plugin installs directory.
+
+## Security Hardening
+
+- Reject insecure dependency sources using `http://` (manifest and CLI normalization paths).
+- Added dependency/plugin/binary name validation to reduce path traversal and unsafe names.
+- Checksum source detection supports:
+    - `SHA256SUMS`, `SHA256SUMS.txt`, `checksums.txt`
+    - `<asset>.sha256`
+- Checksum parsing supports common formats (POSIX, BSD, single-hash lines).
+- Archive extraction protections added (including path traversal/symlink safety checks).
+
+## Fixed
+
+- Plugin installer now handles `.tar.xz` release assets.
+- “Latest tag” lookup is now semver-aware (fixes lexicographic tag ordering bugs).
+- Stale lockfile detection improved for dependency/plugin changes (including plugin bin changes).
+- Plugin linking behavior improved for idempotence and target consistency.
+
+## Documentation
+
+- README now documents supply-chain security model and CI recommendation:
+    - `qv install --frozen --no-build-fallback`
+
 # Version 0.3.0 (2026-03-02)
 
 ## Added

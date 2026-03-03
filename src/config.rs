@@ -19,6 +19,10 @@ fn default_install_mode() -> InstallMode {
     }
 }
 
+fn default_require_signed_assets() -> bool {
+    true
+}
+
 fn known_provider_base_url(provider: &str) -> Option<&'static str> {
     match provider {
         "github" => Some("https://github.com"),
@@ -77,7 +81,24 @@ pub struct GlobalConfig {
     pub install_mode: InstallMode,
 
     #[serde(default)]
+    pub security: SecurityConfig,
+
+    #[serde(default)]
     pub dependencies: HashMap<String, DependencySpec>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecurityConfig {
+    #[serde(default = "default_require_signed_assets")]
+    pub require_signed_assets: bool,
+}
+
+impl Default for SecurityConfig {
+    fn default() -> Self {
+        Self {
+            require_signed_assets: default_require_signed_assets(),
+        }
+    }
 }
 
 impl Default for GlobalConfig {
@@ -86,6 +107,7 @@ impl Default for GlobalConfig {
             modules_dir: None,
             default_git_provider: default_git_provider(),
             install_mode: default_install_mode(),
+            security: SecurityConfig::default(),
             dependencies: HashMap::new(),
         }
     }
@@ -238,6 +260,7 @@ mod tests {
             modules_dir: None,
             default_git_provider: "github".to_string(),
             install_mode: default_install_mode(),
+            security: SecurityConfig::default(),
             dependencies: HashMap::from([(
                 "nu-utils".to_string(),
                 DependencySpec {
@@ -265,6 +288,7 @@ mod tests {
             modules_dir: Some("/custom/path".to_string()),
             default_git_provider: "gitlab".to_string(),
             install_mode: InstallMode::Copy,
+            security: SecurityConfig::default(),
             dependencies: HashMap::new(),
         };
 
@@ -282,6 +306,7 @@ mod tests {
             modules_dir: Some("/custom/modules".to_string()),
             default_git_provider: "github".to_string(),
             install_mode: default_install_mode(),
+            security: SecurityConfig::default(),
             dependencies: HashMap::new(),
         };
         assert_eq!(
@@ -296,6 +321,7 @@ mod tests {
             modules_dir: None,
             default_git_provider: "github".to_string(),
             install_mode: default_install_mode(),
+            security: SecurityConfig::default(),
             dependencies: HashMap::new(),
         };
         let dir = config.modules_dir().unwrap();
@@ -341,6 +367,7 @@ modules_dir = "/tmp/quiver-modules"
         let parsed: GlobalConfig = toml::from_str(toml).unwrap();
         assert_eq!(parsed.default_git_provider, "github");
         assert_eq!(parsed.install_mode, default_install_mode());
+        assert!(parsed.security.require_signed_assets);
     }
 
     #[test]
@@ -364,6 +391,7 @@ modules_dir = "/tmp/quiver-modules"
             modules_dir: None,
             default_git_provider: "git.example.com".to_string(),
             install_mode: default_install_mode(),
+            security: SecurityConfig::default(),
             dependencies: HashMap::new(),
         };
         assert_eq!(
@@ -378,6 +406,7 @@ modules_dir = "/tmp/quiver-modules"
             modules_dir: None,
             default_git_provider: "not-a-provider".to_string(),
             install_mode: default_install_mode(),
+            security: SecurityConfig::default(),
             dependencies: HashMap::new(),
         };
         let err = config.default_git_provider_base_url().unwrap_err();
@@ -390,11 +419,29 @@ modules_dir = "/tmp/quiver-modules"
             modules_dir: None,
             default_git_provider: "github".to_string(),
             install_mode: InstallMode::Hardlink,
+            security: SecurityConfig::default(),
             dependencies: HashMap::new(),
         };
 
         let serialized = toml::to_string_pretty(&config).unwrap();
         let parsed: GlobalConfig = toml::from_str(&serialized).unwrap();
         assert_eq!(parsed.install_mode, InstallMode::Hardlink);
+    }
+
+    #[test]
+    fn security_config_round_trip() {
+        let config = GlobalConfig {
+            modules_dir: None,
+            default_git_provider: "github".to_string(),
+            install_mode: default_install_mode(),
+            security: SecurityConfig {
+                require_signed_assets: false,
+            },
+            dependencies: HashMap::new(),
+        };
+
+        let serialized = toml::to_string_pretty(&config).unwrap();
+        let parsed: GlobalConfig = toml::from_str(&serialized).unwrap();
+        assert!(!parsed.security.require_signed_assets);
     }
 }

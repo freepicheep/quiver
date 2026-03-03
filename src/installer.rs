@@ -1,18 +1,24 @@
 use std::collections::HashSet;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use flate2::read::GzDecoder;
 use semver::{Version, VersionReq};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
+use tar::Archive as TarArchive;
+use xz2::read::XzDecoder;
+use zip::ZipArchive;
 
 use crate::config::{self, GlobalConfig, InstallMode};
 use crate::error::Result;
 use crate::git;
 use crate::lockfile::{LockedPackage, LockedPackageKind, Lockfile};
-use crate::manifest::Manifest;
+use crate::manifest::{DependencySpec, Manifest, PluginDependencySpec};
 use crate::nu;
 use crate::resolver::{self, ResolvedDep, ResolvedPlugin};
+use crate::safety;
 use crate::ui;
 use walkdir::WalkDir;
 
@@ -29,42 +35,93 @@ struct NupmMetadataHints {
     entry_hint: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct SecurityPolicy {
+    require_signed_assets: bool,
+    allow_unsigned: bool,
+    no_build_fallback: bool,
+}
+
+#[derive(Debug, Default, Clone)]
+struct DownloadVerificationMetadata {
+    asset_sha256: Option<String>,
+    asset_url: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct GitHubReleaseAssetCandidate {
+    release_tag: String,
+    release_assets: Vec<GitHubReleaseAsset>,
+    asset: GitHubReleaseAsset,
+}
+
 /// Run a full local install: resolve -> fetch -> checksum -> place -> lock.
-pub fn install(project_dir: &Path, frozen: bool) -> Result<()> {
+pub fn install(
+    project_dir: &Path,
+    frozen: bool,
+    allow_unsigned: bool,
+    no_build_fallback: bool,
+) -> Result<()> {
+    install_with_options(
+        project_dir,
+        frozen,
+        allow_unsigned,
+        no_build_fallback,
+        true,
+    )
+}
+
+pub fn install_with_options(
+    project_dir: &Path,
+    frozen: bool,
+    allow_unsigned: bool,
+    no_build_fallback: bool,
+    print_plugin_registration_hints: bool,
+) -> Result<()> {
     let manifest = Manifest::from_dir(project_dir)?;
     let global_config = GlobalConfig::load_or_default()?;
     let install_mode = global_config.install_mode;
+    let security_policy = security_policy_for(
+        global_config.security.require_signed_assets,
+        frozen,
+        allow_unsigned,
+        no_build_fallback,
+    );
     let lock_path = project_dir.join("quiver.lock");
     let nu_env_dir = project_dir.join(NU_ENV_DIR);
     let modules_dir = nu_env_dir.join(MODULES_SUBDIR);
     let bin_dir = nu_env_dir.join(BIN_SUBDIR);
     let display_name = format!("{NU_ENV_DIR}/{MODULES_SUBDIR}");
 
-    if manifest.dependencies.is_empty() {
+    let has_no_dependencies = manifest.dependencies.is_empty();
+    if has_no_dependencies {
         ui::warn("No dependencies declared in nupackage.toml.");
-        write_config_nu(&nu_env_dir, &modules_dir)?;
-        create_nu_symlink(&nu_env_dir, manifest.package.nu_version.as_deref())?;
-        write_activate_overlay(&nu_env_dir, project_dir)?;
-        return Ok(());
     }
 
     // Determine whether to re-resolve or use the lockfile
+    let mut frozen_lockfile: Option<Lockfile> = None;
     let (resolved_modules, resolved_plugins) = if frozen {
         // --frozen: use lockfile only
         if !lock_path.exists() {
-            return Err(crate::error::QuiverError::Lockfile(
-                "quiver.lock not found (required with --frozen)".to_string(),
+            if has_no_dependencies {
+                (Vec::new(), Vec::new())
+            } else {
+                return Err(crate::error::QuiverError::Lockfile(
+                    "quiver.lock not found (required with --frozen)".to_string(),
+                ));
+            }
+        } else {
+            let lockfile = Lockfile::from_path(&lock_path)?;
+            frozen_lockfile = Some(lockfile.clone());
+            ui::info(format!(
+                "{} locked dependencies (--frozen)",
+                ui::keyword("Using")
             ));
+            (
+                resolver::resolve_modules_from_lock(&lockfile.packages),
+                resolver::resolve_plugins_from_lock(&lockfile.packages),
+            )
         }
-        let lockfile = Lockfile::from_path(&lock_path)?;
-        ui::info(format!(
-            "{} locked dependencies (--frozen)",
-            ui::keyword("Using")
-        ));
-        (
-            resolver::resolve_modules_from_lock(&lockfile.packages),
-            resolver::resolve_plugins_from_lock(&lockfile.packages),
-        )
     } else if lock_path.exists() {
         let lockfile = Lockfile::from_path(&lock_path)?;
 
@@ -111,6 +168,10 @@ pub fn install(project_dir: &Path, frozen: bool) -> Result<()> {
         manifest.package.nu_version.as_deref(),
         &display_name,
         install_mode,
+        frozen,
+        frozen_lockfile.as_ref(),
+        security_policy,
+        print_plugin_registration_hints,
     )
 }
 
@@ -121,14 +182,20 @@ pub fn update(project_dir: &Path) -> Result<()> {
     if lock_path.exists() {
         std::fs::remove_file(&lock_path)?;
     }
-    install(project_dir, false)
+    install_with_options(project_dir, false, false, false, false)
 }
 
 /// Run a global install: resolve from `~/.config/quiver/config.toml` and install
 /// modules to the configured global directory.
-pub fn install_global(frozen: bool) -> Result<()> {
+pub fn install_global(frozen: bool, allow_unsigned: bool, no_build_fallback: bool) -> Result<()> {
     let config = GlobalConfig::load()?;
     let install_mode = config.install_mode;
+    let _security_policy = security_policy_for(
+        config.security.require_signed_assets,
+        frozen,
+        allow_unsigned,
+        no_build_fallback,
+    );
     let modules_dir = config.modules_dir()?;
     let lock_path = config::global_lock_path()?;
     let display_dir = modules_dir.display().to_string();
@@ -138,6 +205,7 @@ pub fn install_global(frozen: bool) -> Result<()> {
         return Ok(());
     }
 
+    let mut frozen_lockfile: Option<Lockfile> = None;
     let resolved_modules = if frozen {
         if !lock_path.exists() {
             return Err(crate::error::QuiverError::Lockfile(
@@ -145,6 +213,7 @@ pub fn install_global(frozen: bool) -> Result<()> {
             ));
         }
         let lockfile = Lockfile::from_path(&lock_path)?;
+        frozen_lockfile = Some(lockfile.clone());
         ui::info(format!(
             "{} locked global dependencies (--frozen)",
             ui::keyword("Using")
@@ -170,6 +239,8 @@ pub fn install_global(frozen: bool) -> Result<()> {
         &lock_path,
         &display_dir,
         install_mode,
+        frozen,
+        frozen_lockfile.as_ref(),
     )
 }
 
@@ -180,12 +251,15 @@ fn install_resolved_global(
     lock_path: &Path,
     modules_display_name: &str,
     install_mode: InstallMode,
+    frozen: bool,
+    frozen_lockfile: Option<&Lockfile>,
 ) -> Result<()> {
     std::fs::create_dir_all(modules_dir)?;
 
     let mut locked_packages = Vec::new();
 
     for dep in modules {
+        safety::validate_dependency_name(&dep.name, "module dependency")?;
         ui::info(format!(
             "{} module {}@{}",
             ui::keyword("Installing"),
@@ -196,6 +270,14 @@ fn install_resolved_global(
 
         let dest = modules_dir.join(&dep.name);
         let sha256 = resolver::compute_checksum(&dest)?;
+        if frozen {
+            verify_frozen_checksum(
+                frozen_lockfile,
+                &dep.name,
+                LockedPackageKind::Module,
+                &sha256,
+            )?;
+        }
 
         locked_packages.push(LockedPackage {
             name: dep.name.clone(),
@@ -205,16 +287,20 @@ fn install_resolved_global(
             rev: dep.rev.clone(),
             path: None,
             sha256,
+            asset_sha256: None,
+            asset_url: None,
         });
     }
 
     locked_packages.sort_by(|a, b| a.kind.cmp(&b.kind).then(a.name.cmp(&b.name)));
 
-    let lockfile = Lockfile {
-        version: 1,
-        packages: locked_packages,
-    };
-    lockfile.write_to(lock_path)?;
+    if !frozen {
+        let lockfile = Lockfile {
+            version: 1,
+            packages: locked_packages,
+        };
+        lockfile.write_to(lock_path)?;
+    }
 
     let module_count = modules.len();
     let module_suffix = if module_count == 1 { "" } else { "s" };
@@ -237,12 +323,22 @@ fn install_resolved(
     nu_version_req: Option<&str>,
     display_name: &str,
     install_mode: InstallMode,
+    frozen: bool,
+    frozen_lockfile: Option<&Lockfile>,
+    security_policy: SecurityPolicy,
+    print_plugin_registration_hints: bool,
 ) -> Result<()> {
     std::fs::create_dir_all(modules_dir)?;
     std::fs::create_dir_all(bin_dir)?;
     let mut locked_packages = Vec::new();
+    let existing_lockfile = if !frozen && lock_path.exists() {
+        Lockfile::from_path(lock_path).ok()
+    } else {
+        None
+    };
 
     for dep in modules {
+        safety::validate_dependency_name(&dep.name, "module dependency")?;
         ui::info(format!(
             "{} module {}@{}",
             ui::keyword("Installing"),
@@ -253,6 +349,14 @@ fn install_resolved(
 
         let dest = modules_dir.join(&dep.name);
         let sha256 = resolver::compute_checksum(&dest)?;
+        if frozen {
+            verify_frozen_checksum(
+                frozen_lockfile,
+                &dep.name,
+                LockedPackageKind::Module,
+                &sha256,
+            )?;
+        }
 
         locked_packages.push(LockedPackage {
             name: dep.name.clone(),
@@ -262,19 +366,73 @@ fn install_resolved(
             rev: dep.rev.clone(),
             path: None,
             sha256,
+            asset_sha256: None,
+            asset_url: None,
         });
     }
 
     for plugin in plugins {
+        safety::validate_dependency_name(&plugin.name, "plugin dependency")?;
+        if let Some(bin) = plugin.bin.as_deref() {
+            safety::validate_binary_name(bin, "plugin dependency bin")?;
+        }
         ui::info(format!(
             "{} plugin {}@{}",
             ui::keyword("Installing"),
             plugin.name,
             &plugin.rev[..12.min(plugin.rev.len())]
         ));
-        let (installed_bin, bin_name, version_dir) = install_plugin(plugin, nu_version_req)?;
+        let frozen_locked_plugin = frozen_lockfile
+            .and_then(|lock| lock.find_package(&plugin.name, LockedPackageKind::Plugin));
+        let plugin_install = install_plugin(
+            plugin,
+            nu_version_req,
+            security_policy,
+            frozen_locked_plugin,
+        )?;
+        let installed_bin = plugin_install.installed_bin;
+        let bin_name = plugin_install.bin_name;
+        let version_dir = plugin_install.version_dir;
         link_plugin_into_env(&installed_bin, bin_dir, &bin_name)?;
         let sha256 = resolver::compute_checksum(&version_dir)?;
+        if frozen {
+            verify_frozen_checksum(
+                frozen_lockfile,
+                &plugin.name,
+                LockedPackageKind::Plugin,
+                &sha256,
+            )?;
+        }
+        if frozen
+            && let Some(expected_asset_sha) =
+                frozen_locked_plugin.and_then(|locked| locked.asset_sha256.as_deref())
+        {
+            let actual_asset_sha = plugin_install.asset_metadata.asset_sha256.as_deref().ok_or_else(|| {
+                crate::error::QuiverError::Lockfile(format!(
+                    "frozen install requires downloaded asset_sha256 for plugin '{}' but no verified release asset digest was recorded",
+                    plugin.name
+                ))
+            })?;
+            if expected_asset_sha != actual_asset_sha {
+                return Err(crate::error::QuiverError::Lockfile(format!(
+                    "frozen install asset checksum mismatch for plugin '{}': expected {}, got {}",
+                    plugin.name, expected_asset_sha, actual_asset_sha
+                )));
+            }
+        }
+
+        let existing_metadata = existing_lockfile
+            .as_ref()
+            .and_then(|lock| lock.find_package(&plugin.name, LockedPackageKind::Plugin));
+        let asset_sha256 = plugin_install
+            .asset_metadata
+            .asset_sha256
+            .or_else(|| existing_metadata.and_then(|pkg| pkg.asset_sha256.clone()));
+        let asset_url = plugin_install
+            .asset_metadata
+            .asset_url
+            .or_else(|| existing_metadata.and_then(|pkg| pkg.asset_url.clone()));
+
         let locked_tag = if plugin.git == "nu-core" {
             None
         } else {
@@ -298,17 +456,21 @@ fn install_resolved(
             rev: locked_rev,
             path: Some(bin_name),
             sha256,
+            asset_sha256,
+            asset_url,
         });
     }
 
     locked_packages.sort_by(|a, b| a.kind.cmp(&b.kind).then(a.name.cmp(&b.name)));
 
     // Write lockfile
-    let lockfile = Lockfile {
-        version: 1,
-        packages: locked_packages,
-    };
-    lockfile.write_to(lock_path)?;
+    if !frozen {
+        let lockfile = Lockfile {
+            version: 1,
+            packages: locked_packages,
+        };
+        lockfile.write_to(lock_path)?;
+    }
 
     let module_count = modules.len();
     let plugin_count = plugins.len();
@@ -322,9 +484,11 @@ fn install_resolved(
     let project_dir = nu_env_dir.parent().unwrap_or(nu_env_dir);
 
     write_config_nu(nu_env_dir, modules_dir)?;
-    create_nu_symlink(nu_env_dir, nu_version_req)?;
+    create_nu_symlink_with_policy(nu_env_dir, nu_version_req, security_policy)?;
     write_activate_overlay(nu_env_dir, project_dir)?;
-    print_plugin_registration_instructions(plugins);
+    if print_plugin_registration_hints {
+        print_plugin_registration_instructions(plugins);
+    }
 
     Ok(())
 }
@@ -381,6 +545,36 @@ fn plugin_use_name(plugin_name: &str) -> String {
     base.strip_prefix("nu_plugin_").unwrap_or(base).to_string()
 }
 
+fn verify_frozen_checksum(
+    frozen_lockfile: Option<&Lockfile>,
+    name: &str,
+    kind: LockedPackageKind,
+    actual_sha256: &str,
+) -> Result<()> {
+    let lockfile = frozen_lockfile.ok_or_else(|| {
+        crate::error::QuiverError::Lockfile(
+            "internal error: frozen install missing loaded lockfile".to_string(),
+        )
+    })?;
+    let expected = lockfile.find_package(name, kind.clone()).ok_or_else(|| {
+        crate::error::QuiverError::Lockfile(format!(
+            "frozen install expected package '{name}' ({kind:?}) in lockfile but it was missing"
+        ))
+    })?;
+    if expected.sha256.trim().is_empty() {
+        return Err(crate::error::QuiverError::Lockfile(format!(
+            "frozen install requires non-empty sha256 for package '{name}' ({kind:?})"
+        )));
+    }
+    if expected.sha256 != actual_sha256 {
+        return Err(crate::error::QuiverError::Lockfile(format!(
+            "checksum mismatch for package '{name}' ({kind:?}): expected {}, got {}",
+            expected.sha256, actual_sha256
+        )));
+    }
+    Ok(())
+}
+
 /// Generate `.nu-env/activate.nu` with a `nu` alias and deactivate alias.
 pub fn write_activate_overlay(nu_env_dir: &Path, project_dir: &Path) -> Result<()> {
     std::fs::create_dir_all(nu_env_dir)?;
@@ -411,14 +605,15 @@ export alias deactivate = overlay hide activate
     );
 
     let activate_path = nu_env_dir.join("activate.nu");
-    std::fs::write(&activate_path, activate_script)?;
-    ui::success(format!(
-        "Generated {}",
-        activate_path
-            .strip_prefix(project_dir)
-            .unwrap_or(&activate_path)
-            .display()
-    ));
+    if write_text_file_if_changed(&activate_path, &activate_script)? {
+        ui::success(format!(
+            "Generated {}",
+            activate_path
+                .strip_prefix(project_dir)
+                .unwrap_or(&activate_path)
+                .display()
+        ));
+    }
     Ok(())
 }
 
@@ -457,8 +652,9 @@ export alias nu = ^{nu_bin_literal} --config {config_literal} --plugin-config {p
     );
 
     let config_path = nu_env_dir.join("config.nu");
-    std::fs::write(&config_path, env_script)?;
-    ui::success(format!("Generated {}", config_path.display()));
+    if write_text_file_if_changed(&config_path, &env_script)? {
+        ui::success(format!("Generated {}", config_path.display()));
+    }
     Ok(())
 }
 
@@ -468,17 +664,28 @@ export alias nu = ^{nu_bin_literal} --config {config_literal} --plugin-config {p
 /// 1. `nu` in PATH (if present and matches `nu-version` when provided)
 /// 2. `~/.local/share/quiver/installs/nu_versions/<version>/` store
 pub fn create_nu_symlink(nu_env_dir: &Path, nu_version_req: Option<&str>) -> Result<()> {
+    create_nu_symlink_with_policy(
+        nu_env_dir,
+        nu_version_req,
+        SecurityPolicy {
+            require_signed_assets: true,
+            allow_unsigned: false,
+            no_build_fallback: false,
+        },
+    )
+}
+
+fn create_nu_symlink_with_policy(
+    nu_env_dir: &Path,
+    nu_version_req: Option<&str>,
+    security_policy: SecurityPolicy,
+) -> Result<()> {
     let bin_dir = nu_env_dir.join(BIN_SUBDIR);
     std::fs::create_dir_all(&bin_dir)?;
 
     let symlink_path = bin_dir.join("nu");
 
-    // Remove existing symlink if present
-    if symlink_path.exists() || symlink_path.symlink_metadata().is_ok() {
-        std::fs::remove_file(&symlink_path)?;
-    }
-
-    let nu_path = match resolve_nu_binary_for_requirement(nu_version_req)? {
+    let nu_path = match resolve_nu_binary_for_requirement(nu_version_req, security_policy)? {
         Some(path) => path,
         None if nu_version_req.is_none() => {
             ui::warn("could not find 'nu' in PATH; skipping .nu-env/bin/nu symlink.");
@@ -495,16 +702,16 @@ pub fn create_nu_symlink(nu_env_dir: &Path, nu_version_req: Option<&str>) -> Res
         }
     };
 
-    #[cfg(unix)]
-    std::os::unix::fs::symlink(&nu_path, &symlink_path)?;
-    #[cfg(windows)]
-    std::os::windows::fs::symlink_file(&nu_path, &symlink_path)?;
-
-    ui::success(format!("Linked .nu-env/bin/nu -> {}", nu_path.display()));
+    if ensure_symlink_or_file(&symlink_path, &nu_path)? {
+        ui::success(format!("Linked .nu-env/bin/nu -> {}", nu_path.display()));
+    }
     Ok(())
 }
 
-fn resolve_nu_binary_for_requirement(nu_version_req: Option<&str>) -> Result<Option<PathBuf>> {
+fn resolve_nu_binary_for_requirement(
+    nu_version_req: Option<&str>,
+    security_policy: SecurityPolicy,
+) -> Result<Option<PathBuf>> {
     let requirement = nu_version_req
         .map(|raw| {
             nu::parse_nu_version_requirement(raw).map_err(|err| {
@@ -514,10 +721,13 @@ fn resolve_nu_binary_for_requirement(nu_version_req: Option<&str>) -> Result<Opt
             })
         })
         .transpose()?;
-    resolve_nu_binary(requirement.as_ref())
+    resolve_nu_binary(requirement.as_ref(), security_policy)
 }
 
-fn resolve_nu_binary(requirement: Option<&VersionReq>) -> Result<Option<PathBuf>> {
+fn resolve_nu_binary(
+    requirement: Option<&VersionReq>,
+    security_policy: SecurityPolicy,
+) -> Result<Option<PathBuf>> {
     if let Some(nu_path) = detect_nu_path() {
         if let Some(req) = requirement {
             if detect_nu_binary_version(&nu_path).is_some_and(|v| req.matches(&v)) {
@@ -543,7 +753,7 @@ fn resolve_nu_binary(requirement: Option<&VersionReq>) -> Result<Option<PathBuf>
 
     if let Some(req) = requirement {
         let target = select_nu_version_to_install(req)?;
-        let path = install_nu_version_from_github_release(&target)?;
+        let path = install_nu_version_from_github_release(&target, security_policy)?;
         return Ok(Some(path));
     }
 
@@ -560,6 +770,21 @@ fn core_plugin_candidate_paths(nu_path: &Path, binary_filename: &str) -> Vec<Pat
         {
             candidates.push(version_dir.join("plugins").join(binary_filename));
         }
+    }
+
+    if let Some(nu_version) = detect_nu_binary_version(nu_path)
+        && let Ok(plugins_root) = config::installs_plugins_dir()
+    {
+        let plugin_name = binary_filename
+            .strip_suffix(".exe")
+            .unwrap_or(binary_filename);
+        candidates.push(
+            plugins_root
+                .join(plugin_name)
+                .join(format!("nu-{nu_version}"))
+                .join("bin")
+                .join(binary_filename),
+        );
     }
 
     candidates
@@ -822,7 +1047,253 @@ fn probe_content_length(url: &str) -> Option<u64> {
     })
 }
 
-fn install_nu_version_from_github_release(version: &Version) -> Result<PathBuf> {
+fn security_policy_for(
+    config_requires_signed_assets: bool,
+    frozen: bool,
+    allow_unsigned_flag: bool,
+    no_build_fallback_flag: bool,
+) -> SecurityPolicy {
+    if frozen {
+        return SecurityPolicy {
+            require_signed_assets: true,
+            allow_unsigned: false,
+            no_build_fallback: true,
+        };
+    }
+
+    let require_signed_assets = if allow_unsigned_flag {
+        false
+    } else {
+        config_requires_signed_assets
+    };
+
+    SecurityPolicy {
+        require_signed_assets,
+        allow_unsigned: allow_unsigned_flag,
+        no_build_fallback: no_build_fallback_flag,
+    }
+}
+
+fn is_asset_verification_error(err: &crate::error::QuiverError) -> bool {
+    matches!(
+        err,
+        crate::error::QuiverError::ChecksumSourceNotFound { .. }
+            | crate::error::QuiverError::ChecksumParse { .. }
+            | crate::error::QuiverError::ChecksumMismatch { .. }
+    )
+}
+
+fn download_text(url: &str, label: &str) -> Result<String> {
+    ui::info(format!("{} {label}", ui::keyword("Downloading")));
+    let output = Command::new("curl")
+        .args(["-fsSL", "-H", "User-Agent: quiver"])
+        .arg(url)
+        .output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(crate::error::QuiverError::Other(format!(
+            "failed to download {label}: {stderr}"
+        )));
+    }
+    String::from_utf8(output.stdout).map_err(|err| {
+        crate::error::QuiverError::Other(format!("invalid UTF-8 while downloading {label}: {err}"))
+    })
+}
+
+fn download_release_checksums(
+    release_assets: &[GitHubReleaseAsset],
+    asset_name: &str,
+    release_label: &str,
+) -> Result<String> {
+    let (source_asset, source_kind) = select_checksum_asset(release_assets, asset_name).ok_or_else(|| {
+        crate::error::QuiverError::ChecksumSourceNotFound {
+            asset: asset_name.to_string(),
+            details: format!(
+                "no checksum asset found in {release_label}; expected SHA256SUMS/checksums.txt or {}.sha256",
+                asset_name
+            ),
+        }
+    })?;
+    if source_asset.browser_download_url.trim().is_empty() {
+        return Err(crate::error::QuiverError::ChecksumSourceNotFound {
+            asset: asset_name.to_string(),
+            details: format!(
+                "checksum asset '{}' in {release_label} had no download URL",
+                source_asset.name
+            ),
+        });
+    }
+    download_text(
+        &source_asset.browser_download_url,
+        &format!("{source_kind} checksum source {}", source_asset.name),
+    )
+}
+
+fn select_checksum_asset<'a>(
+    release_assets: &'a [GitHubReleaseAsset],
+    asset_name: &str,
+) -> Option<(&'a GitHubReleaseAsset, &'static str)> {
+    let preferred = release_assets.iter().find(|asset| {
+        let lower = asset.name.to_ascii_lowercase();
+        lower == "sha256sums"
+            || lower == "sha256sums.txt"
+            || lower == "checksums.txt"
+            || lower == "checksums"
+    });
+    if let Some(asset) = preferred {
+        return Some((asset, "multi-file"));
+    }
+
+    let fallback_name = format!("{}.sha256", asset_name.to_ascii_lowercase());
+    release_assets
+        .iter()
+        .find(|asset| asset.name.to_ascii_lowercase() == fallback_name)
+        .map(|asset| (asset, "single-file"))
+}
+
+fn parse_expected_sha256(checksum_text: &str, asset_name: &str) -> Result<String> {
+    let mut lone_digest: Option<String> = None;
+
+    for raw_line in checksum_text.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        if let Some(hash) = parse_bsd_sha256_line(line, asset_name)? {
+            return Ok(hash);
+        }
+        if let Some(hash) = parse_posix_sha256_line(line, asset_name)? {
+            return Ok(hash);
+        }
+        if let Some(hash) = parse_lone_sha256_line(line, asset_name)? {
+            lone_digest = Some(hash);
+        }
+    }
+
+    lone_digest.ok_or_else(|| crate::error::QuiverError::ChecksumParse {
+        asset: asset_name.to_string(),
+        details: "checksum data did not contain a valid SHA-256 entry for the asset".to_string(),
+    })
+}
+
+fn parse_bsd_sha256_line(line: &str, asset_name: &str) -> Result<Option<String>> {
+    let prefix = "SHA256 (";
+    if !line.starts_with(prefix) {
+        return Ok(None);
+    }
+    let Some(end_name) = line.find(") =") else {
+        return Err(crate::error::QuiverError::ChecksumParse {
+            asset: asset_name.to_string(),
+            details: format!("malformed BSD checksum line: '{line}'"),
+        });
+    };
+    let filename = &line[prefix.len()..end_name];
+    if filename != asset_name {
+        return Ok(None);
+    }
+    let digest = line[end_name + 4..].trim();
+    let normalized =
+        normalize_sha256(digest).ok_or_else(|| crate::error::QuiverError::ChecksumParse {
+            asset: asset_name.to_string(),
+            details: format!("invalid SHA-256 digest for asset '{asset_name}': '{digest}'"),
+        })?;
+    Ok(Some(normalized))
+}
+
+fn parse_posix_sha256_line(line: &str, asset_name: &str) -> Result<Option<String>> {
+    let mut parts = line.split_whitespace();
+    let Some(candidate_digest) = parts.next() else {
+        return Ok(None);
+    };
+    let Some(mut filename) = parts.next() else {
+        return Ok(None);
+    };
+
+    if filename.starts_with('*') {
+        filename = &filename[1..];
+    }
+    if filename != asset_name {
+        return Ok(None);
+    }
+
+    let normalized = normalize_sha256(candidate_digest).ok_or_else(|| {
+        crate::error::QuiverError::ChecksumParse {
+            asset: asset_name.to_string(),
+            details: format!(
+                "invalid SHA-256 digest for asset '{asset_name}': '{candidate_digest}'"
+            ),
+        }
+    })?;
+    Ok(Some(normalized))
+}
+
+fn parse_lone_sha256_line(line: &str, asset_name: &str) -> Result<Option<String>> {
+    if let Some(normalized) = normalize_sha256(line) {
+        return Ok(Some(normalized));
+    }
+
+    if line.chars().all(|c| c.is_ascii_hexdigit()) && line.len() != 64 {
+        return Err(crate::error::QuiverError::ChecksumParse {
+            asset: asset_name.to_string(),
+            details: format!("invalid SHA-256 digest length: '{}'", line.len()),
+        });
+    }
+
+    Ok(None)
+}
+
+fn normalize_sha256(raw: &str) -> Option<String> {
+    let digest = raw.trim().to_ascii_lowercase();
+    if digest.len() != 64 {
+        return None;
+    }
+    if digest.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        Some(digest)
+    } else {
+        None
+    }
+}
+
+fn sha256_file(path: &Path) -> Result<String> {
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn verify_downloaded_asset(path: &Path, asset_name: &str, expected_sha256: &str) -> Result<()> {
+    let expected = normalize_sha256(expected_sha256).ok_or_else(|| {
+        crate::error::QuiverError::ChecksumParse {
+            asset: asset_name.to_string(),
+            details: format!(
+                "expected SHA-256 digest for asset '{}' was malformed: '{}'",
+                asset_name, expected_sha256
+            ),
+        }
+    })?;
+    let actual = sha256_file(path)?;
+    if actual != expected {
+        return Err(crate::error::QuiverError::ChecksumMismatch {
+            asset: asset_name.to_string(),
+            expected_sha256: expected,
+            actual_sha256: actual,
+        });
+    }
+    Ok(())
+}
+
+fn install_nu_version_from_github_release(
+    version: &Version,
+    security_policy: SecurityPolicy,
+) -> Result<PathBuf> {
     let version_dir = config::installs_nu_versions_dir()?.join(version.to_string());
     let binary_name = if cfg!(windows) { "nu.exe" } else { "nu" };
     let installed_path = version_dir.join("bin").join(binary_name);
@@ -834,7 +1305,38 @@ fn install_nu_version_from_github_release(version: &Version) -> Result<PathBuf> 
 
     let asset_suffix = nu_release_asset_suffix()?;
     let asset_name = format!("nu-{version}-{asset_suffix}");
-    let tag_candidates = [version.to_string(), format!("v{version}")];
+    let releases = fetch_nu_github_releases()?;
+    let selected_release = releases
+        .into_iter()
+        .find(|release| {
+            !release.draft
+                && !release.prerelease
+                && parse_version_from_release_tag(&release.tag_name).as_ref() == Some(version)
+                && release.assets.iter().any(|asset| asset.name == asset_name)
+        })
+        .ok_or_else(|| {
+            crate::error::QuiverError::Other(format!(
+                "could not find Nushell release asset '{}' for version {}",
+                asset_name, version
+            ))
+        })?;
+    let asset = selected_release
+        .assets
+        .iter()
+        .find(|candidate| candidate.name == asset_name)
+        .cloned()
+        .ok_or_else(|| {
+            crate::error::QuiverError::Other(format!(
+                "could not locate Nushell release asset '{}' in release {}",
+                asset_name, selected_release.tag_name
+            ))
+        })?;
+    if asset.browser_download_url.trim().is_empty() {
+        return Err(crate::error::QuiverError::Other(format!(
+            "Nushell release asset '{}' did not include a download URL",
+            asset.name
+        )));
+    }
 
     let temp_root = config::installs_root_dir()?.join(format!(
         ".nu-download-{}-{}",
@@ -847,38 +1349,37 @@ fn install_nu_version_from_github_release(version: &Version) -> Result<PathBuf> 
     std::fs::create_dir_all(&temp_root)?;
 
     let archive_path = temp_root.join(&asset_name);
-    let mut downloaded = false;
-    let mut last_download_error = String::new();
-    for tag in &tag_candidates {
-        let url =
-            format!("https://github.com/nushell/nushell/releases/download/{tag}/{asset_name}");
-        match download_file_with_progress(
-            &url,
-            &archive_path,
-            &format!("Nushell {version} release artifact"),
-        ) {
-            Ok(()) => {
-                downloaded = true;
-                break;
-            }
-            Err(err) => {
-                last_download_error = err.to_string();
-            }
-        }
-    }
-
-    if !downloaded {
+    if let Err(err) = download_file_with_progress(
+        &asset.browser_download_url,
+        &archive_path,
+        &format!("Nushell {version} release artifact"),
+    ) {
         let _ = std::fs::remove_dir_all(&temp_root);
         return Err(crate::error::QuiverError::Other(format!(
             "failed to download Nushell {} release artifact '{}' from GitHub: {}",
-            version,
-            asset_name,
-            if last_download_error.is_empty() {
-                "unknown error"
-            } else {
-                &last_download_error
-            }
+            version, asset_name, err
         )));
+    }
+
+    let verification_result: Result<()> = (|| {
+        let checksum_text = download_release_checksums(
+            &selected_release.assets,
+            &asset_name,
+            &format!("Nushell release {}", selected_release.tag_name),
+        )?;
+        let expected_sha256 = parse_expected_sha256(&checksum_text, &asset_name)?;
+        verify_downloaded_asset(&archive_path, &asset_name, &expected_sha256)?;
+        Ok(())
+    })();
+    if let Err(err) = verification_result {
+        if security_policy.require_signed_assets {
+            let _ = std::fs::remove_dir_all(&temp_root);
+            return Err(err);
+        }
+        ui::warn(format!(
+            "SECURITY WARNING: Nushell release asset '{}' could not be verified ({err}); continuing because --allow-unsigned/config override is active",
+            asset_name
+        ));
     }
 
     let extract_dir = temp_root.join("extract");
@@ -896,7 +1397,8 @@ fn install_nu_version_from_github_release(version: &Version) -> Result<PathBuf> 
     std::fs::create_dir_all(&target_bin_dir)?;
     std::fs::copy(&extracted_binary, &installed_path)?;
     make_executable(&installed_path)?;
-    let installed_plugins = install_extracted_nu_plugins(&extract_dir, &version_dir)?;
+    let plugins_root = config::installs_plugins_dir()?;
+    let installed_plugins = install_extracted_nu_plugins(&extract_dir, &plugins_root, version)?;
     let _ = std::fs::remove_dir_all(&temp_root);
 
     if installed_plugins == 0 {
@@ -950,44 +1452,141 @@ fn extract_archive(archive_path: &Path, extract_dir: &Path) -> Result<()> {
         .and_then(|n| n.to_str())
         .unwrap_or_default();
 
-    if archive_name.ends_with(".tar.gz") {
-        let output = Command::new("tar")
-            .arg("-xzf")
-            .arg(archive_path)
-            .arg("-C")
-            .arg(extract_dir)
-            .output()?;
-        if output.status.success() {
-            return Ok(());
-        }
+    if archive_name.ends_with(".tar.gz") || archive_name.ends_with(".tgz") {
+        return extract_tar_archive(archive_path, extract_dir, TarCompression::Gzip);
+    }
 
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(crate::error::QuiverError::Other(format!(
-            "failed to extract Nushell tar archive: {stderr}"
-        )));
+    if archive_name.ends_with(".tar.xz") {
+        return extract_tar_archive(archive_path, extract_dir, TarCompression::Xz);
     }
 
     if archive_name.ends_with(".zip") {
-        let output = Command::new("unzip")
-            .args(["-q"])
-            .arg(archive_path)
-            .arg("-d")
-            .arg(extract_dir)
-            .output()?;
-        if output.status.success() {
-            return Ok(());
-        }
-
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(crate::error::QuiverError::Other(format!(
-            "failed to extract Nushell zip archive: {stderr}"
-        )));
+        return extract_zip_archive(archive_path, extract_dir);
     }
 
     Err(crate::error::QuiverError::Other(format!(
         "unsupported Nushell archive format: {}",
         archive_path.display()
     )))
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TarCompression {
+    Gzip,
+    Xz,
+}
+
+fn extract_tar_archive(
+    archive_path: &Path,
+    extract_dir: &Path,
+    compression: TarCompression,
+) -> Result<()> {
+    let file = std::fs::File::open(archive_path)?;
+    match compression {
+        TarCompression::Gzip => {
+            let decoder = GzDecoder::new(file);
+            let archive = TarArchive::new(decoder);
+            extract_tar_entries(archive, extract_dir)
+        }
+        TarCompression::Xz => {
+            let decoder = XzDecoder::new(file);
+            let archive = TarArchive::new(decoder);
+            extract_tar_entries(archive, extract_dir)
+        }
+    }
+}
+
+fn extract_tar_entries<R: Read>(mut archive: TarArchive<R>, extract_dir: &Path) -> Result<()> {
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let entry_type = entry.header().entry_type();
+        if entry_type.is_symlink() || entry_type.is_hard_link() {
+            let path = entry.path()?;
+            return Err(crate::error::QuiverError::Other(format!(
+                "archive contains unsupported link entry '{}'",
+                path.display()
+            )));
+        }
+
+        let relative_path = entry.path()?;
+        let Some(safe_relative) = safety::normalized_relative_path(relative_path.as_ref()) else {
+            return Err(crate::error::QuiverError::Other(format!(
+                "archive contains unsafe path '{}'",
+                relative_path.display()
+            )));
+        };
+
+        if safe_relative.as_os_str().is_empty() {
+            continue;
+        }
+
+        let target = extract_dir.join(&safe_relative);
+        if entry_type.is_dir() {
+            std::fs::create_dir_all(&target)?;
+            continue;
+        }
+        if !entry_type.is_file() {
+            return Err(crate::error::QuiverError::Other(format!(
+                "archive contains unsupported entry type at '{}'",
+                safe_relative.display()
+            )));
+        }
+
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        entry.unpack(&target)?;
+    }
+    Ok(())
+}
+
+fn extract_zip_archive(archive_path: &Path, extract_dir: &Path) -> Result<()> {
+    let file = std::fs::File::open(archive_path)?;
+    let mut archive = ZipArchive::new(file).map_err(|err| {
+        crate::error::QuiverError::Other(format!("failed to read zip archive: {err}"))
+    })?;
+
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index).map_err(|err| {
+            crate::error::QuiverError::Other(format!("failed to read zip entry #{index}: {err}"))
+        })?;
+        let raw_name = entry.name().to_string();
+        let enclosed = entry.enclosed_name().ok_or_else(|| {
+            crate::error::QuiverError::Other(format!("archive contains unsafe path '{}'", raw_name))
+        })?;
+        let Some(safe_relative) = safety::normalized_relative_path(enclosed) else {
+            return Err(crate::error::QuiverError::Other(format!(
+                "archive contains unsafe path '{}'",
+                raw_name
+            )));
+        };
+
+        if safe_relative.as_os_str().is_empty() {
+            continue;
+        }
+
+        if let Some(mode) = entry.unix_mode()
+            && (mode & 0o170000) == 0o120000
+        {
+            return Err(crate::error::QuiverError::Other(format!(
+                "archive contains unsupported symlink entry '{}'",
+                raw_name
+            )));
+        }
+
+        let target = extract_dir.join(&safe_relative);
+        if entry.is_dir() {
+            std::fs::create_dir_all(&target)?;
+            continue;
+        }
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut output = std::fs::File::create(&target)?;
+        std::io::copy(&mut entry, &mut output)?;
+    }
+
+    Ok(())
 }
 
 fn find_extracted_nu_binary(extract_dir: &Path) -> Option<PathBuf> {
@@ -1004,14 +1603,15 @@ fn find_extracted_nu_binary(extract_dir: &Path) -> Option<PathBuf> {
     None
 }
 
-fn install_extracted_nu_plugins(extract_dir: &Path, version_dir: &Path) -> Result<usize> {
+fn install_extracted_nu_plugins(
+    extract_dir: &Path,
+    plugins_root: &Path,
+    version: &Version,
+) -> Result<usize> {
     let plugins = find_extracted_nu_plugins(extract_dir);
     if plugins.is_empty() {
         return Ok(0);
     }
-
-    let plugins_dir = version_dir.join("plugins");
-    std::fs::create_dir_all(&plugins_dir)?;
 
     for plugin in &plugins {
         let plugin_name = plugin.file_name().ok_or_else(|| {
@@ -1020,7 +1620,18 @@ fn install_extracted_nu_plugins(extract_dir: &Path, version_dir: &Path) -> Resul
                 plugin.display()
             ))
         })?;
-        let target = plugins_dir.join(plugin_name);
+        let plugin_name_str = plugin_name.to_string_lossy();
+        let plugin_key = plugin_name_str
+            .strip_suffix(".exe")
+            .unwrap_or(&plugin_name_str);
+        let target = plugins_root
+            .join(plugin_key)
+            .join(format!("nu-{version}"))
+            .join("bin")
+            .join(plugin_name);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
         std::fs::copy(plugin, &target)?;
         make_executable(&target)?;
     }
@@ -1068,15 +1679,27 @@ fn make_executable(path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone)]
+struct PluginInstallResult {
+    installed_bin: PathBuf,
+    bin_name: String,
+    version_dir: PathBuf,
+    asset_metadata: DownloadVerificationMetadata,
+}
+
 fn install_plugin(
     plugin: &ResolvedPlugin,
     nu_version_req: Option<&str>,
-) -> Result<(PathBuf, String, PathBuf)> {
+    security_policy: SecurityPolicy,
+    frozen_locked_plugin: Option<&LockedPackage>,
+) -> Result<PluginInstallResult> {
+    safety::validate_dependency_name(&plugin.name, "plugin dependency")?;
     if plugin.git == "nu-core" {
         return install_core_plugin(plugin, nu_version_req);
     }
 
     let bin_name = plugin.bin.clone().unwrap_or_else(|| plugin.name.clone());
+    safety::validate_binary_name(&bin_name, "plugin dependency bin")?;
     let binary_filename = plugin_binary_filename(&bin_name);
     let version = plugin.tag.clone().unwrap_or_else(|| plugin.rev.clone());
     let version_dir = config::installs_plugins_dir()?
@@ -1084,18 +1707,58 @@ fn install_plugin(
         .join(version);
     let installed_bin = version_dir.join("bin").join(&binary_filename);
     if installed_bin.is_file() {
-        return Ok((installed_bin, binary_filename, version_dir));
+        return Ok(PluginInstallResult {
+            installed_bin,
+            bin_name: binary_filename,
+            version_dir,
+            asset_metadata: DownloadVerificationMetadata::default(),
+        });
     }
 
     std::fs::create_dir_all(version_dir.join("bin"))?;
 
-    if let Err(err) = install_plugin_from_github_release(plugin, &version_dir, &binary_filename) {
-        ui::warn(format!(
-            "release install for plugin '{}' failed ({err}); falling back to cargo build",
-            plugin.name
-        ));
-        install_plugin_from_cargo_source(plugin, &version_dir, &binary_filename)?;
-    }
+    let asset_metadata = match install_plugin_from_github_release(
+        plugin,
+        &version_dir,
+        &binary_filename,
+        security_policy,
+        frozen_locked_plugin,
+    ) {
+        Ok(metadata) => metadata,
+        Err(err) => {
+            if security_policy.no_build_fallback {
+                return Err(err);
+            }
+            let verification_failure = is_asset_verification_error(&err);
+            if verification_failure && !security_policy.allow_unsigned {
+                return Err(err);
+            }
+            if verification_failure {
+                ui::warn(format!(
+                    "SECURITY WARNING: release verification failed for plugin '{}' ({err}); continuing with local cargo source build because --allow-unsigned was set",
+                    plugin.name
+                ));
+            } else {
+                ui::warn(format!(
+                    "release install for plugin '{}' failed ({err}); falling back to cargo build",
+                    plugin.name
+                ));
+            }
+            ensure_cargo_available(&plugin.name)?;
+            if !prompt_for_cargo_fallback_approval(plugin, &err)? {
+                return Err(crate::error::QuiverError::Other(format!(
+                    "release install for plugin '{}' failed and cargo fallback build was denied by user",
+                    plugin.name
+                )));
+            }
+            ui::warn(format!(
+                "SECURITY WARNING: building plugin '{}' from source locally (trust mode changed)",
+                plugin.name
+            ));
+            install_plugin_from_cargo_source(plugin, &version_dir, &binary_filename)?;
+            DownloadVerificationMetadata::default()
+        }
+    };
 
     if !installed_bin.is_file() {
         return Err(crate::error::QuiverError::Other(format!(
@@ -1104,17 +1767,32 @@ fn install_plugin(
         )));
     }
 
-    Ok((installed_bin, binary_filename, version_dir))
+    Ok(PluginInstallResult {
+        installed_bin,
+        bin_name: binary_filename,
+        version_dir,
+        asset_metadata,
+    })
 }
 
 fn install_core_plugin(
     plugin: &ResolvedPlugin,
     nu_version_req: Option<&str>,
-) -> Result<(PathBuf, String, PathBuf)> {
+) -> Result<PluginInstallResult> {
+    safety::validate_dependency_name(&plugin.name, "plugin dependency")?;
     let bin_name = plugin.bin.clone().unwrap_or_else(|| plugin.name.clone());
+    safety::validate_binary_name(&bin_name, "plugin dependency bin")?;
     let binary_filename = plugin_binary_filename(&bin_name);
 
-    let nu_path = resolve_nu_binary_for_requirement(nu_version_req)?.ok_or_else(|| {
+    let nu_path = resolve_nu_binary_for_requirement(
+        nu_version_req,
+        SecurityPolicy {
+            require_signed_assets: true,
+            allow_unsigned: false,
+            no_build_fallback: false,
+        },
+    )?
+    .ok_or_else(|| {
         crate::error::QuiverError::Other(
             "could not resolve a Nushell binary while installing core plugin".to_string(),
         )
@@ -1128,7 +1806,7 @@ fn install_core_plugin(
     })?;
     let source_binary = find_core_plugin_binary_for_nu(&nu_path, &binary_filename).ok_or_else(|| {
         crate::error::QuiverError::Other(format!(
-            "core plugin '{}' ({}) was not found next to '{}' or in quiver's nu-version plugin store",
+            "core plugin '{}' ({}) was not found next to '{}' or in quiver's shared plugin store",
             plugin.name,
             binary_filename,
             nu_path.display()
@@ -1140,14 +1818,24 @@ fn install_core_plugin(
         .join(format!("nu-{nu_version}"));
     let installed_bin = version_dir.join("bin").join(&binary_filename);
     if installed_bin.is_file() {
-        return Ok((installed_bin, binary_filename, version_dir));
+        return Ok(PluginInstallResult {
+            installed_bin,
+            bin_name: binary_filename,
+            version_dir,
+            asset_metadata: DownloadVerificationMetadata::default(),
+        });
     }
 
     std::fs::create_dir_all(version_dir.join("bin"))?;
     std::fs::copy(&source_binary, &installed_bin)?;
     make_executable(&installed_bin)?;
 
-    Ok((installed_bin, binary_filename, version_dir))
+    Ok(PluginInstallResult {
+        installed_bin,
+        bin_name: binary_filename,
+        version_dir,
+        asset_metadata: DownloadVerificationMetadata::default(),
+    })
 }
 
 fn plugin_binary_filename(bin_name: &str) -> String {
@@ -1162,7 +1850,9 @@ fn install_plugin_from_github_release(
     plugin: &ResolvedPlugin,
     version_dir: &Path,
     binary_filename: &str,
-) -> Result<()> {
+    security_policy: SecurityPolicy,
+    _frozen_locked_plugin: Option<&LockedPackage>,
+) -> Result<DownloadVerificationMetadata> {
     let (owner, repo) = parse_github_owner_repo(&plugin.git).ok_or_else(|| {
         crate::error::QuiverError::Other(format!(
             "plugin '{}' git source is not a supported GitHub repo URL",
@@ -1170,17 +1860,17 @@ fn install_plugin_from_github_release(
         ))
     })?;
     let releases = fetch_repo_github_releases(&owner, &repo)?;
-    let asset = select_plugin_release_asset(&releases, plugin.tag.as_deref(), binary_filename)
+    let selected = select_plugin_release_asset(&releases, plugin.tag.as_deref(), binary_filename)
         .ok_or_else(|| {
-            crate::error::QuiverError::Other(format!(
-                "no suitable release asset found for plugin '{}' ({}/{})",
-                plugin.name, owner, repo
-            ))
-        })?;
-    if asset.browser_download_url.trim().is_empty() {
+        crate::error::QuiverError::Other(format!(
+            "no suitable release asset found for plugin '{}' ({}/{})",
+            plugin.name, owner, repo
+        ))
+    })?;
+    if selected.asset.browser_download_url.trim().is_empty() {
         return Err(crate::error::QuiverError::Other(format!(
             "release asset '{}' did not include a download URL",
-            asset.name
+            selected.asset.name
         )));
     }
 
@@ -1194,27 +1884,57 @@ fn install_plugin_from_github_release(
     }
     std::fs::create_dir_all(&temp_root)?;
 
-    let downloaded_path = temp_root.join(&asset.name);
+    let downloaded_path = temp_root.join(&selected.asset.name);
     if let Err(err) = download_file_with_progress(
-        &asset.browser_download_url,
+        &selected.asset.browser_download_url,
         &downloaded_path,
-        &format!("plugin {} asset {}", plugin.name, asset.name),
+        &format!("plugin {} asset {}", plugin.name, selected.asset.name),
     ) {
         let _ = std::fs::remove_dir_all(&temp_root);
         return Err(crate::error::QuiverError::Other(format!(
             "failed downloading plugin release asset '{}': {err}",
-            asset.name,
+            selected.asset.name,
         )));
     }
 
-    let binary = if asset.name.ends_with(".tar.gz") || asset.name.ends_with(".zip") {
+    let mut asset_metadata = DownloadVerificationMetadata {
+        asset_sha256: None,
+        asset_url: Some(selected.asset.browser_download_url.clone()),
+    };
+    let verification_result: Result<String> = (|| {
+        let checksum_text = download_release_checksums(
+            &selected.release_assets,
+            &selected.asset.name,
+            &format!("plugin {} release {}", plugin.name, selected.release_tag),
+        )?;
+        let expected_sha256 = parse_expected_sha256(&checksum_text, &selected.asset.name)?;
+        verify_downloaded_asset(&downloaded_path, &selected.asset.name, &expected_sha256)?;
+        sha256_file(&downloaded_path)
+    })();
+    match verification_result {
+        Ok(actual_sha256) => {
+            asset_metadata.asset_sha256 = Some(actual_sha256);
+        }
+        Err(err) => {
+            if security_policy.require_signed_assets {
+                let _ = std::fs::remove_dir_all(&temp_root);
+                return Err(err);
+            }
+            ui::warn(format!(
+                "SECURITY WARNING: plugin '{}' release asset '{}' could not be verified ({err}); continuing because --allow-unsigned/config override is active",
+                plugin.name, selected.asset.name
+            ));
+        }
+    }
+
+    let binary = if is_supported_archive_asset_name(&selected.asset.name.to_ascii_lowercase()) {
         let extract_dir = temp_root.join("extract");
         std::fs::create_dir_all(&extract_dir)?;
         extract_archive(&downloaded_path, &extract_dir)?;
         find_extracted_binary_named(&extract_dir, binary_filename).ok_or_else(|| {
             crate::error::QuiverError::Other(format!(
                 "release asset '{}' did not contain '{}'",
-                asset.name, binary_filename
+                selected.asset.name, binary_filename
             ))
         })?
     } else {
@@ -1226,7 +1946,7 @@ fn install_plugin_from_github_release(
     make_executable(&target)?;
     let _ = std::fs::remove_dir_all(&temp_root);
 
-    Ok(())
+    Ok(asset_metadata)
 }
 
 fn install_plugin_from_cargo_source(
@@ -1276,35 +1996,139 @@ fn install_plugin_from_cargo_source(
     Ok(())
 }
 
+fn ensure_cargo_available(plugin_name: &str) -> Result<()> {
+    match Command::new("cargo")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+    {
+        Ok(status) if status.success() => Ok(()),
+        Ok(_) => Err(crate::error::QuiverError::Other(format!(
+            "cargo is required for plugin '{}' source-build fallback, but `cargo --version` failed",
+            plugin_name
+        ))),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            Err(crate::error::QuiverError::Other(format!(
+                "cargo is not installed or not on PATH; cannot source-build plugin '{}'",
+                plugin_name
+            )))
+        }
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn prompt_for_cargo_fallback_approval(
+    plugin: &ResolvedPlugin,
+    release_error: &crate::error::QuiverError,
+) -> Result<bool> {
+    eprintln!("  Release install failed with: {}", release_error);
+
+    loop {
+        eprint!(
+            "{} Build plugin '{}' from source with `cargo build --release --bin {}`? [y/N]: ",
+            ui::keyword("Confirm"),
+            plugin.name,
+            plugin.bin.as_deref().unwrap_or(&plugin.name)
+        );
+        std::io::stderr().flush()?;
+
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+        match parse_yes_no(&input) {
+            Some(answer) => return Ok(answer),
+            None => eprintln!("Please answer 'y' or 'n'."),
+        }
+    }
+}
+
+fn parse_yes_no(input: &str) -> Option<bool> {
+    match input.trim().to_ascii_lowercase().as_str() {
+        "y" | "yes" => Some(true),
+        "n" | "no" | "" => Some(false),
+        _ => None,
+    }
+}
+
 fn link_plugin_into_env(
     installed_binary: &Path,
     bin_dir: &Path,
     binary_filename: &str,
-) -> Result<()> {
+) -> Result<bool> {
+    safety::validate_binary_name(binary_filename, "plugin binary filename")?;
     std::fs::create_dir_all(bin_dir)?;
     let link_path = bin_dir.join(binary_filename);
+    let changed = ensure_symlink_or_file(&link_path, installed_binary)?;
+    if changed {
+        ui::success(format!(
+            "Linked .nu-env/bin/{} -> {}",
+            binary_filename,
+            installed_binary.display()
+        ));
+    }
+    Ok(changed)
+}
+
+fn write_text_file_if_changed(path: &Path, contents: &str) -> Result<bool> {
+    if let Ok(existing) = std::fs::read_to_string(path)
+        && existing == contents
+    {
+        return Ok(false);
+    }
+
+    std::fs::write(path, contents)?;
+    Ok(true)
+}
+
+fn ensure_symlink_or_file(link_path: &Path, target: &Path) -> Result<bool> {
+    if link_points_to_target(link_path, target) {
+        return Ok(false);
+    }
+
     if link_path.exists() || link_path.symlink_metadata().is_ok() {
-        std::fs::remove_file(&link_path)?;
+        std::fs::remove_file(link_path)?;
     }
 
     #[cfg(unix)]
-    std::os::unix::fs::symlink(installed_binary, &link_path)?;
+    std::os::unix::fs::symlink(target, link_path)?;
     #[cfg(windows)]
     {
-        if let Err(err) = std::os::windows::fs::symlink_file(installed_binary, &link_path) {
-            ui::warn(format!(
-                "symlink failed ({err}); copying plugin binary instead"
-            ));
-            std::fs::copy(installed_binary, &link_path)?;
+        if let Err(err) = std::os::windows::fs::symlink_file(target, link_path) {
+            ui::warn(format!("symlink failed ({err}); copying file instead"));
+            std::fs::copy(target, link_path)?;
         }
     }
 
-    ui::success(format!(
-        "Linked .nu-env/bin/{} -> {}",
-        binary_filename,
-        installed_binary.display()
-    ));
-    Ok(())
+    Ok(true)
+}
+
+fn link_points_to_target(link_path: &Path, target: &Path) -> bool {
+    let Ok(metadata) = std::fs::symlink_metadata(link_path) else {
+        return false;
+    };
+    if !metadata.file_type().is_symlink() {
+        return false;
+    }
+
+    let Ok(raw_link_target) = std::fs::read_link(link_path) else {
+        return false;
+    };
+    let resolved_link_target = if raw_link_target.is_absolute() {
+        raw_link_target
+    } else {
+        link_path
+            .parent()
+            .map_or(raw_link_target.clone(), |parent| {
+                parent.join(raw_link_target)
+            })
+    };
+
+    if let (Ok(actual), Ok(expected)) = (resolved_link_target.canonicalize(), target.canonicalize())
+    {
+        return actual == expected;
+    }
+
+    resolved_link_target == target
 }
 
 fn parse_github_owner_repo(git_url: &str) -> Option<(String, String)> {
@@ -1370,7 +2194,7 @@ fn select_plugin_release_asset(
     releases: &[GitHubRelease],
     preferred_tag: Option<&str>,
     binary_filename: &str,
-) -> Option<GitHubReleaseAsset> {
+) -> Option<GitHubReleaseAssetCandidate> {
     for release in releases {
         if release.draft || release.prerelease {
             continue;
@@ -1391,7 +2215,11 @@ fn select_plugin_release_asset(
             .collect();
         candidates.sort_by(|a, b| b.0.cmp(&a.0));
         if let Some((_, asset)) = candidates.into_iter().next() {
-            return Some(asset);
+            return Some(GitHubReleaseAssetCandidate {
+                release_tag: release.tag_name.clone(),
+                release_assets: release.assets.clone(),
+                asset,
+            });
         }
     }
     None
@@ -1403,10 +2231,24 @@ fn release_tag_matches(actual: &str, expected: &str) -> bool {
 
 fn score_plugin_asset_name(asset_name: &str, binary_filename: &str) -> Option<i32> {
     let lower = asset_name.to_ascii_lowercase();
+    if is_non_executable_release_asset(&lower) {
+        return None;
+    }
+
     let os_ok = match std::env::consts::OS {
-        "macos" => lower.contains("darwin") || lower.contains("apple") || lower.contains("macos"),
+        "macos" => {
+            lower.contains("apple-darwin")
+                || lower.contains("darwin")
+                || lower.contains("macos")
+                || lower.contains("osx")
+        }
         "linux" => lower.contains("linux"),
-        "windows" => lower.contains("windows") || lower.contains("win"),
+        "windows" => {
+            lower.contains("pc-windows")
+                || lower.contains("windows")
+                || lower.contains("win32")
+                || lower.contains("win64")
+        }
         _ => false,
     };
     if !os_ok {
@@ -1423,17 +2265,48 @@ fn score_plugin_asset_name(asset_name: &str, binary_filename: &str) -> Option<i3
     }
 
     let mut score = 10;
-    if lower.contains(&binary_filename.to_ascii_lowercase()) {
+    let binary_lower = binary_filename.to_ascii_lowercase();
+    if lower.contains(&binary_lower) {
         score += 5;
     }
-    if lower.ends_with(".tar.gz") || lower.ends_with(".zip") {
+    if is_supported_archive_asset_name(&lower) {
         score += 3;
     }
-    if lower.ends_with(binary_filename) {
+    if lower.ends_with(&binary_lower) {
         score += 2;
     }
 
     Some(score)
+}
+
+fn is_supported_archive_asset_name(lower_asset_name: &str) -> bool {
+    lower_asset_name.ends_with(".tar.gz")
+        || lower_asset_name.ends_with(".tgz")
+        || lower_asset_name.ends_with(".tar.xz")
+        || lower_asset_name.ends_with(".zip")
+}
+
+fn is_non_executable_release_asset(lower_asset_name: &str) -> bool {
+    [
+        ".sha256",
+        ".sha512",
+        ".sha1",
+        ".sha",
+        ".sig",
+        ".asc",
+        ".minisig",
+        ".pem",
+        ".crt",
+        ".cer",
+        ".txt",
+        ".json",
+        ".checksums",
+    ]
+    .iter()
+    .any(|ext| lower_asset_name.ends_with(ext))
+        || lower_asset_name.contains("checksum")
+        || lower_asset_name.contains("sha256sum")
+        || lower_asset_name.contains("sha512sum")
 }
 
 fn find_extracted_binary_named(root: &Path, binary_filename: &str) -> Option<PathBuf> {
@@ -1460,13 +2333,14 @@ fn nu_string_literal(path: &Path) -> String {
 
 /// Install a single resolved dependency into the modules directory.
 fn install_dep(dep: &ResolvedDep, modules_dir: &Path, install_mode: InstallMode) -> Result<String> {
+    safety::validate_dependency_name(&dep.name, "module dependency")?;
     let repo_path = git::clone_or_fetch(&dep.git)?;
     let dest = modules_dir.join(&dep.name);
-    let staging = modules_dir.join(format!(
-        ".quiver-staging-{}-{}",
-        dep.name,
-        std::process::id()
-    ));
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let staging = modules_dir.join(format!(".quiver-staging-{}-{unique}", std::process::id()));
     if staging.exists() {
         std::fs::remove_dir_all(&staging)?;
     }
@@ -1596,7 +2470,7 @@ fn discover_module_use_path(module_root: &Path, dep_name: &str) -> Result<String
     }
 
     if let Some(package_name) = metadata.package_name.as_deref() {
-        if let Some(subdir) = normalized_relative_path(Path::new(package_name)) {
+        if let Some(subdir) = safety::normalized_relative_path(Path::new(package_name)) {
             if module_root.join(&subdir).join("mod.nu").is_file() {
                 push_unique_path(&mut candidates, &mut seen, subdir);
             }
@@ -1747,7 +2621,7 @@ fn module_subpath_from_hint(module_root: &Path, hint: &str) -> Option<PathBuf> {
         return None;
     }
 
-    let hint_path = normalized_relative_path(Path::new(&normalized_hint))?;
+    let hint_path = safety::normalized_relative_path(Path::new(&normalized_hint))?;
     let subdir = if hint_path.file_name().and_then(|name| name.to_str()) == Some("mod.nu") {
         hint_path
             .parent()
@@ -1761,18 +2635,6 @@ fn module_subpath_from_hint(module_root: &Path, hint: &str) -> Option<PathBuf> {
     } else {
         None
     }
-}
-
-fn normalized_relative_path(path: &Path) -> Option<PathBuf> {
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::Normal(segment) => normalized.push(segment),
-            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
-        }
-    }
-    Some(normalized)
 }
 
 fn find_mod_nu_dirs(module_root: &Path) -> Vec<PathBuf> {
@@ -1789,7 +2651,7 @@ fn find_mod_nu_dirs(module_root: &Path) -> Vec<PathBuf> {
 
         if let Ok(relative_file) = entry.path().strip_prefix(module_root) {
             let parent = relative_file.parent().unwrap_or_else(|| Path::new(""));
-            if let Some(normalized) = normalized_relative_path(parent) {
+            if let Some(normalized) = safety::normalized_relative_path(parent) {
                 dirs.push(normalized);
             }
         }
@@ -1846,19 +2708,19 @@ fn path_to_forward_slashes(path: &Path) -> String {
 /// Determine whether the module section is stale relative to the local lockfile.
 fn local_lockfile_is_stale(manifest: &Manifest, lockfile: &Lockfile) -> bool {
     // Check if all manifest module deps are in the lockfile
-    for name in manifest.dependencies.modules.keys() {
-        if lockfile
-            .find_package(name, LockedPackageKind::Module)
-            .is_none()
-        {
+    for (name, spec) in &manifest.dependencies.modules {
+        let Some(locked) = lockfile.find_package(name, LockedPackageKind::Module) else {
+            return true;
+        };
+        if !module_dep_matches_lock(spec, locked) {
             return true;
         }
     }
-    for name in manifest.dependencies.plugins.keys() {
-        if lockfile
-            .find_package(name, LockedPackageKind::Plugin)
-            .is_none()
-        {
+    for (name, spec) in &manifest.dependencies.plugins {
+        let Some(locked) = lockfile.find_package(name, LockedPackageKind::Plugin) else {
+            return true;
+        };
+        if !plugin_dep_matches_lock(name, spec, locked) {
             return true;
         }
     }
@@ -1881,6 +2743,48 @@ fn local_lockfile_is_stale(manifest: &Manifest, lockfile: &Lockfile) -> bool {
     }
 
     false
+}
+
+fn module_dep_matches_lock(spec: &DependencySpec, locked: &LockedPackage) -> bool {
+    if spec.git != locked.git {
+        return false;
+    }
+    if spec.tag != locked.tag {
+        return false;
+    }
+    if let Some(expected_rev) = &spec.rev
+        && expected_rev != &locked.rev
+    {
+        return false;
+    }
+    true
+}
+
+fn plugin_dep_matches_lock(
+    name: &str,
+    spec: &PluginDependencySpec,
+    locked: &LockedPackage,
+) -> bool {
+    let source = spec.source.as_deref().unwrap_or("git");
+    if source == "nu-core" {
+        if locked.git != "nu-core" {
+            return false;
+        }
+    } else if spec.git != locked.git {
+        return false;
+    }
+
+    if spec.tag != locked.tag {
+        return false;
+    }
+    if let Some(expected_rev) = &spec.rev
+        && expected_rev != &locked.rev
+    {
+        return false;
+    }
+
+    let expected_bin = spec.bin.as_deref().unwrap_or(name);
+    locked.path.as_deref() == Some(expected_bin)
 }
 
 /// Check if the global lockfile is stale relative to the global config.
@@ -1920,7 +2824,7 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::ffi::OsString;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn make_temp_dir(label: &str) -> PathBuf {
@@ -1944,6 +2848,23 @@ mod tests {
         } else {
             OsString::from(base)
         }
+    }
+
+    fn write_test_tar_gz_with_symlink(path: &Path, entry_path: &str, link_target: &str) {
+        let file = std::fs::File::create(path).unwrap();
+        let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+        let mut builder = tar::Builder::new(encoder);
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Symlink);
+        header.set_size(0);
+        header.set_mode(0o777);
+        header.set_link_name(link_target).unwrap();
+        header.set_cksum();
+        builder
+            .append_data(&mut header, entry_path, std::io::empty())
+            .unwrap();
+        let encoder = builder.into_inner().unwrap();
+        encoder.finish().unwrap();
     }
 
     #[test]
@@ -2091,6 +3012,64 @@ sha256 = "ddd"
     }
 
     #[test]
+    fn local_lockfile_staleness_detects_changed_module_ref() {
+        let manifest = Manifest::from_str(
+            r#"[package]
+name = "demo"
+version = "0.1.0"
+
+[dependencies.modules]
+nu-salesforce = { git = "https://github.com/freepicheep/nu-salesforce", tag = "v0.4.0" }
+"#,
+        )
+        .unwrap();
+        let lockfile = Lockfile::from_str(
+            r#"version = 1
+
+[[package]]
+name = "nu-salesforce"
+git = "https://github.com/freepicheep/nu-salesforce"
+tag = "v0.3.0"
+rev = "cccccccccccccccccccccccccccccccccccccccc"
+sha256 = "ccc"
+"#,
+        )
+        .unwrap();
+
+        assert!(local_lockfile_is_stale(&manifest, &lockfile));
+    }
+
+    #[test]
+    fn local_lockfile_staleness_detects_changed_plugin_bin() {
+        let manifest = Manifest::from_str(
+            r#"[package]
+name = "demo"
+version = "0.1.0"
+
+[dependencies.plugins]
+nu_plugin_inc = { git = "https://github.com/nushell/nu_plugin_inc", tag = "v0.91.0", bin = "nu_plugin_inc_v2" }
+"#,
+        )
+        .unwrap();
+        let lockfile = Lockfile::from_str(
+            r#"version = 1
+
+[[package]]
+name = "nu_plugin_inc"
+kind = "plugin"
+git = "https://github.com/nushell/nu_plugin_inc"
+tag = "v0.91.0"
+rev = "dddddddddddddddddddddddddddddddddddddddd"
+path = "nu_plugin_inc"
+sha256 = "ddd"
+"#,
+        )
+        .unwrap();
+
+        assert!(local_lockfile_is_stale(&manifest, &lockfile));
+    }
+
+    #[test]
     fn frozen_install_without_dependencies_writes_activate_overlay() {
         let project_dir = make_temp_dir("empty_manifest");
         std::fs::write(
@@ -2102,7 +3081,7 @@ version = "0.1.0"
         )
         .unwrap();
 
-        install(&project_dir, true).unwrap();
+        install(&project_dir, true, false, false).unwrap();
 
         let nu_env = project_dir.join(".nu-env");
         let activate = std::fs::read_to_string(nu_env.join("activate.nu")).unwrap();
@@ -2113,6 +3092,43 @@ version = "0.1.0"
         let config_nu = std::fs::read_to_string(nu_env.join("config.nu")).unwrap();
         assert!(config_nu.contains("export const NU_LIB_DIRS"));
         assert!(config_nu.contains(".nu-env/modules"));
+
+        let _ = std::fs::remove_dir_all(project_dir);
+    }
+
+    #[test]
+    fn install_without_dependencies_rewrites_lockfile_to_empty() {
+        let project_dir = make_temp_dir("empty_manifest_rewrites_lock");
+        std::fs::write(
+            project_dir.join("nupackage.toml"),
+            r#"[package]
+name = "demo"
+version = "0.1.0"
+"#,
+        )
+        .unwrap();
+
+        std::fs::write(
+            project_dir.join("quiver.lock"),
+            r#"# This file is generated automatically. Do not edit.
+version = 1
+
+[[package]]
+name = "nu-utils"
+kind = "module"
+git = "https://github.com/example/nu-utils"
+tag = "v1.0.0"
+rev = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+sha256 = "aaa"
+"#,
+        )
+        .unwrap();
+
+        install(&project_dir, false, false, false).unwrap();
+
+        let lock = Lockfile::from_path(&project_dir.join("quiver.lock")).unwrap();
+        assert_eq!(lock.version, 1);
+        assert!(lock.packages.is_empty());
 
         let _ = std::fs::remove_dir_all(project_dir);
     }
@@ -2139,6 +3155,7 @@ sha256 = "aaa"
             modules_dir: None,
             default_git_provider: "github".to_string(),
             install_mode: InstallMode::Copy,
+            security: crate::config::SecurityConfig::default(),
             dependencies: HashMap::from([(
                 "nu-utils".to_string(),
                 crate::manifest::DependencySpec {
@@ -2176,6 +3193,7 @@ sha256 = "aaa"
             modules_dir: None,
             default_git_provider: "github".to_string(),
             install_mode: InstallMode::Copy,
+            security: crate::config::SecurityConfig::default(),
             dependencies: HashMap::from([(
                 "nu-utils".to_string(),
                 crate::manifest::DependencySpec {
@@ -2267,6 +3285,8 @@ nu_plugin_inc = { git = "https://github.com/nushell/nu_plugin_inc", tag = "v0.91
                 rev: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
                 path: None,
                 sha256: "aaa".to_string(),
+                asset_sha256: None,
+                asset_url: None,
             }],
         };
 
@@ -2306,6 +3326,89 @@ nu_plugin_inc = { git = "https://github.com/nushell/nu_plugin_inc", tag = "v0.91
     }
 
     #[test]
+    fn select_plugin_release_asset_ignores_checksum_and_signature_assets() {
+        let binary = plugin_binary_filename("nu_plugin_inc");
+        let target_asset = format!(
+            "nu_plugin_inc-{}-{}.tar.gz",
+            std::env::consts::ARCH,
+            std::env::consts::OS
+        );
+        let releases = vec![GitHubRelease {
+            tag_name: "v0.91.0".to_string(),
+            draft: false,
+            prerelease: false,
+            assets: vec![
+                GitHubReleaseAsset {
+                    name: format!("{target_asset}.sha256"),
+                    browser_download_url: "https://example.com/checksum".to_string(),
+                },
+                GitHubReleaseAsset {
+                    name: format!("{target_asset}.sig"),
+                    browser_download_url: "https://example.com/sig".to_string(),
+                },
+                GitHubReleaseAsset {
+                    name: target_asset.clone(),
+                    browser_download_url: "https://example.com/bin".to_string(),
+                },
+            ],
+        }];
+
+        let selected = select_plugin_release_asset(&releases, Some("v0.91.0"), &binary).unwrap();
+        assert_eq!(selected.asset.name, target_asset);
+    }
+
+    #[test]
+    fn supported_plugin_archive_formats_include_tgz_and_tar_xz() {
+        assert!(is_supported_archive_asset_name(
+            "nu_plugin_inc-aarch64-apple-darwin.tgz"
+        ));
+        assert!(is_supported_archive_asset_name(
+            "nu_plugin_inc-aarch64-apple-darwin.tar.xz"
+        ));
+    }
+
+    #[test]
+    fn extract_archive_rejects_tar_symlink_entries() {
+        let root = make_temp_dir("extract_tar_symlink");
+        let archive_path = root.join("bad.tar.gz");
+        write_test_tar_gz_with_symlink(&archive_path, "link-out", "../escape.txt");
+
+        let extract_dir = root.join("extract");
+        std::fs::create_dir_all(&extract_dir).unwrap();
+
+        let error = extract_archive(&archive_path, &extract_dir)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unsupported link entry"));
+        assert!(!root.join("escape.txt").exists());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn extract_archive_rejects_zip_path_traversal_entries() {
+        let root = make_temp_dir("extract_zip_traversal");
+        let archive_path = root.join("bad.zip");
+        let file = std::fs::File::create(&archive_path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::FileOptions::default();
+        zip.start_file("../escape.txt", options).unwrap();
+        zip.write_all(b"malicious").unwrap();
+        zip.finish().unwrap();
+
+        let extract_dir = root.join("extract");
+        std::fs::create_dir_all(&extract_dir).unwrap();
+
+        let error = extract_archive(&archive_path, &extract_dir)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unsafe path"));
+        assert!(!root.join("escape.txt").exists());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn link_plugin_into_env_creates_link() {
         let root = make_temp_dir("plugin_link");
         let store_bin = root.join("store").join("nu_plugin_inc");
@@ -2313,12 +3416,46 @@ nu_plugin_inc = { git = "https://github.com/nushell/nu_plugin_inc", tag = "v0.91
         std::fs::create_dir_all(store_bin.parent().unwrap()).unwrap();
         std::fs::write(&store_bin, "plugin-binary").unwrap();
 
-        link_plugin_into_env(&store_bin, &env_bin, "nu_plugin_inc").unwrap();
+        let changed = link_plugin_into_env(&store_bin, &env_bin, "nu_plugin_inc").unwrap();
+        assert!(changed);
 
         let linked = env_bin.join("nu_plugin_inc");
         assert!(linked.exists());
         #[cfg(unix)]
         assert!(linked.symlink_metadata().unwrap().file_type().is_symlink());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn link_plugin_into_env_is_idempotent_when_target_matches() {
+        let root = make_temp_dir("plugin_link_idempotent");
+        let store_bin = root.join("store").join("nu_plugin_inc");
+        let env_bin = root.join(".nu-env").join("bin");
+        std::fs::create_dir_all(store_bin.parent().unwrap()).unwrap();
+        std::fs::write(&store_bin, "plugin-binary").unwrap();
+
+        let changed_first = link_plugin_into_env(&store_bin, &env_bin, "nu_plugin_inc").unwrap();
+        let changed_second = link_plugin_into_env(&store_bin, &env_bin, "nu_plugin_inc").unwrap();
+
+        assert!(changed_first);
+        assert!(!changed_second);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn write_text_file_if_changed_is_idempotent() {
+        let root = make_temp_dir("write_if_changed");
+        let file = root.join("config.nu");
+
+        let changed_first = write_text_file_if_changed(&file, "content").unwrap();
+        let changed_second = write_text_file_if_changed(&file, "content").unwrap();
+        let changed_third = write_text_file_if_changed(&file, "new content").unwrap();
+
+        assert!(changed_first);
+        assert!(!changed_second);
+        assert!(changed_third);
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -2355,7 +3492,7 @@ nu_plugin_inc = { git = "https://github.com/nushell/nu_plugin_inc", tag = "v0.91
     }
 
     #[test]
-    fn install_extracted_nu_plugins_copies_into_version_plugins_dir() {
+    fn install_extracted_nu_plugins_copies_into_shared_plugins_store() {
         let root = make_temp_dir("nu_release_plugin_install");
         let extracted = root.join("extract");
         std::fs::create_dir_all(&extracted).unwrap();
@@ -2364,11 +3501,26 @@ nu_plugin_inc = { git = "https://github.com/nushell/nu_plugin_inc", tag = "v0.91
         std::fs::write(extracted.join(&formats), "formats").unwrap();
         std::fs::write(extracted.join(&query), "query").unwrap();
 
-        let version_dir = root.join("nu_versions").join("0.110.0");
-        let count = install_extracted_nu_plugins(&extracted, &version_dir).unwrap();
+        let plugins_root = root.join("plugins");
+        let version = Version::parse("0.110.0").unwrap();
+        let count = install_extracted_nu_plugins(&extracted, &plugins_root, &version).unwrap();
         assert_eq!(count, 2);
-        assert!(version_dir.join("plugins").join(formats).is_file());
-        assert!(version_dir.join("plugins").join(query).is_file());
+        assert!(
+            plugins_root
+                .join("nu_plugin_formats")
+                .join("nu-0.110.0")
+                .join("bin")
+                .join(formats)
+                .is_file()
+        );
+        assert!(
+            plugins_root
+                .join("nu_plugin_query")
+                .join("nu-0.110.0")
+                .join("bin")
+                .join(query)
+                .is_file()
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -2457,5 +3609,108 @@ nu_plugin_inc = { git = "https://github.com/nushell/nu_plugin_inc", tag = "v0.91
         assert_eq!(plugin_use_name("nu_plugin_inc"), "inc");
         assert_eq!(plugin_use_name("nu_plugin_query.exe"), "query");
         assert_eq!(plugin_use_name("custom_plugin"), "custom_plugin");
+    }
+
+    #[test]
+    fn parse_yes_no_accepts_expected_answers() {
+        assert_eq!(parse_yes_no("y"), Some(true));
+        assert_eq!(parse_yes_no("yes"), Some(true));
+        assert_eq!(parse_yes_no("Y"), Some(true));
+        assert_eq!(parse_yes_no(" n "), Some(false));
+        assert_eq!(parse_yes_no("no"), Some(false));
+        assert_eq!(parse_yes_no(""), Some(false));
+    }
+
+    #[test]
+    fn parse_yes_no_rejects_invalid_answers() {
+        assert_eq!(parse_yes_no("maybe"), None);
+        assert_eq!(parse_yes_no("1"), None);
+    }
+
+    #[test]
+    fn parse_expected_sha256_supports_common_formats() {
+        let asset = "nu-x86_64-unknown-linux-gnu.tar.gz";
+        let hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let checksum_text =
+            format!("{hash}  {asset}\n{hash} *{asset}\nSHA256 ({asset}) = {hash}\n");
+        let parsed = parse_expected_sha256(&checksum_text, asset).unwrap();
+        assert_eq!(parsed, hash);
+    }
+
+    #[test]
+    fn parse_expected_sha256_rejects_malformed_digest() {
+        let asset = "nu-x86_64-unknown-linux-gnu.tar.gz";
+        let err = parse_expected_sha256("abc123  nu-x86_64-unknown-linux-gnu.tar.gz", asset)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("checksum parse failure"));
+        assert!(err.contains(asset));
+    }
+
+    #[test]
+    fn verify_downloaded_asset_detects_match_and_mismatch() {
+        let root = make_temp_dir("asset_verify");
+        let asset_path = root.join("sample.tar.gz");
+        std::fs::write(&asset_path, b"quiver-security").unwrap();
+
+        let digest = sha256_file(&asset_path).unwrap();
+        assert!(verify_downloaded_asset(&asset_path, "sample.tar.gz", &digest).is_ok());
+
+        let mismatch = verify_downloaded_asset(
+            &asset_path,
+            "sample.tar.gz",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(mismatch.contains("checksum mismatch"));
+        assert!(mismatch.contains("sample.tar.gz"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn frozen_policy_forces_signed_assets_and_disables_fallback() {
+        let policy = security_policy_for(false, true, true, false);
+        assert!(policy.require_signed_assets);
+        assert!(!policy.allow_unsigned);
+        assert!(policy.no_build_fallback);
+    }
+
+    #[test]
+    fn frozen_checksum_verification_requires_matching_sha() {
+        let lock = Lockfile {
+            version: 1,
+            packages: vec![LockedPackage {
+                name: "nu-utils".to_string(),
+                kind: LockedPackageKind::Module,
+                git: "https://github.com/example/nu-utils".to_string(),
+                tag: Some("v1.0.0".to_string()),
+                rev: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+                path: None,
+                sha256: "deadbeef".to_string(),
+                asset_sha256: None,
+                asset_url: None,
+            }],
+        };
+
+        assert!(
+            verify_frozen_checksum(
+                Some(&lock),
+                "nu-utils",
+                LockedPackageKind::Module,
+                "deadbeef"
+            )
+            .is_ok()
+        );
+        assert!(
+            verify_frozen_checksum(
+                Some(&lock),
+                "nu-utils",
+                LockedPackageKind::Module,
+                "cafebabe"
+            )
+            .is_err()
+        );
     }
 }
