@@ -76,6 +76,7 @@ pub struct PluginDependencySpec {
 impl DependencySpec {
     /// Validate that exactly one of tag/rev/branch is specified.
     pub fn validate(&self, name: &str) -> Result<()> {
+        safety::validate_secure_git_source(&self.git, "module dependency git source")?;
         validate_ref_fields(
             name,
             "module dependency",
@@ -151,6 +152,7 @@ impl PluginDependencySpec {
                 "plugin dependency '{name}': git cannot be empty"
             )));
         }
+        safety::validate_secure_git_source(&self.git, "plugin dependency git source")?;
         if self.bin.as_deref().is_some_and(|bin| bin.trim().is_empty()) {
             return Err(QuiverError::Manifest(format!(
                 "plugin dependency '{name}': bin cannot be empty when set"
@@ -402,6 +404,21 @@ x = { git = "https://example.com/x" }
     }
 
     #[test]
+    fn reject_module_dependency_with_insecure_http_git_source() {
+        let toml = r#"
+[package]
+name = "bad"
+version = "0.1.0"
+
+[dependencies.modules]
+x = { git = "http://example.com/x", tag = "v1.0.0" }
+"#;
+
+        let err = Manifest::from_str(toml).unwrap_err();
+        assert!(err.to_string().contains("insecure HTTP"));
+    }
+
+    #[test]
     fn to_toml_string_emits_stable_sorted_dependencies() {
         let manifest = Manifest {
             package: Package {
@@ -536,6 +553,21 @@ x = { git = "https://example.com/x", tag = "v1.0.0", bin = "   " }
 
         let err = Manifest::from_str(toml).unwrap_err();
         assert!(err.to_string().contains("bin cannot be empty"));
+    }
+
+    #[test]
+    fn reject_plugin_dependency_with_insecure_http_git_source() {
+        let toml = r#"
+[package]
+name = "bad"
+version = "0.1.0"
+
+[dependencies.plugins]
+x = { git = "http://example.com/x", tag = "v1.0.0", bin = "x" }
+"#;
+
+        let err = Manifest::from_str(toml).unwrap_err();
+        assert!(err.to_string().contains("insecure HTTP"));
     }
 
     #[test]

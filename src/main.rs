@@ -953,6 +953,7 @@ fn normalize_dependency_source(input: &str, provider_base_url: Option<&str>) -> 
     }
 
     if is_git_url(trimmed) {
+        safety::validate_secure_git_source(trimmed, "dependency source")?;
         return Ok(trimmed.to_string());
     }
 
@@ -962,7 +963,9 @@ fn normalize_dependency_source(input: &str, provider_base_url: Option<&str>) -> 
                 "a default git provider is required for owner/repo shorthand".to_string(),
             )
         })?;
-        return Ok(format!("{provider_base}/{trimmed}"));
+        let expanded = format!("{provider_base}/{trimmed}");
+        safety::validate_secure_git_source(&expanded, "dependency source")?;
+        return Ok(expanded);
     }
 
     Err(error::QuiverError::Other(format!(
@@ -1118,6 +1121,12 @@ mod tests {
     }
 
     #[test]
+    fn normalize_dependency_source_rejects_insecure_http_url() {
+        let err = normalize_dependency_source("http://example.com/team/repo", None).unwrap_err();
+        assert!(err.to_string().contains("insecure HTTP"));
+    }
+
+    #[test]
     fn normalize_dependency_source_expands_repo_shorthand() {
         let config = config_with_provider("github");
         let provider = config.default_git_provider_base_url().unwrap();
@@ -1145,6 +1154,13 @@ mod tests {
     fn normalize_dependency_source_requires_provider_for_shorthand() {
         let err = normalize_dependency_source("owner/repo", None).unwrap_err();
         assert!(err.to_string().contains("default git provider"));
+    }
+
+    #[test]
+    fn normalize_dependency_source_rejects_insecure_provider_url() {
+        let err =
+            normalize_dependency_source("owner/repo", Some("http://example.com")).unwrap_err();
+        assert!(err.to_string().contains("insecure HTTP"));
     }
 
     #[test]

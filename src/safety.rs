@@ -56,6 +56,30 @@ pub fn validate_binary_name(name: &str, context: &str) -> Result<()> {
     Ok(())
 }
 
+pub fn validate_secure_git_source(source: &str, context: &str) -> Result<()> {
+    let trimmed = source.trim();
+    if trimmed.is_empty() {
+        return Err(QuiverError::Manifest(format!("{context} cannot be empty")));
+    }
+
+    if trimmed.starts_with("http://") {
+        return Err(QuiverError::Manifest(format!(
+            "{context} '{source}' uses insecure HTTP; use HTTPS or SSH (git@...)"
+        )));
+    }
+
+    if trimmed.starts_with("https://")
+        || trimmed.starts_with("git@")
+        || trimmed.starts_with("ssh://")
+    {
+        return Ok(());
+    }
+
+    Err(QuiverError::Manifest(format!(
+        "{context} '{source}' must use HTTPS or SSH (git@...)"
+    )))
+}
+
 pub fn normalized_relative_path(path: &Path) -> Option<PathBuf> {
     let mut normalized = PathBuf::new();
     for component in path.components() {
@@ -85,6 +109,19 @@ mod tests {
         assert!(validate_dependency_name("nu-utils", "dependency").is_ok());
         assert!(validate_dependency_name("nu_plugin_query", "dependency").is_ok());
         assert!(validate_dependency_name("nu.plugin", "dependency").is_ok());
+    }
+
+    #[test]
+    fn secure_git_source_allows_https_and_ssh() {
+        assert!(validate_secure_git_source("https://github.com/org/repo", "git").is_ok());
+        assert!(validate_secure_git_source("git@github.com:org/repo.git", "git").is_ok());
+        assert!(validate_secure_git_source("ssh://git@github.com/org/repo.git", "git").is_ok());
+    }
+
+    #[test]
+    fn secure_git_source_rejects_http_and_unknown_schemes() {
+        assert!(validate_secure_git_source("http://github.com/org/repo", "git").is_err());
+        assert!(validate_secure_git_source("git://github.com/org/repo", "git").is_err());
     }
 
     #[test]
