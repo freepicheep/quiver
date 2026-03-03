@@ -266,9 +266,31 @@ pub fn latest_tag(repo_path: &Path) -> Result<Option<String>> {
         return Ok(None);
     }
 
-    // Sort tags — simple lexicographic on the numeric parts works for semver
+    let mut semver_tags: Vec<(semver::Version, String)> = tags
+        .iter()
+        .filter_map(|tag| parse_semver_tag(tag).map(|version| (version, tag.clone())))
+        .collect();
+
+    if !semver_tags.is_empty() {
+        semver_tags.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        return Ok(semver_tags.last().map(|(_, tag)| tag.clone()));
+    }
+
+    // Fall back to lexicographic ordering for non-semver tags.
     tags.sort();
     Ok(tags.last().cloned())
+}
+
+fn parse_semver_tag(tag: &str) -> Option<semver::Version> {
+    let trimmed = tag.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let normalized = trimmed
+        .strip_prefix('v')
+        .or_else(|| trimmed.strip_prefix('V'))
+        .unwrap_or(trimmed);
+    semver::Version::parse(normalized).ok()
 }
 
 /// Extract a package name from a git URL.
@@ -300,6 +322,7 @@ pub fn default_branch(repo_path: &Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use git2::{IndexAddOption, Signature};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_repo_dir(label: &str) -> PathBuf {
@@ -347,6 +370,57 @@ mod tests {
             .unwrap();
 
         assert!(ensure_origin_matches(&repo, "https://github.com/example/other").is_err());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn init_repo_with_commit(label: &str) -> (PathBuf, Repository) {
+        let dir = temp_repo_dir(label);
+        let repo = Repository::init(&dir).unwrap();
+        std::fs::write(dir.join("README.md"), "test").unwrap();
+
+        let mut index = repo.index().unwrap();
+        index
+            .add_all(["*"], IndexAddOption::DEFAULT, None)
+            .unwrap();
+        index.write().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let sig = Signature::now("Quiver Tests", "tests@quiver.local").unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "initial", &tree, &[])
+            .unwrap();
+        drop(tree);
+
+        (dir, repo)
+    }
+
+    fn create_tag(repo: &Repository, name: &str) {
+        let head_commit = repo.head().unwrap().peel_to_commit().unwrap();
+        repo.tag_lightweight(name, head_commit.as_object(), false)
+            .unwrap();
+    }
+
+    #[test]
+    fn latest_tag_uses_semver_order_instead_of_lexicographic_order() {
+        let (dir, repo) = init_repo_with_commit("latest_tag_semver_order");
+        create_tag(&repo, "v0.9.0");
+        create_tag(&repo, "v0.10.0");
+        create_tag(&repo, "v0.11.0");
+
+        let latest = latest_tag(&dir).unwrap();
+        assert_eq!(latest.as_deref(), Some("v0.11.0"));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn latest_tag_falls_back_for_non_semver_tags() {
+        let (dir, repo) = init_repo_with_commit("latest_tag_non_semver");
+        create_tag(&repo, "alpha");
+        create_tag(&repo, "beta");
+
+        let latest = latest_tag(&dir).unwrap();
+        assert_eq!(latest.as_deref(), Some("beta"));
+
         let _ = std::fs::remove_dir_all(dir);
     }
 }
