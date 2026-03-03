@@ -259,7 +259,7 @@ fn cmd_add(
     ui::success(format!("Added module '{pkg_name}' to nupackage.toml"));
 
     // Run install
-    installer::install(dir, false, false, false)
+    installer::install_with_options(dir, false, false, false, false)
 }
 
 fn cmd_add_plugin(
@@ -303,7 +303,7 @@ fn cmd_add_plugin(
         ui::success(format!(
             "Added core plugin '{core_plugin_name}' to nupackage.toml"
         ));
-        return installer::install(dir, false, false, false);
+        return installer::install_with_options(dir, false, false, false, true);
     }
 
     let provider_base = if is_git_url(url.trim()) {
@@ -381,7 +381,7 @@ fn cmd_add_plugin(
     std::fs::write(dir.join("nupackage.toml"), content)?;
     ui::success(format!("Added plugin '{pkg_name}' to nupackage.toml"));
 
-    installer::install(dir, false, false, false)
+    installer::install_with_options(dir, false, false, false, true)
 }
 
 fn cmd_add_global(
@@ -492,7 +492,7 @@ fn cmd_remove(dir: &Path, name: String) -> Result<()> {
 
     // Regenerate activate.nu from the updated manifest and lockfile state.
     eprintln!("Regenerating activate.nu...");
-    installer::install(dir, false, false, false)?;
+    installer::install_with_options(dir, false, false, false, false)?;
 
     Ok(())
 }
@@ -552,7 +552,7 @@ fn cmd_run(cwd: &Path, command: Vec<String>) -> Result<()> {
     let config_path = cwd.join(".nu-env").join("config.nu");
     if !config_path.exists() {
         eprintln!("No .nu-env found; running install first...");
-        installer::install(cwd, false, false, false)?;
+        installer::install_with_options(cwd, false, false, false, false)?;
     }
 
     if !config_path.exists() {

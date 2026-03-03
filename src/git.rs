@@ -1,4 +1,6 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 use git2::{FetchOptions, Progress, RemoteCallbacks, Repository, build::RepoBuilder};
 use indicatif::ProgressBar;
@@ -7,6 +9,8 @@ use sha2::{Digest, Sha256};
 use crate::config;
 use crate::error::{QuiverError, Result};
 use crate::ui;
+
+static FETCHED_THIS_RUN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 
 /// Returns the global install directory for git repos:
 /// `~/.local/share/quiver/installs/git/` on macOS/Linux.
@@ -25,6 +29,25 @@ fn normalize_git_url(url: &str) -> String {
         .trim_end_matches('/')
         .trim_end_matches(".git")
         .to_string()
+}
+
+fn fetched_this_run() -> &'static Mutex<HashSet<String>> {
+    FETCHED_THIS_RUN.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn was_fetched_this_run(url: &str) -> bool {
+    let normalized = normalize_git_url(url);
+    fetched_this_run()
+        .lock()
+        .ok()
+        .is_some_and(|set| set.contains(&normalized))
+}
+
+fn mark_fetched_this_run(url: &str) {
+    let normalized = normalize_git_url(url);
+    if let Ok(mut set) = fetched_this_run().lock() {
+        set.insert(normalized);
+    }
 }
 
 fn ensure_origin_matches(repo: &Repository, expected_url: &str) -> Result<()> {
@@ -51,6 +74,10 @@ pub fn clone_or_fetch(url: &str) -> Result<PathBuf> {
     let repo_label = repo_name_from_url(url).unwrap_or_else(|| url.to_string());
 
     if repo_dir.exists() {
+        if was_fetched_this_run(url) {
+            return Ok(repo_dir);
+        }
+
         ui::info(format!(
             "{} cached repository {}",
             ui::keyword("Updating"),
@@ -71,6 +98,7 @@ pub fn clone_or_fetch(url: &str) -> Result<PathBuf> {
             ui::keyword("Updated"),
             repo_label
         ));
+        mark_fetched_this_run(url);
         Ok(repo_dir)
     } else {
         ui::info(format!(
@@ -93,6 +121,7 @@ pub fn clone_or_fetch(url: &str) -> Result<PathBuf> {
             ui::keyword("Cloned"),
             repo_label
         ));
+        mark_fetched_this_run(url);
 
         Ok(repo_dir)
     }

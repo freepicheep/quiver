@@ -62,6 +62,22 @@ pub fn install(
     allow_unsigned: bool,
     no_build_fallback: bool,
 ) -> Result<()> {
+    install_with_options(
+        project_dir,
+        frozen,
+        allow_unsigned,
+        no_build_fallback,
+        true,
+    )
+}
+
+pub fn install_with_options(
+    project_dir: &Path,
+    frozen: bool,
+    allow_unsigned: bool,
+    no_build_fallback: bool,
+    print_plugin_registration_hints: bool,
+) -> Result<()> {
     let manifest = Manifest::from_dir(project_dir)?;
     let global_config = GlobalConfig::load_or_default()?;
     let install_mode = global_config.install_mode;
@@ -155,6 +171,7 @@ pub fn install(
         frozen,
         frozen_lockfile.as_ref(),
         security_policy,
+        print_plugin_registration_hints,
     )
 }
 
@@ -165,7 +182,7 @@ pub fn update(project_dir: &Path) -> Result<()> {
     if lock_path.exists() {
         std::fs::remove_file(&lock_path)?;
     }
-    install(project_dir, false, false, false)
+    install_with_options(project_dir, false, false, false, false)
 }
 
 /// Run a global install: resolve from `~/.config/quiver/config.toml` and install
@@ -309,6 +326,7 @@ fn install_resolved(
     frozen: bool,
     frozen_lockfile: Option<&Lockfile>,
     security_policy: SecurityPolicy,
+    print_plugin_registration_hints: bool,
 ) -> Result<()> {
     std::fs::create_dir_all(modules_dir)?;
     std::fs::create_dir_all(bin_dir)?;
@@ -468,7 +486,9 @@ fn install_resolved(
     write_config_nu(nu_env_dir, modules_dir)?;
     create_nu_symlink_with_policy(nu_env_dir, nu_version_req, security_policy)?;
     write_activate_overlay(nu_env_dir, project_dir)?;
-    print_plugin_registration_instructions(plugins);
+    if print_plugin_registration_hints {
+        print_plugin_registration_instructions(plugins);
+    }
 
     Ok(())
 }
