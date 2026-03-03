@@ -62,13 +62,7 @@ pub fn install(
     allow_unsigned: bool,
     no_build_fallback: bool,
 ) -> Result<()> {
-    install_with_options(
-        project_dir,
-        frozen,
-        allow_unsigned,
-        no_build_fallback,
-        true,
-    )
+    install_with_options(project_dir, frozen, allow_unsigned, no_build_fallback, true)
 }
 
 pub fn install_with_options(
