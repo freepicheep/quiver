@@ -85,7 +85,6 @@ pub fn install_with_options(
     let nu_env_dir = project_dir.join(NU_ENV_DIR);
     let modules_dir = nu_env_dir.join(MODULES_SUBDIR);
     let bin_dir = nu_env_dir.join(BIN_SUBDIR);
-    let display_name = format!("{NU_ENV_DIR}/{MODULES_SUBDIR}");
 
     let has_no_dependencies = manifest.dependencies.is_empty();
     if has_no_dependencies {
@@ -116,7 +115,7 @@ pub fn install_with_options(
                 resolver::resolve_plugins_from_lock(&lockfile.packages),
             )
         }
-    } else if lock_path.exists() {
+    } else if !has_no_dependencies && lock_path.exists() {
         let lockfile = Lockfile::from_path(&lock_path)?;
 
         if !local_lockfile_is_stale(&manifest, &lockfile) {
@@ -126,29 +125,37 @@ pub fn install_with_options(
                 resolver::resolve_plugins_from_lock(&lockfile.packages),
             )
         } else {
-            if !manifest.dependencies.modules.is_empty() {
+            let resolved_modules = if manifest.dependencies.modules.is_empty() {
+                Vec::new()
+            } else {
                 ui::info(format!("{} module dependencies", ui::keyword("Resolving")));
-            }
-            if !manifest.dependencies.plugins.is_empty() {
+                resolver::resolve_modules_from_deps(&manifest.dependencies.modules)?
+            };
+            let resolved_plugins = if manifest.dependencies.plugins.is_empty() {
+                Vec::new()
+            } else {
                 ui::info(format!("{} plugin dependencies", ui::keyword("Resolving")));
-            }
-            (
-                resolver::resolve_modules_from_deps(&manifest.dependencies.modules)?,
-                resolver::resolve_plugins_from_deps(&manifest.dependencies.plugins)?,
-            )
+                resolver::resolve_plugins_from_deps(&manifest.dependencies.plugins)?
+            };
+            (resolved_modules, resolved_plugins)
         }
     } else if manifest.dependencies.modules.is_empty() && manifest.dependencies.plugins.is_empty() {
         (Vec::new(), Vec::new())
     } else {
         // No lockfile yet: resolve from manifest.
-        ui::info(format!("{} module dependencies", ui::keyword("Resolving")));
-        if !manifest.dependencies.plugins.is_empty() {
+        let resolved_modules = if manifest.dependencies.modules.is_empty() {
+            Vec::new()
+        } else {
+            ui::info(format!("{} module dependencies", ui::keyword("Resolving")));
+            resolver::resolve_modules_from_deps(&manifest.dependencies.modules)?
+        };
+        let resolved_plugins = if manifest.dependencies.plugins.is_empty() {
+            Vec::new()
+        } else {
             ui::info(format!("{} plugin dependencies", ui::keyword("Resolving")));
-        }
-        (
-            resolver::resolve_modules_from_deps(&manifest.dependencies.modules)?,
-            resolver::resolve_plugins_from_deps(&manifest.dependencies.plugins)?,
-        )
+            resolver::resolve_plugins_from_deps(&manifest.dependencies.plugins)?
+        };
+        (resolved_modules, resolved_plugins)
     };
 
     // Install each dependency
@@ -160,7 +167,6 @@ pub fn install_with_options(
         &lock_path,
         &nu_env_dir,
         manifest.package.nu_version.as_deref(),
-        &display_name,
         install_mode,
         frozen,
         frozen_lockfile.as_ref(),
@@ -315,7 +321,6 @@ fn install_resolved(
     lock_path: &Path,
     nu_env_dir: &Path,
     nu_version_req: Option<&str>,
-    display_name: &str,
     install_mode: InstallMode,
     frozen: bool,
     frozen_lockfile: Option<&Lockfile>,
@@ -468,11 +473,22 @@ fn install_resolved(
 
     let module_count = modules.len();
     let plugin_count = plugins.len();
-    let module_suffix = if module_count == 1 { "" } else { "s" };
-    let plugin_suffix = if plugin_count == 1 { "" } else { "s" };
-    ui::success(format!(
-        "Installed {module_count} module{module_suffix} and {plugin_count} plugin{plugin_suffix} into {display_name}/"
-    ));
+    let mut summary_parts = Vec::new();
+    if module_count > 0 {
+        let module_suffix = if module_count == 1 { "" } else { "s" };
+        summary_parts.push(format!(
+            "Installed {module_count} module{module_suffix} into {NU_ENV_DIR}/{MODULES_SUBDIR}/"
+        ));
+    }
+    if plugin_count > 0 {
+        let plugin_suffix = if plugin_count == 1 { "" } else { "s" };
+        summary_parts.push(format!(
+            "Linked {plugin_count} plugin{plugin_suffix} into {NU_ENV_DIR}/{BIN_SUBDIR}/"
+        ));
+    }
+    if !summary_parts.is_empty() {
+        ui::success(summary_parts.join(" and "));
+    }
 
     // Derive project_dir from nu_env_dir (parent of .nu-env)
     let project_dir = nu_env_dir.parent().unwrap_or(nu_env_dir);
