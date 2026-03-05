@@ -179,7 +179,7 @@ Plugin dependencies support either:
 | `qv install -g` | Install global dependencies from `~/.config/quiver/config.toml` |
 | `qv install --frozen` | Install from lockfile only (CI-friendly) |
 | `qv update` | Re-resolve all dependencies |
-| `qv run <command...>` | Run a command in the current project using `.nu-env` (injects `--config` for `nu`) |
+| `qv run <command...>` | Run a command in the current project using `.nu-env` (injects `--config` and `--plugin-config` for `nu`) |
 | `qv remove <name>` / `qv rm <name>` | Remove a project dependency (module or plugin) |
 | `qv list` / `qv ls` | List installed dependencies (project modules/plugins or global modules) |
 | `qv lsp` | Generate editor-specific LSP configuration (interactive picker) |

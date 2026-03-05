@@ -1,5 +1,8 @@
 # Unreleased
 
+## Fixed
+- `qv run` properly sets the `--plugin-config` when running `nu`.
+
 # Version 0.3.2 (2026-03-05)
 
 ## Improved
