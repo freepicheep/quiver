@@ -373,12 +373,6 @@ fn install_resolved(
         if let Some(bin) = plugin.bin.as_deref() {
             safety::validate_binary_name(bin, "plugin dependency bin")?;
         }
-        ui::info(format!(
-            "{} plugin {}@{}",
-            ui::keyword("Installing"),
-            plugin.name,
-            &plugin.rev[..12.min(plugin.rev.len())]
-        ));
         let frozen_locked_plugin = frozen_lockfile
             .and_then(|lock| lock.find_package(&plugin.name, LockedPackageKind::Plugin));
         let plugin_install = install_plugin(
@@ -390,6 +384,12 @@ fn install_resolved(
         let installed_bin = plugin_install.installed_bin;
         let bin_name = plugin_install.bin_name;
         let version_dir = plugin_install.version_dir;
+        ui::info(format!(
+            "{} plugin {}@{}",
+            ui::keyword("Installing"),
+            plugin.name,
+            plugin_install_display_ref(plugin, &version_dir)
+        ));
         link_plugin_into_env(&installed_bin, bin_dir, &bin_name)?;
         let sha256 = resolver::compute_checksum(&version_dir)?;
         if frozen {
@@ -2782,7 +2782,7 @@ fn local_lockfile_is_stale(manifest: &Manifest, lockfile: &Lockfile) -> bool {
         let Some(locked) = lockfile.find_package(name, LockedPackageKind::Plugin) else {
             return true;
         };
-        if !plugin_dep_matches_lock(name, spec, locked) {
+        if !plugin_dep_matches_lock(name, spec, locked, manifest.package.nu_version.as_deref()) {
             return true;
         }
     }
@@ -2826,10 +2826,14 @@ fn plugin_dep_matches_lock(
     name: &str,
     spec: &PluginDependencySpec,
     locked: &LockedPackage,
+    package_nu_version: Option<&str>,
 ) -> bool {
     let source = spec.source.as_deref().unwrap_or("git");
     if source == "nu-core" {
         if locked.git != "nu-core" {
+            return false;
+        }
+        if !nu_core_plugin_lock_matches_version(locked, package_nu_version) {
             return false;
         }
     } else if spec.git != locked.git {
@@ -2847,6 +2851,34 @@ fn plugin_dep_matches_lock(
 
     let expected_bin = spec.bin.as_deref().unwrap_or(name);
     locked.path.as_deref() == Some(expected_bin)
+}
+
+fn nu_core_plugin_lock_matches_version(
+    locked: &LockedPackage,
+    package_nu_version: Option<&str>,
+) -> bool {
+    let Some(nu_version) = package_nu_version.and_then(exact_nu_version_from_requirement) else {
+        return true;
+    };
+    locked.rev == format!("nu-{nu_version}")
+}
+
+fn exact_nu_version_from_requirement(requirement: &str) -> Option<Version> {
+    let trimmed = requirement.trim();
+    Version::parse(trimmed).ok().or_else(|| {
+        trimmed
+            .strip_prefix('=')
+            .and_then(|version| Version::parse(version).ok())
+    })
+}
+
+fn plugin_install_display_ref(plugin: &ResolvedPlugin, version_dir: &Path) -> String {
+    version_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| plugin.rev[..12.min(plugin.rev.len())].to_string())
 }
 
 /// Check if the global lockfile is stale relative to the global config.
@@ -3175,6 +3207,99 @@ sha256 = "ddd"
         .unwrap();
 
         assert!(local_lockfile_is_stale(&manifest, &lockfile));
+    }
+
+    #[test]
+    fn local_lockfile_staleness_detects_changed_exact_nu_version_for_core_plugin() {
+        let manifest = Manifest::from_str(
+            r#"[package]
+name = "demo"
+version = "0.1.0"
+nu-version = "0.110.0"
+
+[dependencies.plugins]
+nu_plugin_polars = { source = "nu-core", bin = "nu_plugin_polars" }
+"#,
+        )
+        .unwrap();
+        let lockfile = Lockfile::from_str(
+            r#"version = 1
+
+[[package]]
+name = "nu_plugin_polars"
+kind = "plugin"
+git = "nu-core"
+rev = "nu-0.111.0"
+path = "nu_plugin_polars"
+sha256 = "ddd"
+"#,
+        )
+        .unwrap();
+
+        assert!(local_lockfile_is_stale(&manifest, &lockfile));
+    }
+
+    #[test]
+    fn local_lockfile_staleness_keeps_range_nu_version_for_core_plugin() {
+        let manifest = Manifest::from_str(
+            r#"[package]
+name = "demo"
+version = "0.1.0"
+nu-version = ">=0.110.0, <0.112.0"
+
+[dependencies.plugins]
+nu_plugin_polars = { source = "nu-core", bin = "nu_plugin_polars" }
+"#,
+        )
+        .unwrap();
+        let lockfile = Lockfile::from_str(
+            r#"version = 1
+
+[[package]]
+name = "nu_plugin_polars"
+kind = "plugin"
+git = "nu-core"
+rev = "nu-0.111.0"
+path = "nu_plugin_polars"
+sha256 = "ddd"
+"#,
+        )
+        .unwrap();
+
+        assert!(!local_lockfile_is_stale(&manifest, &lockfile));
+    }
+
+    #[test]
+    fn plugin_install_display_ref_prefers_version_dir_name() {
+        let plugin = ResolvedPlugin {
+            name: "nu_plugin_polars".to_string(),
+            git: "nu-core".to_string(),
+            tag: None,
+            rev: "nu-0.111.0".to_string(),
+            bin: Some("nu_plugin_polars".to_string()),
+        };
+
+        let display_ref = plugin_install_display_ref(
+            &plugin,
+            Path::new("/tmp/quiver/plugins/nu_plugin_polars/nu-0.110.0"),
+        );
+
+        assert_eq!(display_ref, "nu-0.110.0");
+    }
+
+    #[test]
+    fn plugin_install_display_ref_falls_back_to_short_rev() {
+        let plugin = ResolvedPlugin {
+            name: "nu_plugin_inc".to_string(),
+            git: "https://github.com/nushell/nu_plugin_inc".to_string(),
+            tag: Some("v0.91.0".to_string()),
+            rev: "1234567890abcdef".to_string(),
+            bin: Some("nu_plugin_inc".to_string()),
+        };
+
+        let display_ref = plugin_install_display_ref(&plugin, Path::new("/"));
+
+        assert_eq!(display_ref, "1234567890ab");
     }
 
     #[test]
