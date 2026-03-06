@@ -31,7 +31,7 @@ Quiver is alpha software. I release breaking changes ~~frequently~~ occasionally
 
 ### Build from source via Cargo
 
-```bash
+```nushell
 cargo install --git https://github.com/freepicheep/quiver
 ```
 
@@ -60,7 +60,7 @@ Quiver will store plugins, modules, and Nu versions in `/Users/<username>/.local
 
 ## Quick Start
 
-```bash
+```nushell
 # Initialize a new project
 qv init
 
@@ -111,7 +111,7 @@ Using `qv run` is the easiest way to run any script in your environment. If you 
 
 You can also activate the virtual environment with an overlay:
 
-```nu
+```nushell
 overlay use .nu-env/activate.nu
 ```
 
@@ -123,7 +123,7 @@ When you're done, run `exit` to leave the sub shell and `deactivate` (or `overla
 
 If you want quiver projects to automatically update `$env.NU_LIB_DIRS` when you `cd` into their directory (and clean up when you leave), run:
 
-```nu
+```nushell
 mkdir ($nu.default-config-dir | path join "vendor" "autoload")
 qv hook | save -f ($nu.default-config-dir | path join "vendor" "autoload" "quiver_hook.nu")
 ```
@@ -136,7 +136,7 @@ You only need to run this once. Re-run it after updating quiver to pick up any c
 
 Generate per-project LSP configuration so your editor's Nushell language server knows about your installed modules:
 
-```bash
+```nushell
 # Interactive picker — select which editors to configure
 qv lsp
 
@@ -227,7 +227,7 @@ Use `qv install --no-build-fallback` to disable source-build fallback.
 
 After Quiver installs a plugin, make sure you enable it by running the version of nu for the package you are working in.
 
-```nu
+```nushell
 overlay use .nu-env/activate.nu # activates the env for this project
 nu # runs the alias for the project's nu version with the modules and plugins properly pointed
 plugin add <nu_plugin_name>
@@ -248,7 +248,7 @@ Quiver verifies SHA-256 checksums for downloaded release artifacts (Nushell arch
 
 For CI, use:
 
-```bash
+```nushell
 qv install --frozen --no-build-fallback
 ```
 
