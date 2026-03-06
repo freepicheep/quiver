@@ -14,7 +14,7 @@ Quiver handles dependency resolution, fetching, and lockfile management for Nush
 
 ## Install
 
-Quiver is pre-alpha. I release breaking changes frequently. Most of the code is written with Codex 5.3. I release build for the following platforms and have confirmed quiver works great on macOS silicon and ARM64 Linux (thanks Asahi devs).
+Quiver is alpha software. I release breaking changes ~~frequently~~ occasionally. Most of the code is written with Codex 5.3. I release build for the following platforms and have confirmed quiver works great on macOS silicon and ARM64 Linux (thanks Asahi devs).
 
 ![Apple Silicon macOS](https://img.shields.io/badge/macOS%20Apple%20Silicon-000000?logo=apple&logoColor=white)
 ![Intel macOS](https://img.shields.io/badge/macOS%20Intel-000000?logo=apple&logoColor=white)
@@ -35,55 +35,9 @@ Quiver is pre-alpha. I release breaking changes frequently. Most of the code is 
 cargo install --git https://github.com/freepicheep/quiver
 ```
 
-## Quick Start
-
-```bash
-# Initialize a new module project
-qv init
-
-# Or pin the Nushell version requirement up front
-qv init --nu-version ">=0.109,<0.111"
-
-# Add a dependency
-qv add https://github.com/user/nu-some-module
-
-# Or use owner/repo shorthand (defaults to github)
-qv add user/nu-some-module
-
-# Add a plugin dependency
-qv add-plugin nushell/nu_plugin_inc --tag v0.91.0 --bin nu_plugin_inc
-
-# Add a Nushell core plugin dependency by alias/name
-qv add-plugin polars
-
-# Install all dependencies from nupackage.toml
-qv install
-
-# Run a Nushell script with quiver's environment
-qv run script.nu
-
-# Activate the virtual environment
-overlay use .nu-env/activate.nu
-
-# Install all global dependencies from ~/.config/quiver/config.toml
-qv install -g
-
-# Re-resolve everything (ignore lockfile)
-qv update
-
-# Remove a dependency
-qv remove nu-some-module
-
-# List installed dependencies (project-local if nupackage.toml exists, otherwise global)
-qv list
-
-# Generate editor LSP configuration
-qv lsp
-```
-
 ## How It Works
 
-A quiver project is a directory containing:
+A Quiver project is a directory containing:
 
 - **`nupackage.toml`** - declares package metadata and dependencies
 - **`<project-dir-name>/mod.nu`** - the Nushell module entry point
@@ -97,14 +51,65 @@ Running `qv install` (or `qv init`) sets up a `.nu-env/` virtual environment:
 ├── config.nu          # sets NU_LIB_DIRS/NU_PLUGIN_DIRS and exports a `nu` alias
 ├── plugins.msgpackz   # plugin registry/config used by nushell
 ├── bin/
-│   ├── nu             # symlink to your system nu binary (or managed nu)
+│   ├── nu             # symlink to quiver's stored nu binary for the project's version
 │   └── ...            # plugin binaries linked for project activation
 └── modules/           # installed module dependencies
 ```
 
+Quiver will store plugins, modules, and Nu versions in `/Users/<username>/.local/share/quiver/installs`. Any projects that reuse the same tools will have a blazingly fast installation time since the dependencies are cached.
+
+## Quick Start
+
+```bash
+# Initialize a new project
+qv init
+
+# Or pin the Nushell version requirement up front
+qv init --nu-version ">=0.109,<0.111"
+
+# Add a dependency
+qv add https://github.com/freepicheep/nu-salesforce
+
+# Or use owner/repo shorthand (git provider defaults to github)
+qv add freepicheep/nu-salesforce
+
+# Add a plugin dependency
+qv add-plugin fdncred/nu_plugin_file --tag v0.22.0 --bin nu_plugin_file
+
+# Add a Nushell core plugin dependency by alias/name
+qv add-plugin polars
+
+# Install all dependencies from nupackage.toml
+qv install
+
+# Run a Nushell script with quiver's environment (including any plugins)
+qv run script.nu
+
+# Activate the environment and run nu with everything loaded
+overlay use .nu-env/activate.nu
+nu
+
+# Install all global dependencies from ~/.config/quiver/config.toml (this is still being worked on)
+qv install -g
+
+# Re-resolve everything (ignore lockfile)
+qv update
+
+# Remove a dependency
+qv remove nu-salesforce
+
+# List installed dependencies (project-local if nupackage.toml exists, otherwise global)
+qv list
+
+# Generate editor LSP configuration (for helix and zed currently)
+qv lsp
+```
+
 ## Activation
 
-Activate the virtual environment with an overlay:
+Using `qv run` is the easiest way to run any script in your environment. If you want to enter your package's environment through a sub shell, you can run `qv run nu` to enter the Nushell REPL for the project's installed version of Nushell with all your dependencies available. 
+
+You can also activate the virtual environment with an overlay:
 
 ```nu
 overlay use .nu-env/activate.nu
@@ -112,9 +117,7 @@ overlay use .nu-env/activate.nu
 
 This exports a `nu` alias that runs with `--config .nu-env/config.nu --plugin-config .nu-env/plugins.msgpackz`, so launching `nu` from the activated shell automatically includes both module and plugin paths for the project.
 
-When you're done, run `deactivate` (or `overlay hide activate`) to unload the overlay.
-
-You can also run project scripts directly with `qv run script.nu` (or `qv run nu script.nu`) to execute under the project config.
+When you're done, run `exit` to leave the sub shell and `deactivate` (or `overlay hide activate`) to unload the overlay.
 
 ### Auto-activation Hook
 
@@ -218,7 +221,7 @@ You can also set a custom host like `git.example.com` or a full `https://...` ba
 
 For plugin dependencies, Quiver installs in this order:
 1. GitHub releases artifact matching current platform/arch (preferred).
-2. Cargo build fallback from source if no usable release artifact is available.
+2. Cargo build fallback from source if no usable release artifact is available (asks before running).
 
 Use `qv install --no-build-fallback` to disable source-build fallback.
 
@@ -251,7 +254,7 @@ qv install --frozen --no-build-fallback
 
 ## Disclaimer
 
-I have not verified the security of all the code yet and I am not responsible for any grief or loss quiver may cause to you or your company.
+I have not verified the security of all the code yet and I am not responsible for any grief or loss Quiver may cause to you or your company.
 
 ## License
 
