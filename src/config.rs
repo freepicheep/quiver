@@ -204,6 +204,10 @@ pub fn global_lock_path() -> Result<PathBuf> {
 /// Uses `~/.local/share/quiver/installs/` on macOS/Linux and
 /// `%APPDATA%/quiver/installs/` on Windows.
 pub fn installs_root_dir() -> Result<PathBuf> {
+    if let Some(override_dir) = std::env::var_os("QUIVER_INSTALLS_ROOT") {
+        return Ok(PathBuf::from(override_dir));
+    }
+
     #[cfg(windows)]
     {
         let data = dirs::data_dir()

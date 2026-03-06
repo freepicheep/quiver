@@ -7,6 +7,10 @@
 ## Fixed
 - `qv run` properly sets the `--plugin-config` when running `nu`.
 
+## Changed
+
+- Quiver will always download the version of nu specified for a project, even if that version matches your current global installation in PATH. Why? Because if we symlink to your version in PATH at Nu 0.110.0, and you update to Nu 0.111.0, the symlink in your project's `.nu-env/bin/` will now be at 0.111.0 while your project is still at 0.110.0.
+
 # Version 0.3.2 (2026-03-05)
 
 ## Improved

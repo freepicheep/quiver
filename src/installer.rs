@@ -642,8 +642,9 @@ export alias nu = ^{nu_bin_literal} --config {config_literal} --plugin-config {p
 /// Create a symlink at `.nu-env/bin/nu` pointing to a matching `nu` binary.
 ///
 /// Resolution order:
-/// 1. `nu` in PATH (if present and matches `nu-version` when provided)
+/// 1. The active `nu` version from PATH, materialized into quiver's store
 /// 2. `~/.local/share/quiver/installs/nu_versions/<version>/` store
+/// 3. A matching GitHub release installed into quiver's store
 pub fn create_nu_symlink(nu_env_dir: &Path, nu_version_req: Option<&str>) -> Result<()> {
     create_nu_symlink_with_policy(
         nu_env_dir,
@@ -709,33 +710,50 @@ fn resolve_nu_binary(
     requirement: Option<&VersionReq>,
     security_policy: SecurityPolicy,
 ) -> Result<Option<PathBuf>> {
-    if let Some(nu_path) = detect_nu_path() {
-        if let Some(req) = requirement {
-            if detect_nu_binary_version(&nu_path).is_some_and(|v| req.matches(&v)) {
-                return Ok(Some(nu_path));
-            }
-        } else {
-            return Ok(Some(nu_path));
+    let current_nu_version = detect_nu_path()
+        .as_deref()
+        .and_then(detect_nu_binary_version);
+    let candidates = discover_installed_nu_binaries()?;
+
+    match resolve_nu_store_candidate(requirement, current_nu_version.as_ref(), &candidates)? {
+        Some(NuBinaryResolution::Installed(path)) => Ok(Some(path)),
+        Some(NuBinaryResolution::Install(version)) => {
+            let path = install_nu_version_from_github_release(&version, security_policy)?;
+            Ok(Some(path))
+        }
+        None => Ok(None),
+    }
+}
+
+#[derive(Debug, Clone)]
+enum NuBinaryResolution {
+    Installed(PathBuf),
+    Install(Version),
+}
+
+fn resolve_nu_store_candidate(
+    requirement: Option<&VersionReq>,
+    current_nu_version: Option<&Version>,
+    installed_candidates: &[NuBinaryCandidate],
+) -> Result<Option<NuBinaryResolution>> {
+    if let Some(current) = current_nu_version {
+        let matches_requirement = requirement.is_none_or(|req| req.matches(current));
+        if matches_requirement {
+            return Ok(Some(NuBinaryResolution::Install(current.clone())));
         }
     }
 
-    let mut candidates = discover_installed_nu_binaries()?;
-
-    if let Some(req) = requirement {
-        candidates.retain(|candidate| req.matches(&candidate.version));
-    }
-
-    if let Some(selected) = candidates
-        .into_iter()
+    if let Some(selected) = installed_candidates
+        .iter()
+        .filter(|candidate| requirement.is_none_or(|req| req.matches(&candidate.version)))
         .max_by(|a, b| a.version.cmp(&b.version))
     {
-        return Ok(Some(selected.path));
+        return Ok(Some(NuBinaryResolution::Installed(selected.path.clone())));
     }
 
     if let Some(req) = requirement {
         let target = select_nu_version_to_install(req)?;
-        let path = install_nu_version_from_github_release(&target, security_policy)?;
-        return Ok(Some(path));
+        return Ok(Some(NuBinaryResolution::Install(target)));
     }
 
     Ok(None)
@@ -2894,6 +2912,52 @@ mod tests {
         }
     }
 
+    struct EnvVarGuard {
+        key: &'static str,
+        original: Option<OsString>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &Path) -> Self {
+            let lock = crate::TEST_ENV_MUTEX
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let original = std::env::var_os(key);
+            // SAFETY: tests serialize environment mutation through TEST_ENV_MUTEX.
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self {
+                key,
+                original,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            // SAFETY: tests serialize environment mutation through TEST_ENV_MUTEX.
+            unsafe {
+                if let Some(value) = &self.original {
+                    std::env::set_var(self.key, value);
+                } else {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
+
+    fn seed_fake_nu_store(version: &str) -> (PathBuf, EnvVarGuard) {
+        let store_root = make_temp_dir("installs_root");
+        let guard = EnvVarGuard::set("QUIVER_INSTALLS_ROOT", &store_root);
+        let version_dir = store_root.join("nu_versions").join(version).join("bin");
+        std::fs::create_dir_all(&version_dir).unwrap();
+        std::fs::write(version_dir.join("nu"), "nu").unwrap();
+        (store_root, guard)
+    }
+
     fn write_test_tar_gz_with_symlink(path: &Path, entry_path: &str, link_target: &str) {
         let file = std::fs::File::create(path).unwrap();
         let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::default());
@@ -3116,6 +3180,10 @@ sha256 = "ddd"
     #[test]
     fn frozen_install_without_dependencies_writes_activate_overlay() {
         let project_dir = make_temp_dir("empty_manifest");
+        let store = detect_nu_path()
+            .as_deref()
+            .and_then(detect_nu_binary_version)
+            .map(|version| seed_fake_nu_store(&version.to_string()));
         std::fs::write(
             project_dir.join("nupackage.toml"),
             r#"[package]
@@ -3138,11 +3206,18 @@ version = "0.1.0"
         assert!(config_nu.contains(".nu-env/modules"));
 
         let _ = std::fs::remove_dir_all(project_dir);
+        if let Some((store_root, _guard)) = store {
+            let _ = std::fs::remove_dir_all(store_root);
+        }
     }
 
     #[test]
     fn install_without_dependencies_rewrites_lockfile_to_empty() {
         let project_dir = make_temp_dir("empty_manifest_rewrites_lock");
+        let store = detect_nu_path()
+            .as_deref()
+            .and_then(detect_nu_binary_version)
+            .map(|version| seed_fake_nu_store(&version.to_string()));
         std::fs::write(
             project_dir.join("nupackage.toml"),
             r#"[package]
@@ -3175,6 +3250,9 @@ sha256 = "aaa"
         assert!(lock.packages.is_empty());
 
         let _ = std::fs::remove_dir_all(project_dir);
+        if let Some((store_root, _guard)) = store {
+            let _ = std::fs::remove_dir_all(store_root);
+        }
     }
 
     #[test]
@@ -3256,50 +3334,118 @@ sha256 = "aaa"
     #[test]
     fn create_nu_symlink_creates_symlink() {
         let nu_env_dir = make_temp_dir("symlink_test");
+        let store_root = make_temp_dir("symlink_store");
+        let _installs_root = EnvVarGuard::set("QUIVER_INSTALLS_ROOT", &store_root);
+        let version_dir = store_root
+            .join("nu_versions")
+            .join("255.255.255")
+            .join("bin");
+        std::fs::create_dir_all(&version_dir).unwrap();
+        std::fs::write(version_dir.join("nu"), "nu").unwrap();
 
-        create_nu_symlink(&nu_env_dir, None).unwrap();
+        create_nu_symlink(&nu_env_dir, Some("=255.255.255")).unwrap();
 
         let symlink_path = nu_env_dir.join("bin").join("nu");
-        // If nu is available in PATH, symlink should exist
-        if symlink_path.exists() {
-            assert!(
-                symlink_path
-                    .symlink_metadata()
-                    .unwrap()
-                    .file_type()
-                    .is_symlink()
-            );
-            let target = std::fs::read_link(&symlink_path).unwrap();
-            assert!(target.to_string_lossy().contains("nu"));
-        }
-        // If nu is not in PATH, the function gracefully skips
+        assert!(symlink_path.exists());
+        assert!(
+            symlink_path
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        let target = std::fs::read_link(&symlink_path).unwrap();
+        assert_eq!(target, version_dir.join("nu"));
 
         let _ = std::fs::remove_dir_all(nu_env_dir);
+        let _ = std::fs::remove_dir_all(store_root);
     }
 
     #[test]
     fn create_nu_symlink_replaces_existing() {
         let nu_env_dir = make_temp_dir("symlink_replace");
+        let store_root = make_temp_dir("symlink_replace_store");
+        let _installs_root = EnvVarGuard::set("QUIVER_INSTALLS_ROOT", &store_root);
+        let version_dir = store_root
+            .join("nu_versions")
+            .join("255.255.255")
+            .join("bin");
+        std::fs::create_dir_all(&version_dir).unwrap();
+        std::fs::write(version_dir.join("nu"), "nu").unwrap();
         let bin_dir = nu_env_dir.join("bin");
         std::fs::create_dir_all(&bin_dir).unwrap();
         // Create a dummy file where the symlink would go
         std::fs::write(bin_dir.join("nu"), "dummy").unwrap();
 
-        create_nu_symlink(&nu_env_dir, None).unwrap();
+        create_nu_symlink(&nu_env_dir, Some("=255.255.255")).unwrap();
 
         let symlink_path = bin_dir.join("nu");
-        if symlink_path.exists() {
-            // Should have replaced the dummy file with a proper symlink
-            assert!(
-                symlink_path
-                    .symlink_metadata()
-                    .unwrap()
-                    .file_type()
-                    .is_symlink()
-            );
-        }
+        assert!(symlink_path.exists());
+        assert!(
+            symlink_path
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        let target = std::fs::read_link(&symlink_path).unwrap();
+        assert_eq!(target, version_dir.join("nu"));
 
         let _ = std::fs::remove_dir_all(nu_env_dir);
+        let _ = std::fs::remove_dir_all(store_root);
+    }
+
+    #[test]
+    fn resolve_nu_store_candidate_prefers_current_version_for_unpinned_projects() {
+        let installed = vec![NuBinaryCandidate {
+            path: PathBuf::from("/store/nu_versions/0.110.0/bin/nu"),
+            version: Version::parse("0.110.0").unwrap(),
+        }];
+        let current = Version::parse("0.109.0").unwrap();
+
+        let resolved = resolve_nu_store_candidate(None, Some(&current), &installed).unwrap();
+
+        match resolved {
+            Some(NuBinaryResolution::Install(version)) => assert_eq!(version, current),
+            other => panic!("expected current version to be materialized, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_nu_store_candidate_prefers_current_version_when_it_matches_requirement() {
+        let installed = vec![NuBinaryCandidate {
+            path: PathBuf::from("/store/nu_versions/0.110.0/bin/nu"),
+            version: Version::parse("0.110.0").unwrap(),
+        }];
+        let current = Version::parse("0.109.0").unwrap();
+        let requirement = VersionReq::parse(">=0.108.0, <0.111.0").unwrap();
+
+        let resolved =
+            resolve_nu_store_candidate(Some(&requirement), Some(&current), &installed).unwrap();
+
+        match resolved {
+            Some(NuBinaryResolution::Install(version)) => assert_eq!(version, current),
+            other => panic!("expected current matching version to be materialized, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_nu_store_candidate_uses_installed_store_when_current_version_mismatches() {
+        let installed_path = PathBuf::from("/store/nu_versions/0.110.0/bin/nu");
+        let installed = vec![NuBinaryCandidate {
+            path: installed_path.clone(),
+            version: Version::parse("0.110.0").unwrap(),
+        }];
+        let current = Version::parse("0.109.0").unwrap();
+        let requirement = VersionReq::parse("=0.110.0").unwrap();
+
+        let resolved =
+            resolve_nu_store_candidate(Some(&requirement), Some(&current), &installed).unwrap();
+
+        match resolved {
+            Some(NuBinaryResolution::Installed(path)) => assert_eq!(path, installed_path),
+            other => panic!("expected installed store version, got {other:?}"),
+        }
     }
 
     #[test]
@@ -3619,27 +3765,27 @@ nu_plugin_inc = { git = "https://github.com/nushell/nu_plugin_inc", tag = "v0.91
         let bin_dir = root.join(".nu-env").join("bin");
         let commands = plugin_registration_targets(
             &[
-            ResolvedPlugin {
-                name: "z_plugin".to_string(),
-                git: "nu-core".to_string(),
-                tag: None,
-                rev: "nu-core".to_string(),
-                bin: Some("nu_plugin_zeta".to_string()),
-            },
-            ResolvedPlugin {
-                name: "a_plugin".to_string(),
-                git: "nu-core".to_string(),
-                tag: None,
-                rev: "nu-core".to_string(),
-                bin: None,
-            },
-            ResolvedPlugin {
-                name: "duplicate".to_string(),
-                git: "nu-core".to_string(),
-                tag: None,
-                rev: "nu-core".to_string(),
-                bin: Some("nu_plugin_zeta".to_string()),
-            },
+                ResolvedPlugin {
+                    name: "z_plugin".to_string(),
+                    git: "nu-core".to_string(),
+                    tag: None,
+                    rev: "nu-core".to_string(),
+                    bin: Some("nu_plugin_zeta".to_string()),
+                },
+                ResolvedPlugin {
+                    name: "a_plugin".to_string(),
+                    git: "nu-core".to_string(),
+                    tag: None,
+                    rev: "nu-core".to_string(),
+                    bin: None,
+                },
+                ResolvedPlugin {
+                    name: "duplicate".to_string(),
+                    git: "nu-core".to_string(),
+                    tag: None,
+                    rev: "nu-core".to_string(),
+                    bin: Some("nu_plugin_zeta".to_string()),
+                },
             ],
             &bin_dir,
         )
@@ -3649,10 +3795,7 @@ nu_plugin_inc = { git = "https://github.com/nushell/nu_plugin_inc", tag = "v0.91
             commands,
             vec![
                 ("a_plugin".to_string(), bin_dir.join("a_plugin")),
-                (
-                    "nu_plugin_zeta".to_string(),
-                    bin_dir.join("nu_plugin_zeta")
-                )
+                ("nu_plugin_zeta".to_string(), bin_dir.join("nu_plugin_zeta"))
             ]
         );
 

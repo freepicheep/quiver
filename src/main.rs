@@ -14,12 +14,17 @@ mod ui;
 use std::io::{self, Write};
 use std::path::Path;
 use std::process::Command;
+#[cfg(test)]
+use std::sync::{LazyLock, Mutex};
 
 use cli::Commands;
 use config::GlobalConfig;
 use error::Result;
 use manifest::{DependencySpec, Manifest, Package, PluginDependencySpec};
 use safety::{validate_binary_name, validate_dependency_name};
+
+#[cfg(test)]
+pub(crate) static TEST_ENV_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 fn main() {
     let cli = cli::parse();
@@ -566,8 +571,7 @@ fn cmd_run(cwd: &Path, command: Vec<String>) -> Result<()> {
         ));
     }
 
-    let (program, args) =
-        resolve_run_invocation(&command, &config_path, &plugin_config_path, cwd);
+    let (program, args) = resolve_run_invocation(&command, &config_path, &plugin_config_path, cwd);
     let status = Command::new(&program)
         .args(&args)
         .current_dir(cwd)
@@ -1101,7 +1105,8 @@ fn detect_nu_version() -> Option<String> {
 mod tests {
     use super::*;
     use std::collections::HashMap;
-    use std::path::PathBuf;
+    use std::ffi::OsString;
+    use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn config_with_provider(provider: &str) -> GlobalConfig {
@@ -1127,6 +1132,52 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        original: Option<OsString>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &Path) -> Self {
+            let lock = crate::TEST_ENV_MUTEX
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let original = std::env::var_os(key);
+            // SAFETY: tests serialize environment mutation through TEST_ENV_MUTEX.
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self {
+                key,
+                original,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            // SAFETY: tests serialize environment mutation through TEST_ENV_MUTEX.
+            unsafe {
+                if let Some(value) = &self.original {
+                    std::env::set_var(self.key, value);
+                } else {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
+
+    fn seed_fake_nu_store(version: &str) -> (PathBuf, EnvVarGuard) {
+        let store_root = make_temp_dir("installs_root");
+        let guard = EnvVarGuard::set("QUIVER_INSTALLS_ROOT", &store_root);
+        let version_dir = store_root.join("nu_versions").join(version).join("bin");
+        std::fs::create_dir_all(&version_dir).unwrap();
+        std::fs::write(version_dir.join("nu"), "nu").unwrap();
+        (store_root, guard)
     }
 
     #[test]
@@ -1359,6 +1410,7 @@ mod tests {
     #[test]
     fn init_creates_mod_nu_in_subdir_named_after_current_dir() {
         let project_dir = make_temp_dir("init_subdir");
+        let store = detect_nu_version().map(|version| seed_fake_nu_store(&version));
 
         cmd_init(&project_dir, None, "0.1.0".to_string(), None, None).unwrap();
 
@@ -1388,11 +1440,15 @@ mod tests {
         assert!(config_nu.contains(".nu-env/modules"));
 
         let _ = std::fs::remove_dir_all(project_dir);
+        if let Some((store_root, _guard)) = store {
+            let _ = std::fs::remove_dir_all(store_root);
+        }
     }
 
     #[test]
     fn init_respects_explicit_name_but_uses_current_dir_for_mod_nu_subdir() {
         let project_dir = make_temp_dir("init_named_subdir");
+        let store = detect_nu_version().map(|version| seed_fake_nu_store(&version));
 
         cmd_init(
             &project_dir,
@@ -1420,15 +1476,16 @@ mod tests {
         assert!(project_dir.join(".nu-env").join("config.nu").exists());
 
         let _ = std::fs::remove_dir_all(project_dir);
+        if let Some((store_root, _guard)) = store {
+            let _ = std::fs::remove_dir_all(store_root);
+        }
     }
 
     #[test]
     fn init_uses_explicit_nu_version_when_provided() {
         let project_dir = make_temp_dir("init_nu_version");
-        let Some(local_nu_version) = detect_nu_version() else {
-            let _ = std::fs::remove_dir_all(project_dir);
-            return;
-        };
+        let local_nu_version = "255.255.255".to_string();
+        let (store_root, _guard) = seed_fake_nu_store(&local_nu_version);
 
         cmd_init(
             &project_dir,
@@ -1447,6 +1504,7 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(project_dir);
+        let _ = std::fs::remove_dir_all(store_root);
     }
 
     #[test]
@@ -1469,6 +1527,7 @@ mod tests {
     #[test]
     fn init_creates_gitignore_with_nu_env_entry() {
         let project_dir = make_temp_dir("init_gitignore_create");
+        let store = detect_nu_version().map(|version| seed_fake_nu_store(&version));
 
         cmd_init(&project_dir, None, "0.1.0".to_string(), None, None).unwrap();
 
@@ -1476,11 +1535,15 @@ mod tests {
         assert!(gitignore.lines().any(|line| line.trim() == ".nu-env/"));
 
         let _ = std::fs::remove_dir_all(project_dir);
+        if let Some((store_root, _guard)) = store {
+            let _ = std::fs::remove_dir_all(store_root);
+        }
     }
 
     #[test]
     fn init_appends_nu_env_entry_to_existing_gitignore() {
         let project_dir = make_temp_dir("init_gitignore_append");
+        let store = detect_nu_version().map(|version| seed_fake_nu_store(&version));
         std::fs::write(project_dir.join(".gitignore"), "target/\n").unwrap();
 
         cmd_init(&project_dir, None, "0.1.0".to_string(), None, None).unwrap();
@@ -1490,6 +1553,9 @@ mod tests {
         assert!(gitignore.lines().any(|line| line.trim() == ".nu-env/"));
 
         let _ = std::fs::remove_dir_all(project_dir);
+        if let Some((store_root, _guard)) = store {
+            let _ = std::fs::remove_dir_all(store_root);
+        }
     }
 
     #[test]
