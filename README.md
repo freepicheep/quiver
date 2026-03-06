@@ -5,7 +5,7 @@
   <br>Quiver
 </h1>
   <p align="center">
-    An extraordinarily fast <a href="https://www.nushell.sh/">Nu</a> package and project manager, written in Rust.
+    A fast <a href="https://www.nushell.sh/">Nu</a> package and project manager, written in Rust.
     <br />
   </p>
 </p>
