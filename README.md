@@ -256,6 +256,6 @@ qv install --frozen --no-build-fallback
 
 I have not verified the security of all the code yet and I am not responsible for any grief or loss Quiver may cause to you or your company.
 
-## License
+## LICENSE
 
-MIT
+Apache 2.0 and MIT.
