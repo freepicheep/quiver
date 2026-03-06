@@ -128,7 +128,7 @@ fn cmd_init(
             version,
             description: Some(description.unwrap_or_default()),
             license: Some(String::new()),
-            authors: Some(Vec::new()),
+            authors: detect_git_author_name().map(|author| vec![author]),
             nu_version: nu_version.or_else(detect_nu_version),
         },
         dependencies: Default::default(),
@@ -1101,6 +1101,23 @@ fn detect_nu_version() -> Option<String> {
     nu::extract_semver_from_text(&stdout).map(|version| version.to_string())
 }
 
+fn detect_git_author_name() -> Option<String> {
+    let output = Command::new("git")
+        .args(["config", "user.name"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let author = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if author.is_empty() {
+        None
+    } else {
+        Some(author)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1156,6 +1173,22 @@ mod tests {
                 _lock: lock,
             }
         }
+
+        fn set_os(key: &'static str, value: OsString) -> Self {
+            let lock = crate::TEST_ENV_MUTEX
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let original = std::env::var_os(key);
+            // SAFETY: tests serialize environment mutation through TEST_ENV_MUTEX.
+            unsafe {
+                std::env::set_var(key, &value);
+            }
+            Self {
+                key,
+                original,
+                _lock: lock,
+            }
+        }
     }
 
     impl Drop for EnvVarGuard {
@@ -1178,6 +1211,37 @@ mod tests {
         std::fs::create_dir_all(&version_dir).unwrap();
         std::fs::write(version_dir.join("nu"), "nu").unwrap();
         (store_root, guard)
+    }
+
+    fn seed_fake_git_config_user_name(stdout: &str) -> (PathBuf, EnvVarGuard) {
+        let bin_dir = make_temp_dir("fake_git_bin");
+        #[cfg(windows)]
+        let git_path = bin_dir.join("git.bat");
+        #[cfg(not(windows))]
+        let git_path = bin_dir.join("git");
+
+        #[cfg(windows)]
+        let script = format!(
+            "@echo off\r\nif \"%1\"==\"config\" if \"%2\"==\"user.name\" (\r\n  echo {}\r\n  exit /b 0\r\n)\r\nexit /b 1\r\n",
+            stdout
+        );
+        #[cfg(not(windows))]
+        let script = format!(
+            "#!/bin/sh\nif [ \"$1\" = \"config\" ] && [ \"$2\" = \"user.name\" ]; then\n  printf '%s\\n' '{}'\n  exit 0\nfi\nexit 1\n",
+            stdout.replace('\'', "'\"'\"'")
+        );
+
+        std::fs::write(&git_path, script).unwrap();
+        #[cfg(not(windows))]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&git_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&git_path, perms).unwrap();
+        }
+
+        let guard = EnvVarGuard::set_os("PATH", OsString::from(bin_dir.as_os_str()));
+        (bin_dir, guard)
     }
 
     #[test]
@@ -1443,6 +1507,41 @@ mod tests {
         if let Some((store_root, _guard)) = store {
             let _ = std::fs::remove_dir_all(store_root);
         }
+    }
+
+    #[test]
+    fn init_uses_git_user_name_for_authors_when_available() {
+        let project_dir = make_temp_dir("init_git_author");
+        let (git_dir, _path_guard) = seed_fake_git_config_user_name("Alice Example");
+
+        cmd_init(&project_dir, None, "0.1.0".to_string(), None, None).unwrap();
+
+        let manifest_text = std::fs::read_to_string(project_dir.join("nupackage.toml")).unwrap();
+        let manifest = Manifest::from_str(&manifest_text).unwrap();
+        assert_eq!(
+            manifest.package.authors,
+            Some(vec!["Alice Example".to_string()])
+        );
+        assert!(manifest_text.contains("authors = [\"Alice Example\"]"));
+
+        let _ = std::fs::remove_dir_all(project_dir);
+        let _ = std::fs::remove_dir_all(git_dir);
+    }
+
+    #[test]
+    fn init_omits_authors_when_git_user_name_is_empty() {
+        let project_dir = make_temp_dir("init_no_git_author");
+        let (git_dir, _path_guard) = seed_fake_git_config_user_name("");
+
+        cmd_init(&project_dir, None, "0.1.0".to_string(), None, None).unwrap();
+
+        let manifest_text = std::fs::read_to_string(project_dir.join("nupackage.toml")).unwrap();
+        let manifest = Manifest::from_str(&manifest_text).unwrap();
+        assert_eq!(manifest.package.authors, None);
+        assert!(!manifest_text.contains("authors ="));
+
+        let _ = std::fs::remove_dir_all(project_dir);
+        let _ = std::fs::remove_dir_all(git_dir);
     }
 
     #[test]
