@@ -70,7 +70,7 @@ pub fn install_with_options(
     frozen: bool,
     allow_unsigned: bool,
     no_build_fallback: bool,
-    print_plugin_registration_hints: bool,
+    _print_plugin_registration_hints: bool,
 ) -> Result<()> {
     let manifest = Manifest::from_dir(project_dir)?;
     let global_config = GlobalConfig::load_or_default()?;
@@ -171,7 +171,6 @@ pub fn install_with_options(
         frozen,
         frozen_lockfile.as_ref(),
         security_policy,
-        print_plugin_registration_hints,
     )
 }
 
@@ -325,7 +324,6 @@ fn install_resolved(
     frozen: bool,
     frozen_lockfile: Option<&Lockfile>,
     security_policy: SecurityPolicy,
-    print_plugin_registration_hints: bool,
 ) -> Result<()> {
     std::fs::create_dir_all(modules_dir)?;
     std::fs::create_dir_all(bin_dir)?;
@@ -495,38 +493,15 @@ fn install_resolved(
 
     write_config_nu(nu_env_dir, modules_dir)?;
     create_nu_symlink_with_policy(nu_env_dir, nu_version_req, security_policy)?;
+    sync_plugin_registry(nu_env_dir, plugins)?;
     write_activate_overlay(nu_env_dir, project_dir)?;
-    if print_plugin_registration_hints {
-        print_plugin_registration_instructions(plugins);
-    }
-
     Ok(())
 }
 
-fn print_plugin_registration_instructions(plugins: &[ResolvedPlugin]) {
-    let commands = plugin_registration_commands(plugins);
-    if commands.is_empty() {
-        return;
-    }
-
-    ui::info("Run the following to finish enabling your new plugin(s) for this shell:");
-    eprintln!(
-        "  {}",
-        ui::command_with_inline_comment("overlay use .nu-env/activate.nu # sets the nushell env")
-    );
-    eprintln!(
-        "  {}",
-        ui::command_with_inline_comment(
-            "nu # runs the proper version of nu for this project with the module and plugin configs"
-        )
-    );
-    for (plugin_name, use_name) in commands {
-        eprintln!("  {}", ui::command(format!("plugin add {plugin_name}")));
-        eprintln!("  {}", ui::command(format!("plugin use {use_name}")));
-    }
-}
-
-fn plugin_registration_commands(plugins: &[ResolvedPlugin]) -> Vec<(String, String)> {
+fn plugin_registration_targets(
+    plugins: &[ResolvedPlugin],
+    bin_dir: &Path,
+) -> Result<Vec<(String, PathBuf)>> {
     let mut commands = Vec::new();
     let mut seen = HashSet::new();
 
@@ -542,17 +517,13 @@ fn plugin_registration_commands(plugins: &[ResolvedPlugin]) -> Vec<(String, Stri
         }
 
         if seen.insert(plugin_name.clone()) {
-            commands.push((plugin_name.clone(), plugin_use_name(&plugin_name)));
+            safety::validate_binary_name(&plugin_name, "plugin dependency bin")?;
+            commands.push((plugin_name.clone(), bin_dir.join(&plugin_name)));
         }
     }
 
     commands.sort_by(|a, b| a.0.cmp(&b.0));
-    commands
-}
-
-fn plugin_use_name(plugin_name: &str) -> String {
-    let base = plugin_name.strip_suffix(".exe").unwrap_or(plugin_name);
-    base.strip_prefix("nu_plugin_").unwrap_or(base).to_string()
+    Ok(commands)
 }
 
 fn verify_frozen_checksum(
@@ -2079,6 +2050,69 @@ fn link_plugin_into_env(
     Ok(changed)
 }
 
+fn sync_plugin_registry(nu_env_dir: &Path, plugins: &[ResolvedPlugin]) -> Result<()> {
+    std::fs::create_dir_all(nu_env_dir)?;
+
+    let plugin_config_path = nu_env_dir.join("plugins.msgpackz");
+    let bin_dir = nu_env_dir.join(BIN_SUBDIR);
+    let targets = plugin_registration_targets(plugins, &bin_dir)?;
+    if targets.is_empty() {
+        if plugin_config_path.exists() {
+            std::fs::remove_file(&plugin_config_path)?;
+        }
+        return Ok(());
+    }
+
+    let nu_bin = bin_dir.join("nu");
+    if !nu_bin.exists() {
+        return Err(crate::error::QuiverError::Other(format!(
+            "cannot register plugins because '{}' was not found",
+            nu_bin.display()
+        )));
+    }
+
+    if plugin_config_path.exists() {
+        std::fs::remove_file(&plugin_config_path)?;
+    }
+
+    let config_path = nu_env_dir.join("config.nu");
+    let plugin_config = plugin_config_path.to_string_lossy().to_string();
+    let config = config_path.to_string_lossy().to_string();
+
+    for (plugin_name, plugin_path) in &targets {
+        let command = plugin_add_command(plugin_path);
+        let status = Command::new(&nu_bin)
+            .arg("--plugin-config")
+            .arg(&plugin_config)
+            .arg("--config")
+            .arg(&config)
+            .arg("--commands")
+            .arg(command)
+            .status()?;
+
+        if !status.success() {
+            return Err(crate::error::QuiverError::Other(format!(
+                "failed to register plugin '{}' in {}",
+                plugin_name,
+                plugin_config_path.display()
+            )));
+        }
+    }
+
+    ui::success(format!(
+        "Registered {} plugin{} in {}",
+        targets.len(),
+        if targets.len() == 1 { "" } else { "s" },
+        plugin_config_path.display()
+    ));
+
+    Ok(())
+}
+
+fn plugin_add_command(plugin_path: &Path) -> String {
+    format!("plugin add {}", nu_string_literal(plugin_path))
+}
+
 fn write_text_file_if_changed(path: &Path, contents: &str) -> Result<bool> {
     if let Ok(existing) = std::fs::read_to_string(path)
         && existing == contents
@@ -3580,8 +3614,11 @@ nu_plugin_inc = { git = "https://github.com/nushell/nu_plugin_inc", tag = "v0.91
     }
 
     #[test]
-    fn plugin_registration_commands_are_sorted_and_deduped() {
-        let commands = plugin_registration_commands(&[
+    fn plugin_registration_targets_are_sorted_and_deduped() {
+        let root = make_temp_dir("plugin_targets");
+        let bin_dir = root.join(".nu-env").join("bin");
+        let commands = plugin_registration_targets(
+            &[
             ResolvedPlugin {
                 name: "z_plugin".to_string(),
                 git: "nu-core".to_string(),
@@ -3603,22 +3640,47 @@ nu_plugin_inc = { git = "https://github.com/nushell/nu_plugin_inc", tag = "v0.91
                 rev: "nu-core".to_string(),
                 bin: Some("nu_plugin_zeta".to_string()),
             },
-        ]);
+            ],
+            &bin_dir,
+        )
+        .unwrap();
 
         assert_eq!(
             commands,
             vec![
-                ("a_plugin".to_string(), "a_plugin".to_string()),
-                ("nu_plugin_zeta".to_string(), "zeta".to_string())
+                ("a_plugin".to_string(), bin_dir.join("a_plugin")),
+                (
+                    "nu_plugin_zeta".to_string(),
+                    bin_dir.join("nu_plugin_zeta")
+                )
             ]
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn plugin_add_command_escapes_paths() {
+        let command = plugin_add_command(Path::new(r#"/tmp/plugin "quoted"/nu_plugin_polars"#));
+        assert_eq!(
+            command,
+            r#"plugin add "/tmp/plugin \"quoted\"/nu_plugin_polars""#
         );
     }
 
     #[test]
-    fn plugin_use_name_strips_prefix_and_windows_suffix() {
-        assert_eq!(plugin_use_name("nu_plugin_inc"), "inc");
-        assert_eq!(plugin_use_name("nu_plugin_query.exe"), "query");
-        assert_eq!(plugin_use_name("custom_plugin"), "custom_plugin");
+    fn sync_plugin_registry_removes_stale_file_when_no_plugins() {
+        let root = make_temp_dir("plugin_registry_empty");
+        let nu_env_dir = root.join(".nu-env");
+        std::fs::create_dir_all(&nu_env_dir).unwrap();
+        let plugin_config = nu_env_dir.join("plugins.msgpackz");
+        std::fs::write(&plugin_config, "stale").unwrap();
+
+        sync_plugin_registry(&nu_env_dir, &[]).unwrap();
+
+        assert!(!plugin_config.exists());
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

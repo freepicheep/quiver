@@ -549,9 +549,14 @@ fn cmd_run(cwd: &Path, command: Vec<String>) -> Result<()> {
         return Err(error::QuiverError::NoManifest(cwd.to_path_buf()));
     }
 
+    let manifest = Manifest::from_dir(cwd)?;
     let config_path = cwd.join(".nu-env").join("config.nu");
-    if !config_path.exists() {
-        eprintln!("No .nu-env found; running install first...");
+    let plugin_config_path = cwd.join(".nu-env").join("plugins.msgpackz");
+    let needs_install = !config_path.exists()
+        || (!manifest.dependencies.plugins.is_empty() && !plugin_config_path.exists());
+
+    if needs_install {
+        eprintln!("Project environment is incomplete; running install first...");
         installer::install_with_options(cwd, false, false, false, false)?;
     }
 
@@ -561,7 +566,6 @@ fn cmd_run(cwd: &Path, command: Vec<String>) -> Result<()> {
         ));
     }
 
-    let plugin_config_path = cwd.join(".nu-env").join("plugins.msgpackz");
     let (program, args) =
         resolve_run_invocation(&command, &config_path, &plugin_config_path, cwd);
     let status = Command::new(&program)

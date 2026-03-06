@@ -21,23 +21,6 @@ pub fn keyword(word: impl AsRef<str>) -> String {
     style(word.as_ref()).bold().cyan().to_string()
 }
 
-pub fn command(text: impl AsRef<str>) -> String {
-    style(text.as_ref()).bold().yellow().to_string()
-}
-
-pub fn command_with_inline_comment(text: impl AsRef<str>) -> String {
-    let text = text.as_ref();
-    if let Some((command_part, comment_part)) = text.split_once(" #") {
-        return format!(
-            "{} {}",
-            command(command_part),
-            style(format!("#{comment_part}")).color256(250)
-        );
-    }
-
-    command(text)
-}
-
 pub fn bytes_progress(message: impl Into<String>) -> ProgressBar {
     let pb = ProgressBar::new(0);
     pb.set_style(

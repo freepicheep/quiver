@@ -1,5 +1,9 @@
 # Unreleased
 
+## Added
+
+- Nu plugins are now registered whenever they are installed, whether that is through `qv run`, `qv add-plugin`, or `qv install`. This means you can literally just clone a quiver project and run `qv run your-project/amazing_things.nu` and it will work, even if you are using Nu plugins.
+
 ## Fixed
 - `qv run` properly sets the `--plugin-config` when running `nu`.
 
