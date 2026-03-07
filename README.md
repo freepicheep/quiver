@@ -1,7 +1,7 @@
 <!-- LOGO -->
 <h1>
 <p align="center">
-  <img src="https://github.com/user-attachments/assets/5bd69aeb-3c42-4a5e-8281-65b18748a43c" alt="Logo" width="128">
+  <img src="https://github.com/user-attachments/assets/7ae462fc-8b53-4009-b2c9-72874f005fd0" alt="Logo" width="128">
   <br>Quiver
 </h1>
   <p align="center">
