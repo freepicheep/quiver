@@ -1553,7 +1553,7 @@ fn extract_zip_archive(archive_path: &Path, extract_dir: &Path) -> Result<()> {
         let enclosed = entry.enclosed_name().ok_or_else(|| {
             crate::error::QuiverError::Other(format!("archive contains unsafe path '{}'", raw_name))
         })?;
-        let Some(safe_relative) = safety::normalized_relative_path(enclosed) else {
+        let Some(safe_relative) = safety::normalized_relative_path(&enclosed) else {
             return Err(crate::error::QuiverError::Other(format!(
                 "archive contains unsafe path '{}'",
                 raw_name
@@ -3913,7 +3913,7 @@ nu_plugin_inc = { git = "https://github.com/nushell/nu_plugin_inc", tag = "v0.91
         let archive_path = root.join("bad.zip");
         let file = std::fs::File::create(&archive_path).unwrap();
         let mut zip = zip::ZipWriter::new(file);
-        let options = zip::write::FileOptions::default();
+        let options = zip::write::SimpleFileOptions::default();
         zip.start_file("../escape.txt", options).unwrap();
         zip.write_all(b"malicious").unwrap();
         zip.finish().unwrap();
