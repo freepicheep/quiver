@@ -10,7 +10,7 @@
   </p>
 </p>
 
-Quiver handles dependency resolution, fetching, and lockfile management for Nushell modules and plugins distributed as git repositories.
+Quiver handles dependency resolution, fetching, and lockfile management for Nushell modules and plugins distributed as git repositories. Read the [docs](https://freepicheep.github.io/quiver-docs/) to learn more, or get started below.
 
 ## Install
 
