@@ -1,6 +1,8 @@
 # Unreleased
 
-# Changed
+# Version 0.3.4 (2026-03-09)
+
+## Changed
 
 - Since the standard module project structure is `<module-name>/<module-name>`, modules are now extracted to `.nu-env/modules/<module-name>` with the package information going to `.nu-env/modules/<module-name>-<version>.dist-info`, like in Python. You now only need to type `use nu-salesforce *` in your script instead of `use nu-salesforce/nu-salesforce *`. 
 
