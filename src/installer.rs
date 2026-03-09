@@ -2398,6 +2398,7 @@ fn install_dep(dep: &ResolvedDep, modules_dir: &Path, install_mode: InstallMode)
     safety::validate_dependency_name(&dep.name, "module dependency")?;
     let repo_path = git::clone_or_fetch(&dep.git)?;
     let dest = modules_dir.join(&dep.name);
+    let dist_info_dest = modules_dir.join(dist_info_dir_name(dep));
     let unique = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -2408,7 +2409,15 @@ fn install_dep(dep: &ResolvedDep, modules_dir: &Path, install_mode: InstallMode)
     }
 
     git::export_to(&repo_path, &dep.rev, &staging)?;
-    materialize_module_dir(&staging, &dest, install_mode)?;
+    let module_subdir = select_module_subdir(&staging, &dep.name)?;
+    let module_src = if module_subdir.as_os_str().is_empty() {
+        staging.clone()
+    } else {
+        staging.join(&module_subdir)
+    };
+
+    materialize_module_dir(&module_src, &dest, install_mode)?;
+    write_module_dist_info(&staging, &module_subdir, &dist_info_dest)?;
     std::fs::remove_dir_all(&staging)?;
     discover_module_use_path(&dest, &dep.name)
 }
@@ -2520,7 +2529,135 @@ fn copy_dir(src: &Path, dest: &Path) -> Result<()> {
     Ok(())
 }
 
+fn dist_info_dir_name(dep: &ResolvedDep) -> String {
+    let raw_version = dep
+        .tag
+        .as_deref()
+        .map(str::trim)
+        .filter(|tag| !tag.is_empty())
+        .unwrap_or(&dep.rev[..12.min(dep.rev.len())]);
+    let version = sanitize_dist_info_version(raw_version);
+    format!("{}-{version}.dist-info", dep.name)
+}
+
+fn sanitize_dist_info_version(version: &str) -> String {
+    let mut out = String::with_capacity(version.len());
+    for ch in version.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-') {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+
+    if out.is_empty() {
+        "unknown".to_string()
+    } else {
+        out
+    }
+}
+
+fn write_module_dist_info(
+    repo_root: &Path,
+    module_subdir: &Path,
+    dist_info_dir: &Path,
+) -> Result<()> {
+    if dist_info_dir.exists() {
+        std::fs::remove_dir_all(dist_info_dir)?;
+    }
+    std::fs::create_dir_all(dist_info_dir)?;
+
+    if module_subdir.as_os_str().is_empty() {
+        copy_root_peripheral_entries(repo_root, dist_info_dir)?;
+    } else {
+        copy_repo_except_subdir(repo_root, dist_info_dir, module_subdir)?;
+    }
+
+    Ok(())
+}
+
+fn copy_repo_except_subdir(src_root: &Path, dest_root: &Path, skip_subdir: &Path) -> Result<()> {
+    for entry in WalkDir::new(src_root)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(std::result::Result::ok)
+    {
+        let relative = entry
+            .path()
+            .strip_prefix(src_root)
+            .map_err(|e| crate::error::QuiverError::Other(e.to_string()))?;
+        if relative.as_os_str().is_empty() || relative.starts_with(skip_subdir) {
+            continue;
+        }
+
+        let target = dest_root.join(relative);
+        if entry.file_type().is_dir() {
+            std::fs::create_dir_all(&target)?;
+        } else if entry.file_type().is_file() {
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::copy(entry.path(), &target)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn copy_root_peripheral_entries(repo_root: &Path, dist_info_dir: &Path) -> Result<()> {
+    for entry in std::fs::read_dir(repo_root)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().to_lowercase();
+        let path = entry.path();
+        if path.is_file() {
+            if !should_include_root_peripheral_file(&name) {
+                continue;
+            }
+            std::fs::copy(&path, dist_info_dir.join(entry.file_name()))?;
+        } else if path.is_dir() {
+            if !should_include_root_peripheral_dir(&name) {
+                continue;
+            }
+            copy_dir(&path, &dist_info_dir.join(entry.file_name()))?;
+        }
+    }
+
+    Ok(())
+}
+
+fn should_include_root_peripheral_file(name: &str) -> bool {
+    let base = name.split('.').next().unwrap_or(name);
+    matches!(
+        base,
+        "readme"
+            | "license"
+            | "licenses"
+            | "copying"
+            | "notice"
+            | "notices"
+            | "changelog"
+            | "changes"
+            | "contributing"
+            | "authors"
+            | "security"
+            | "code_of_conduct"
+            | "nupackage"
+            | "nupm"
+    ) || name.ends_with(".md")
+        || name.ends_with(".rst")
+        || name.ends_with(".txt")
+}
+
+fn should_include_root_peripheral_dir(name: &str) -> bool {
+    matches!(name, "docs" | "doc" | ".github")
+}
+
 fn discover_module_use_path(module_root: &Path, dep_name: &str) -> Result<String> {
+    let subdir = select_module_subdir(module_root, dep_name)?;
+    Ok(module_use_path(dep_name, &subdir))
+}
+
+fn select_module_subdir(module_root: &Path, dep_name: &str) -> Result<PathBuf> {
     let metadata = read_nupm_metadata_hints(module_root)?;
     let mut candidates = Vec::new();
     let mut seen = HashSet::new();
@@ -2564,13 +2701,13 @@ fn discover_module_use_path(module_root: &Path, dep_name: &str) -> Result<String
     }
 
     if let Some(best) = candidates.first() {
-        return Ok(module_use_path(dep_name, best));
+        return Ok(best.clone());
     }
 
     ui::warn(format!(
         "could not locate mod.nu for module '{dep_name}' after install; defaulting to '{dep_name}'"
     ));
-    Ok(dep_name.to_string())
+    Ok(PathBuf::new())
 }
 
 fn read_nupm_metadata_hints(module_root: &Path) -> Result<NupmMetadataHints> {
@@ -3085,6 +3222,76 @@ mod tests {
         assert_eq!(use_path, "nu-tools/nu-tools");
 
         let _ = std::fs::remove_dir_all(module_root);
+    }
+
+    #[test]
+    fn write_module_dist_info_excludes_nested_module_subdir() {
+        let repo_root = make_temp_dir("dist_info_nested");
+        let module_dir = repo_root.join("nu-salesforce");
+        std::fs::create_dir_all(&module_dir).unwrap();
+        std::fs::write(module_dir.join("mod.nu"), "# module").unwrap();
+        std::fs::write(repo_root.join("README.md"), "docs").unwrap();
+        std::fs::write(repo_root.join("LICENSE"), "license").unwrap();
+        std::fs::create_dir_all(repo_root.join("docs")).unwrap();
+        std::fs::write(repo_root.join("docs").join("usage.md"), "usage").unwrap();
+
+        let dist_info =
+            make_temp_dir("dist_info_nested_out").join("nu-salesforce-v0.1.0.dist-info");
+        write_module_dist_info(&repo_root, Path::new("nu-salesforce"), &dist_info).unwrap();
+
+        assert!(dist_info.join("README.md").is_file());
+        assert!(dist_info.join("LICENSE").is_file());
+        assert!(dist_info.join("docs").join("usage.md").is_file());
+        assert!(!dist_info.join("nu-salesforce").exists());
+
+        let _ = std::fs::remove_dir_all(repo_root);
+        let _ = std::fs::remove_dir_all(dist_info.parent().unwrap());
+    }
+
+    #[test]
+    fn write_module_dist_info_root_module_keeps_peripheral_files_only() {
+        let repo_root = make_temp_dir("dist_info_root");
+        std::fs::write(repo_root.join("mod.nu"), "# module").unwrap();
+        std::fs::write(repo_root.join("README.md"), "docs").unwrap();
+        std::fs::write(repo_root.join("LICENSE"), "license").unwrap();
+        std::fs::create_dir_all(repo_root.join("docs")).unwrap();
+        std::fs::write(repo_root.join("docs").join("guide.md"), "guide").unwrap();
+
+        let dist_info = make_temp_dir("dist_info_root_out").join("nu-foo-v0.1.0.dist-info");
+        write_module_dist_info(&repo_root, Path::new(""), &dist_info).unwrap();
+
+        assert!(dist_info.join("README.md").is_file());
+        assert!(dist_info.join("LICENSE").is_file());
+        assert!(dist_info.join("docs").join("guide.md").is_file());
+        assert!(!dist_info.join("mod.nu").exists());
+
+        let _ = std::fs::remove_dir_all(repo_root);
+        let _ = std::fs::remove_dir_all(dist_info.parent().unwrap());
+    }
+
+    #[test]
+    fn dist_info_dir_name_uses_tag_or_short_rev() {
+        let with_tag = ResolvedDep {
+            name: "nu-salesforce".to_string(),
+            git: "https://example.com/nu-salesforce.git".to_string(),
+            tag: Some("v0.3.0".to_string()),
+            rev: "0123456789abcdef".to_string(),
+        };
+        let without_tag = ResolvedDep {
+            name: "nu-salesforce".to_string(),
+            git: "https://example.com/nu-salesforce.git".to_string(),
+            tag: None,
+            rev: "0123456789abcdef".to_string(),
+        };
+
+        assert_eq!(
+            dist_info_dir_name(&with_tag),
+            "nu-salesforce-v0.3.0.dist-info"
+        );
+        assert_eq!(
+            dist_info_dir_name(&without_tag),
+            "nu-salesforce-0123456789ab.dist-info"
+        );
     }
 
     #[test]

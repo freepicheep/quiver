@@ -448,6 +448,9 @@ fn cmd_remove(dir: &Path, name: String) -> Result<()> {
             std::fs::remove_dir_all(&module_dir)?;
             eprintln!("Removed .nu-env/modules/{name}/");
         }
+        for removed in remove_module_dist_info_dirs(&dir.join(".nu-env").join("modules"), &name)? {
+            eprintln!("Removed .nu-env/modules/{removed}/");
+        }
 
         // Update lockfile: remove the module package entry
         let lock_path = dir.join("quiver.lock");
@@ -523,6 +526,9 @@ fn cmd_remove_global(name: String) -> Result<()> {
     if module_dir.exists() {
         std::fs::remove_dir_all(&module_dir)?;
         eprintln!("Removed {}/", module_dir.display());
+    }
+    for removed in remove_module_dist_info_dirs(&modules_dir, &name)? {
+        eprintln!("Removed {}/", modules_dir.join(&removed).display());
     }
 
     // Update global lockfile
@@ -932,12 +938,46 @@ fn list_installed_module_names(modules_dir: &Path) -> Result<Vec<String>> {
         }
 
         if let Some(name) = entry.file_name().to_str() {
+            if name.ends_with(".dist-info") {
+                continue;
+            }
             modules.push(name.to_string());
         }
     }
 
     modules.sort();
     Ok(modules)
+}
+
+fn remove_module_dist_info_dirs(modules_dir: &Path, module_name: &str) -> Result<Vec<String>> {
+    if !modules_dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut removed = Vec::new();
+    let prefix = format!("{module_name}-");
+
+    for entry in std::fs::read_dir(modules_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        if !name.starts_with(&prefix) || !name.ends_with(".dist-info") {
+            continue;
+        }
+
+        std::fs::remove_dir_all(&path)?;
+        removed.push(name.to_string());
+    }
+
+    removed.sort();
+    Ok(removed)
 }
 
 fn list_installed_plugin_names(bin_dir: &Path) -> Result<Vec<String>> {
@@ -1325,6 +1365,7 @@ mod tests {
         let modules_dir = make_temp_dir("list_modules");
         std::fs::create_dir_all(modules_dir.join("nu-zeta")).unwrap();
         std::fs::create_dir_all(modules_dir.join("nu-alpha")).unwrap();
+        std::fs::create_dir_all(modules_dir.join("nu-alpha-v0.1.0.dist-info")).unwrap();
         std::fs::write(modules_dir.join("activate.nu"), "# generated").unwrap();
 
         let modules = list_installed_module_names(&modules_dir).unwrap();
@@ -1340,6 +1381,37 @@ mod tests {
         let modules = list_installed_module_names(&root_dir.join("missing")).unwrap();
         assert!(modules.is_empty());
         let _ = std::fs::remove_dir_all(root_dir);
+    }
+
+    #[test]
+    fn remove_module_dist_info_dirs_removes_only_matching_module_dist_info() {
+        let modules_dir = make_temp_dir("remove_dist_info");
+        std::fs::create_dir_all(modules_dir.join("nu-salesforce")).unwrap();
+        std::fs::create_dir_all(modules_dir.join("nu-salesforce-v0.3.0.dist-info")).unwrap();
+        std::fs::create_dir_all(modules_dir.join("nu-salesforce-abcdef123456.dist-info")).unwrap();
+        std::fs::create_dir_all(modules_dir.join("nu-other-v1.0.0.dist-info")).unwrap();
+        std::fs::create_dir_all(modules_dir.join("nu-salesforce.dist-info")).unwrap();
+
+        let removed = remove_module_dist_info_dirs(&modules_dir, "nu-salesforce").unwrap();
+
+        assert_eq!(
+            removed,
+            vec![
+                "nu-salesforce-abcdef123456.dist-info".to_string(),
+                "nu-salesforce-v0.3.0.dist-info".to_string()
+            ]
+        );
+        assert!(modules_dir.join("nu-salesforce").is_dir());
+        assert!(modules_dir.join("nu-other-v1.0.0.dist-info").is_dir());
+        assert!(modules_dir.join("nu-salesforce.dist-info").is_dir());
+        assert!(!modules_dir.join("nu-salesforce-v0.3.0.dist-info").exists());
+        assert!(
+            !modules_dir
+                .join("nu-salesforce-abcdef123456.dist-info")
+                .exists()
+        );
+
+        let _ = std::fs::remove_dir_all(modules_dir);
     }
 
     #[test]
