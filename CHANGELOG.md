@@ -1,5 +1,9 @@
 # Unreleased
 
+## Fixed
+
+- Fixed args for lsp configs. Somehow the previous version worked for Nu <=0.110.
+
 # Version 0.3.4 (2026-03-09)
 
 ## Changed

@@ -843,7 +843,13 @@ fn write_helix_lsp_config(project_dir: &Path) -> Result<()> {
     let config_path = helix_dir.join("languages.toml");
     let config = r#"[language-server.nu-lsp]
 command = ".nu-env/bin/nu"
-args = ["--config .nu-env/config.nu", "--plugin-config .nu-env/plugins.msgpackz", "--lsp"]
+args = [
+  "--config",
+  ".nu-env/config.nu",
+  "--plugin-config",
+  ".nu-env/plugins.msgpackz",
+  "--lsp"
+]
 "#;
 
     std::fs::write(&config_path, config)?;
@@ -861,7 +867,13 @@ fn write_zed_lsp_config(project_dir: &Path) -> Result<()> {
     "nu": {
       "binary": {
         "path": ".nu-env/bin/nu",
-        "arguments": ["--config .nu-env/config.nu", "--plugin-config .nu-env/plugins.msgpackz", "--lsp"]
+        "arguments": [
+          "--config",
+          ".nu-env/config.nu",
+          "--plugin-config",
+          ".nu-env/plugins.msgpackz",
+          "--lsp"
+        ]
       }
     }
   }
