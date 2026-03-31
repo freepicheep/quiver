@@ -1,5 +1,7 @@
 # Unreleased
 
+# Version 0.4.0 (2026-03-31)
+
 ## Added
 
 - Global plugin installation. Global plugins are automatically registered to your default `plugin.msgpackz` upon installation. They are listed under the `[plugins]` table in your global `config.toml` for quiver.
