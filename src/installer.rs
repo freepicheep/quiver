@@ -189,7 +189,7 @@ pub fn update(project_dir: &Path) -> Result<()> {
 pub fn install_global(frozen: bool, allow_unsigned: bool, no_build_fallback: bool) -> Result<()> {
     let config = GlobalConfig::load()?;
     let install_mode = config.install_mode;
-    let _security_policy = security_policy_for(
+    let security_policy = security_policy_for(
         config.security.require_signed_assets,
         frozen,
         allow_unsigned,
@@ -199,13 +199,13 @@ pub fn install_global(frozen: bool, allow_unsigned: bool, no_build_fallback: boo
     let lock_path = config::global_lock_path()?;
     let display_dir = modules_dir.display().to_string();
 
-    if config.dependencies.is_empty() {
+    if config.modules.is_empty() && config.plugins.is_empty() {
         ui::warn("No dependencies declared in global config.");
         return Ok(());
     }
 
     let mut frozen_lockfile: Option<Lockfile> = None;
-    let resolved_modules = if frozen {
+    let (resolved_modules, resolved_plugins) = if frozen {
         if !lock_path.exists() {
             return Err(crate::error::QuiverError::Lockfile(
                 "config.lock not found (required with --frozen)".to_string(),
@@ -217,54 +217,102 @@ pub fn install_global(frozen: bool, allow_unsigned: bool, no_build_fallback: boo
             "{} locked global dependencies (--frozen)",
             ui::keyword("Using")
         ));
-        resolver::resolve_modules_from_lock(&lockfile.packages)
+        (
+            resolver::resolve_modules_from_lock(&lockfile.packages),
+            resolver::resolve_plugins_from_lock(&lockfile.packages),
+        )
     } else if lock_path.exists() && !is_global_lockfile_stale(&config, &lock_path)? {
         let lockfile = Lockfile::from_path(&lock_path)?;
         ui::info(format!("{} existing global lockfile", ui::keyword("Using")));
-        resolver::resolve_modules_from_lock(&lockfile.packages)
-    } else if config.dependencies.is_empty() {
-        Vec::new()
+        (
+            resolver::resolve_modules_from_lock(&lockfile.packages),
+            resolver::resolve_plugins_from_lock(&lockfile.packages),
+        )
+    } else if config.modules.is_empty() && config.plugins.is_empty() {
+        (Vec::new(), Vec::new())
     } else {
-        ui::info(format!(
-            "{} global module dependencies",
-            ui::keyword("Resolving")
-        ));
-        resolver::resolve_modules_from_deps(&config.dependencies)?
+        let resolved_modules = if config.modules.is_empty() {
+            Vec::new()
+        } else {
+            ui::info(format!(
+                "{} global module dependencies",
+                ui::keyword("Resolving")
+            ));
+            resolver::resolve_modules_from_deps(&config.modules)?
+        };
+        let resolved_plugins = if config.plugins.is_empty() {
+            Vec::new()
+        } else {
+            ui::info(format!(
+                "{} global plugin dependencies",
+                ui::keyword("Resolving")
+            ));
+            resolver::resolve_plugins_from_deps(&config.plugins)?
+        };
+        (resolved_modules, resolved_plugins)
     };
 
     install_resolved_global(
         &resolved_modules,
+        &resolved_plugins,
         &modules_dir,
         &lock_path,
         &display_dir,
         install_mode,
         frozen,
         frozen_lockfile.as_ref(),
+        security_policy,
     )
+}
+
+fn global_autoload_dir_expression() -> &'static str {
+    r#"($nu.default-config-dir | path join "vendor" "autoload")"#
+}
+
+fn global_autoload_config_hint() -> &'static str {
+    r#"$env.NU_LIB_DIRS = ($env.NU_LIB_DIRS? | default [] | append ($nu.default-config-dir | path join "vendor" "autoload"))"#
 }
 
 /// Install resolved global dependencies and write `config.lock`.
 fn install_resolved_global(
     modules: &[ResolvedDep],
+    plugins: &[ResolvedPlugin],
     modules_dir: &Path,
     lock_path: &Path,
     modules_display_name: &str,
     install_mode: InstallMode,
     frozen: bool,
     frozen_lockfile: Option<&Lockfile>,
+    security_policy: SecurityPolicy,
 ) -> Result<()> {
     std::fs::create_dir_all(modules_dir)?;
 
     let mut locked_packages = Vec::new();
+    let existing_lockfile = if !frozen && lock_path.exists() {
+        Lockfile::from_path(lock_path).ok()
+    } else {
+        None
+    };
+    let mut plugin_targets = Vec::new();
+    let changed_module_count = modules
+        .iter()
+        .filter(|dep| !resolved_module_matches_existing_lock(dep, existing_lockfile.as_ref()))
+        .count();
+    let changed_plugin_count = plugins
+        .iter()
+        .filter(|plugin| !resolved_plugin_matches_existing_lock(plugin, existing_lockfile.as_ref()))
+        .count();
 
     for dep in modules {
         safety::validate_dependency_name(&dep.name, "module dependency")?;
-        ui::info(format!(
-            "{} module {}@{}",
-            ui::keyword("Installing"),
-            dep.name,
-            &dep.rev[..12.min(dep.rev.len())]
-        ));
+        if !resolved_module_matches_existing_lock(dep, existing_lockfile.as_ref()) {
+            ui::info(format!(
+                "{} module {}@{}",
+                ui::keyword("Installing"),
+                dep.name,
+                &dep.rev[..12.min(dep.rev.len())]
+            ));
+        }
         install_dep(dep, modules_dir, install_mode)?;
 
         let dest = modules_dir.join(&dep.name);
@@ -291,6 +339,93 @@ fn install_resolved_global(
         });
     }
 
+    for plugin in plugins {
+        safety::validate_dependency_name(&plugin.name, "plugin dependency")?;
+        if let Some(bin) = plugin.bin.as_deref() {
+            safety::validate_binary_name(bin, "plugin dependency bin")?;
+        }
+        let frozen_locked_plugin = frozen_lockfile
+            .and_then(|lock| lock.find_package(&plugin.name, LockedPackageKind::Plugin));
+        let plugin_install = install_plugin(plugin, None, security_policy, frozen_locked_plugin)?;
+        let installed_bin = plugin_install.installed_bin;
+        let bin_name = plugin_install.bin_name;
+        let version_dir = plugin_install.version_dir;
+        if !resolved_plugin_matches_existing_lock(plugin, existing_lockfile.as_ref()) {
+            ui::info(format!(
+                "{} plugin {}@{}",
+                ui::keyword("Installing"),
+                plugin.name,
+                plugin_install_display_ref(plugin, &version_dir)
+            ));
+        }
+        let sha256 = resolver::compute_checksum(&version_dir)?;
+        if frozen {
+            verify_frozen_checksum(
+                frozen_lockfile,
+                &plugin.name,
+                LockedPackageKind::Plugin,
+                &sha256,
+            )?;
+        }
+        if frozen
+            && let Some(expected_asset_sha) =
+                frozen_locked_plugin.and_then(|locked| locked.asset_sha256.as_deref())
+        {
+            let actual_asset_sha = plugin_install.asset_metadata.asset_sha256.as_deref().ok_or_else(|| {
+                crate::error::QuiverError::Lockfile(format!(
+                    "frozen install requires downloaded asset_sha256 for plugin '{}' but no verified release asset digest was recorded",
+                    plugin.name
+                ))
+            })?;
+            if expected_asset_sha != actual_asset_sha {
+                return Err(crate::error::QuiverError::Lockfile(format!(
+                    "frozen install asset checksum mismatch for plugin '{}': expected {}, got {}",
+                    plugin.name, expected_asset_sha, actual_asset_sha
+                )));
+            }
+        }
+
+        let existing_metadata = existing_lockfile
+            .as_ref()
+            .and_then(|lock| lock.find_package(&plugin.name, LockedPackageKind::Plugin));
+        let asset_sha256 = plugin_install
+            .asset_metadata
+            .asset_sha256
+            .or_else(|| existing_metadata.and_then(|pkg| pkg.asset_sha256.clone()));
+        let asset_url = plugin_install
+            .asset_metadata
+            .asset_url
+            .or_else(|| existing_metadata.and_then(|pkg| pkg.asset_url.clone()));
+
+        let locked_tag = if plugin.git == "nu-core" {
+            None
+        } else {
+            plugin.tag.clone()
+        };
+        let locked_rev = if plugin.git == "nu-core" {
+            version_dir
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("nu-core")
+                .to_string()
+        } else {
+            plugin.rev.clone()
+        };
+
+        plugin_targets.push((plugin_registry_name(&bin_name), installed_bin));
+        locked_packages.push(LockedPackage {
+            name: plugin.name.clone(),
+            kind: LockedPackageKind::Plugin,
+            git: plugin.git.clone(),
+            tag: locked_tag,
+            rev: locked_rev,
+            path: Some(bin_name),
+            sha256,
+            asset_sha256,
+            asset_url,
+        });
+    }
+
     locked_packages.sort_by(|a, b| a.kind.cmp(&b.kind).then(a.name.cmp(&b.name)));
 
     if !frozen {
@@ -301,12 +436,34 @@ fn install_resolved_global(
         lockfile.write_to(lock_path)?;
     }
 
-    let module_count = modules.len();
-    let module_suffix = if module_count == 1 { "" } else { "s" };
+    reconcile_global_plugin_registry(existing_lockfile.as_ref(), plugins, &plugin_targets)?;
 
-    ui::success(format!(
-        "Installed {module_count} module{module_suffix} into {modules_display_name}/"
-    ));
+    let mut summary_parts = Vec::new();
+    if changed_module_count > 0 {
+        let module_suffix = if changed_module_count == 1 { "" } else { "s" };
+        summary_parts.push(format!(
+            "Installed {changed_module_count} module{module_suffix} into {modules_display_name}/"
+        ));
+    }
+    if changed_plugin_count > 0 {
+        let plugin_suffix = if changed_plugin_count == 1 { "" } else { "s" };
+        summary_parts.push(format!(
+            "Registered {changed_plugin_count} global plugin{plugin_suffix} in {}",
+            config::nushell_plugin_registry_path()?.display()
+        ));
+    }
+    if !summary_parts.is_empty() {
+        ui::success(summary_parts.join(" and "));
+    } else {
+        ui::success("Global modules and plugins are already up to date");
+    }
+    if changed_module_count > 0 {
+        ui::info(format!(
+            "To load quiver autoload files from {}, add this to config.nu:",
+            global_autoload_dir_expression()
+        ));
+        eprintln!("  {}", global_autoload_config_hint());
+    }
 
     Ok(())
 }
@@ -2131,6 +2288,86 @@ fn plugin_add_command(plugin_path: &Path) -> String {
     format!("plugin add {}", nu_string_literal(plugin_path))
 }
 
+fn plugin_registry_name(binary_name: &str) -> String {
+    binary_name
+        .strip_suffix(".exe")
+        .unwrap_or(binary_name)
+        .strip_prefix("nu_plugin_")
+        .unwrap_or_else(|| binary_name.strip_suffix(".exe").unwrap_or(binary_name))
+        .to_string()
+}
+
+fn global_plugin_remove_command(binary_name: &str) -> String {
+    format!("plugin rm {}", plugin_registry_name(binary_name))
+}
+
+fn reconcile_global_plugin_registry(
+    existing_lockfile: Option<&Lockfile>,
+    plugins: &[ResolvedPlugin],
+    plugin_targets: &[(String, PathBuf)],
+) -> Result<()> {
+    let nu_bin = detect_nu_path().ok_or_else(|| {
+        crate::error::QuiverError::Other(
+            "cannot register global plugins because 'nu' was not found in PATH".to_string(),
+        )
+    })?;
+    let plugin_config_path = config::nushell_plugin_registry_path()?;
+    if let Some(parent) = plugin_config_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let desired_names: HashSet<&str> = plugins.iter().map(|plugin| plugin.name.as_str()).collect();
+    if let Some(lockfile) = existing_lockfile {
+        for pkg in &lockfile.packages {
+            if pkg.kind != LockedPackageKind::Plugin || desired_names.contains(pkg.name.as_str()) {
+                continue;
+            }
+            let binary_name = pkg.path.as_deref().unwrap_or(&pkg.name);
+            run_plugin_registry_command(
+                &nu_bin,
+                &plugin_config_path,
+                &pkg.name,
+                &global_plugin_remove_command(binary_name),
+            )?;
+        }
+    }
+
+    for (plugin_name, plugin_path) in plugin_targets {
+        run_plugin_registry_command(
+            &nu_bin,
+            &plugin_config_path,
+            plugin_name,
+            &plugin_add_command(plugin_path),
+        )?;
+    }
+
+    Ok(())
+}
+
+fn run_plugin_registry_command(
+    nu_bin: &Path,
+    plugin_config_path: &Path,
+    plugin_name: &str,
+    command: &str,
+) -> Result<()> {
+    let status = Command::new(nu_bin)
+        .arg("--plugin-config")
+        .arg(plugin_config_path)
+        .arg("--commands")
+        .arg(command)
+        .status()?;
+
+    if !status.success() {
+        return Err(crate::error::QuiverError::Other(format!(
+            "failed to update plugin registry for '{}' in {}",
+            plugin_name,
+            plugin_config_path.display()
+        )));
+    }
+
+    Ok(())
+}
+
 fn write_text_file_if_changed(path: &Path, contents: &str) -> Result<bool> {
     if let Ok(existing) = std::fs::read_to_string(path)
         && existing == contents
@@ -2959,6 +3196,19 @@ fn module_dep_matches_lock(spec: &DependencySpec, locked: &LockedPackage) -> boo
     true
 }
 
+fn resolved_module_matches_existing_lock(
+    dep: &ResolvedDep,
+    existing_lockfile: Option<&Lockfile>,
+) -> bool {
+    let Some(locked) =
+        existing_lockfile.and_then(|lock| lock.find_package(&dep.name, LockedPackageKind::Module))
+    else {
+        return false;
+    };
+
+    dep.git == locked.git && dep.tag == locked.tag && dep.rev == locked.rev
+}
+
 fn plugin_dep_matches_lock(
     name: &str,
     spec: &PluginDependencySpec,
@@ -2987,6 +3237,27 @@ fn plugin_dep_matches_lock(
     }
 
     let expected_bin = spec.bin.as_deref().unwrap_or(name);
+    locked.path.as_deref() == Some(expected_bin)
+}
+
+fn resolved_plugin_matches_existing_lock(
+    plugin: &ResolvedPlugin,
+    existing_lockfile: Option<&Lockfile>,
+) -> bool {
+    let Some(locked) = existing_lockfile
+        .and_then(|lock| lock.find_package(&plugin.name, LockedPackageKind::Plugin))
+    else {
+        return false;
+    };
+
+    if plugin.git != locked.git || plugin.tag != locked.tag {
+        return false;
+    }
+    if plugin.git != "nu-core" && plugin.rev != locked.rev {
+        return false;
+    }
+
+    let expected_bin = plugin.bin.as_deref().unwrap_or(&plugin.name);
     locked.path.as_deref() == Some(expected_bin)
 }
 
@@ -3026,9 +3297,18 @@ fn is_global_lockfile_stale(config: &GlobalConfig, lock_path: &Path) -> Result<b
 
     let lockfile = Lockfile::from_path(lock_path)?;
 
-    for name in config.dependencies.keys() {
+    for name in config.modules.keys() {
         if lockfile
             .find_package(name, LockedPackageKind::Module)
+            .is_none()
+        {
+            return Ok(true);
+        }
+    }
+
+    for name in config.plugins.keys() {
+        if lockfile
+            .find_package(name, LockedPackageKind::Plugin)
             .is_none()
         {
             return Ok(true);
@@ -3038,11 +3318,15 @@ fn is_global_lockfile_stale(config: &GlobalConfig, lock_path: &Path) -> Result<b
     for pkg in &lockfile.packages {
         match pkg.kind {
             LockedPackageKind::Module => {
-                if !config.dependencies.contains_key(&pkg.name) {
+                if !config.modules.contains_key(&pkg.name) {
                     return Ok(true);
                 }
             }
-            LockedPackageKind::Plugin => return Ok(true),
+            LockedPackageKind::Plugin => {
+                if !config.plugins.contains_key(&pkg.name) {
+                    return Ok(true);
+                }
+            }
             LockedPackageKind::Other => return Ok(true),
         }
     }
@@ -3184,6 +3468,18 @@ mod tests {
         assert!(config_nu.contains("--config"));
 
         let _ = std::fs::remove_dir_all(nu_env_dir);
+    }
+
+    #[test]
+    fn global_autoload_guidance_uses_vendor_autoload() {
+        assert_eq!(
+            global_autoload_dir_expression(),
+            r#"($nu.default-config-dir | path join "vendor" "autoload")"#
+        );
+        assert_eq!(
+            global_autoload_config_hint(),
+            r#"$env.NU_LIB_DIRS = ($env.NU_LIB_DIRS? | default [] | append ($nu.default-config-dir | path join "vendor" "autoload"))"#
+        );
     }
 
     #[test]
@@ -3510,6 +3806,116 @@ sha256 = "ddd"
     }
 
     #[test]
+    fn resolved_module_matches_existing_lock_requires_exact_resolved_identity() {
+        let lockfile = Lockfile::from_str(
+            r#"version = 1
+
+[[package]]
+name = "nu-salesforce"
+git = "https://github.com/freepicheep/nu-salesforce"
+tag = "v0.1.0"
+rev = "307444896bd7feedfacecafebeef1234567890ab"
+sha256 = "abc"
+"#,
+        )
+        .unwrap();
+        let matching = ResolvedDep {
+            name: "nu-salesforce".to_string(),
+            git: "https://github.com/freepicheep/nu-salesforce".to_string(),
+            tag: Some("v0.1.0".to_string()),
+            rev: "307444896bd7feedfacecafebeef1234567890ab".to_string(),
+        };
+        let changed = ResolvedDep {
+            rev: "aaaaaaaaaaaafacecafebeef1234567890abcdef".to_string(),
+            ..matching.clone()
+        };
+
+        assert!(resolved_module_matches_existing_lock(
+            &matching,
+            Some(&lockfile)
+        ));
+        assert!(!resolved_module_matches_existing_lock(
+            &changed,
+            Some(&lockfile)
+        ));
+    }
+
+    #[test]
+    fn resolved_plugin_matches_existing_lock_checks_bin_and_ref() {
+        let lockfile = Lockfile::from_str(
+            r#"version = 1
+
+[[package]]
+name = "nu_plugin_file"
+kind = "plugin"
+git = "https://github.com/fdncred/nu_plugin_file"
+tag = "v0.22.0"
+rev = "1234567890abcdef1234567890abcdef12345678"
+path = "nu_plugin_file"
+sha256 = "def"
+"#,
+        )
+        .unwrap();
+        let matching = ResolvedPlugin {
+            name: "nu_plugin_file".to_string(),
+            git: "https://github.com/fdncred/nu_plugin_file".to_string(),
+            tag: Some("v0.22.0".to_string()),
+            rev: "1234567890abcdef1234567890abcdef12345678".to_string(),
+            bin: Some("nu_plugin_file".to_string()),
+        };
+        let renamed_bin = ResolvedPlugin {
+            bin: Some("custom_plugin_file".to_string()),
+            ..matching.clone()
+        };
+        let changed_rev = ResolvedPlugin {
+            rev: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            ..matching.clone()
+        };
+
+        assert!(resolved_plugin_matches_existing_lock(
+            &matching,
+            Some(&lockfile)
+        ));
+        assert!(!resolved_plugin_matches_existing_lock(
+            &renamed_bin,
+            Some(&lockfile)
+        ));
+        assert!(!resolved_plugin_matches_existing_lock(
+            &changed_rev,
+            Some(&lockfile)
+        ));
+    }
+
+    #[test]
+    fn resolved_plugin_matches_existing_lock_allows_nu_core_versioned_lock_entries() {
+        let lockfile = Lockfile::from_str(
+            r#"version = 1
+
+[[package]]
+name = "nu_plugin_polars"
+kind = "plugin"
+git = "nu-core"
+rev = "nu-0.111.0"
+path = "nu_plugin_polars"
+sha256 = "ghi"
+"#,
+        )
+        .unwrap();
+        let plugin = ResolvedPlugin {
+            name: "nu_plugin_polars".to_string(),
+            git: "nu-core".to_string(),
+            tag: None,
+            rev: "nu-core".to_string(),
+            bin: Some("nu_plugin_polars".to_string()),
+        };
+
+        assert!(resolved_plugin_matches_existing_lock(
+            &plugin,
+            Some(&lockfile)
+        ));
+    }
+
+    #[test]
     fn frozen_install_without_dependencies_writes_activate_overlay() {
         let project_dir = make_temp_dir("empty_manifest");
         let store = detect_nu_path()
@@ -3610,7 +4016,7 @@ sha256 = "aaa"
             default_git_provider: "github".to_string(),
             install_mode: InstallMode::Copy,
             security: crate::config::SecurityConfig::default(),
-            dependencies: HashMap::from([(
+            modules: HashMap::from([(
                 "nu-utils".to_string(),
                 crate::manifest::DependencySpec {
                     git: "https://github.com/example/nu-utils".to_string(),
@@ -3619,6 +4025,7 @@ sha256 = "aaa"
                     branch: None,
                 },
             )]),
+            plugins: HashMap::new(),
         };
 
         assert!(is_global_lockfile_stale(&config, &lock_path).unwrap());
@@ -3648,7 +4055,7 @@ sha256 = "aaa"
             default_git_provider: "github".to_string(),
             install_mode: InstallMode::Copy,
             security: crate::config::SecurityConfig::default(),
-            dependencies: HashMap::from([(
+            modules: HashMap::from([(
                 "nu-utils".to_string(),
                 crate::manifest::DependencySpec {
                     git: "https://github.com/example/nu-utils".to_string(),
@@ -3657,10 +4064,102 @@ sha256 = "aaa"
                     branch: None,
                 },
             )]),
+            plugins: HashMap::new(),
         };
 
         assert!(!is_global_lockfile_stale(&config, &lock_path).unwrap());
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn global_lockfile_staleness_detects_missing_plugin_entry() {
+        let root = make_temp_dir("global_lock_missing_plugin");
+        let lock_path = root.join("config.lock");
+        std::fs::write(
+            &lock_path,
+            r#"version = 1
+
+[[package]]
+name = "nu-utils"
+git = "https://github.com/example/nu-utils"
+tag = "v1.0.0"
+rev = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+sha256 = "aaa"
+"#,
+        )
+        .unwrap();
+
+        let config = GlobalConfig {
+            modules_dir: None,
+            default_git_provider: "github".to_string(),
+            install_mode: InstallMode::Copy,
+            security: crate::config::SecurityConfig::default(),
+            modules: HashMap::new(),
+            plugins: HashMap::from([(
+                "nu_plugin_inc".to_string(),
+                crate::manifest::PluginDependencySpec {
+                    source: None,
+                    git: "https://github.com/nushell/nu_plugin_inc".to_string(),
+                    tag: Some("v0.91.0".to_string()),
+                    rev: None,
+                    branch: None,
+                    bin: Some("nu_plugin_inc".to_string()),
+                },
+            )]),
+        };
+
+        assert!(is_global_lockfile_stale(&config, &lock_path).unwrap());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn global_lockfile_staleness_accepts_matching_plugin_entries() {
+        let root = make_temp_dir("global_lock_plugin_fresh");
+        let lock_path = root.join("config.lock");
+        std::fs::write(
+            &lock_path,
+            r#"version = 1
+
+[[package]]
+name = "nu_plugin_inc"
+kind = "plugin"
+git = "https://github.com/nushell/nu_plugin_inc"
+tag = "v0.91.0"
+rev = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+path = "nu_plugin_inc"
+sha256 = "aaa"
+"#,
+        )
+        .unwrap();
+
+        let config = GlobalConfig {
+            modules_dir: None,
+            default_git_provider: "github".to_string(),
+            install_mode: InstallMode::Copy,
+            security: crate::config::SecurityConfig::default(),
+            modules: HashMap::new(),
+            plugins: HashMap::from([(
+                "nu_plugin_inc".to_string(),
+                crate::manifest::PluginDependencySpec {
+                    source: None,
+                    git: "https://github.com/nushell/nu_plugin_inc".to_string(),
+                    tag: Some("v0.91.0".to_string()),
+                    rev: None,
+                    branch: None,
+                    bin: Some("nu_plugin_inc".to_string()),
+                },
+            )]),
+        };
+
+        assert!(!is_global_lockfile_stale(&config, &lock_path).unwrap());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn plugin_registry_name_strips_common_prefix() {
+        assert_eq!(plugin_registry_name("nu_plugin_inc"), "inc");
+        assert_eq!(plugin_registry_name("nu_plugin_polars.exe"), "polars");
+        assert_eq!(plugin_registry_name("custom_plugin"), "custom_plugin");
     }
 
     #[test]

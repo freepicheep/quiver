@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::error::{QuiverError, Result};
-use crate::manifest::DependencySpec;
+use crate::manifest::{DependencySpec, PluginDependencySpec};
 
 const DEFAULT_GIT_PROVIDER: &str = "github";
 
@@ -55,6 +55,20 @@ fn normalize_provider_base_url(provider: &str) -> Option<String> {
     None
 }
 
+fn toml_scalar<T: Serialize>(value: &T) -> Result<String> {
+    let scalar = toml::Value::try_from(value)
+        .map_err(|e| QuiverError::Config(format!("failed to encode TOML value: {e}")))?;
+    Ok(scalar.to_string())
+}
+
+fn install_mode_name(mode: InstallMode) -> &'static str {
+    match mode {
+        InstallMode::Clone => "clone",
+        InstallMode::Hardlink => "hardlink",
+        InstallMode::Copy => "copy",
+    }
+}
+
 /// The global quiver config file: `~/.config/quiver/config.toml`.
 ///
 /// Tracks globally-installed modules and optional path overrides.
@@ -68,7 +82,7 @@ pub enum InstallMode {
 
 /// The global quiver config file: `~/.config/quiver/config.toml`.
 ///
-/// Tracks globally-installed modules and optional path overrides.
+/// Tracks globally-installed modules/plugins and optional path overrides.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GlobalConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -83,8 +97,15 @@ pub struct GlobalConfig {
     #[serde(default)]
     pub security: SecurityConfig,
 
-    #[serde(default)]
-    pub dependencies: HashMap<String, DependencySpec>,
+    #[serde(
+        default,
+        alias = "dependencies",
+        skip_serializing_if = "HashMap::is_empty"
+    )]
+    pub modules: HashMap<String, DependencySpec>,
+
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub plugins: HashMap<String, PluginDependencySpec>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -108,7 +129,8 @@ impl Default for GlobalConfig {
             default_git_provider: default_git_provider(),
             install_mode: default_install_mode(),
             security: SecurityConfig::default(),
-            dependencies: HashMap::new(),
+            modules: HashMap::new(),
+            plugins: HashMap::new(),
         }
     }
 }
@@ -145,6 +167,79 @@ impl GlobalConfig {
         Ok(config)
     }
 
+    /// Serialize the global config using stable top-level `[modules]` and `[plugins]` tables.
+    pub fn to_toml_string(&self) -> Result<String> {
+        let mut out = String::new();
+
+        if let Some(modules_dir) = &self.modules_dir {
+            out.push_str(&format!("modules_dir = {}\n", toml_scalar(modules_dir)?));
+        }
+        out.push_str(&format!(
+            "default_git_provider = {}\n",
+            toml_scalar(&self.default_git_provider)?
+        ));
+        out.push_str(&format!(
+            "install_mode = {}\n",
+            toml_scalar(&install_mode_name(self.install_mode))?
+        ));
+
+        out.push_str("\n[security]\n");
+        out.push_str(&format!(
+            "require_signed_assets = {}\n",
+            toml_scalar(&self.security.require_signed_assets)?
+        ));
+
+        if !self.modules.is_empty() {
+            out.push_str("\n[modules]\n");
+            let mut modules: Vec<_> = self.modules.iter().collect();
+            modules.sort_by(|a, b| a.0.cmp(b.0));
+            for (name, spec) in modules {
+                out.push_str(&format!("{name} = {{ git = {}, ", toml_scalar(&spec.git)?));
+                if let Some(tag) = &spec.tag {
+                    out.push_str(&format!("tag = {} }}\n", toml_scalar(tag)?));
+                } else if let Some(rev) = &spec.rev {
+                    out.push_str(&format!("rev = {} }}\n", toml_scalar(rev)?));
+                } else if let Some(branch) = &spec.branch {
+                    out.push_str(&format!("branch = {} }}\n", toml_scalar(branch)?));
+                } else {
+                    return Err(QuiverError::Config(format!(
+                        "module dependency '{name}' is missing tag/rev/branch"
+                    )));
+                }
+            }
+        }
+
+        if !self.plugins.is_empty() {
+            out.push_str("\n[plugins]\n");
+            let mut plugins: Vec<_> = self.plugins.iter().collect();
+            plugins.sort_by(|a, b| a.0.cmp(b.0));
+            for (name, spec) in plugins {
+                let mut parts = Vec::new();
+                if let Some(source) = &spec.source {
+                    parts.push(format!("source = {}", toml_scalar(source)?));
+                }
+                if spec.source.as_deref() != Some("nu-core") {
+                    parts.push(format!("git = {}", toml_scalar(&spec.git)?));
+                }
+                if let Some(tag) = &spec.tag {
+                    parts.push(format!("tag = {}", toml_scalar(tag)?));
+                }
+                if let Some(rev) = &spec.rev {
+                    parts.push(format!("rev = {}", toml_scalar(rev)?));
+                }
+                if let Some(branch) = &spec.branch {
+                    parts.push(format!("branch = {}", toml_scalar(branch)?));
+                }
+                if let Some(bin) = &spec.bin {
+                    parts.push(format!("bin = {}", toml_scalar(bin)?));
+                }
+                out.push_str(&format!("{name} = {{ {} }}\n", parts.join(", ")));
+            }
+        }
+
+        Ok(out)
+    }
+
     /// Save the global config back to disk.
     pub fn save(&self) -> Result<()> {
         let path = global_config_path()?;
@@ -153,8 +248,7 @@ impl GlobalConfig {
             std::fs::create_dir_all(parent)?;
         }
 
-        let content = toml::to_string_pretty(self)
-            .map_err(|e| QuiverError::Config(format!("failed to serialize config: {e}")))?;
+        let content = self.to_toml_string()?;
         std::fs::write(&path, content)?;
         Ok(())
     }
@@ -162,7 +256,7 @@ impl GlobalConfig {
     /// Returns the directory where global modules should be installed.
     ///
     /// Uses the `modules_dir` override if set, otherwise falls back to
-    /// `~/.config/nushell/vendor/quiver/modules/`.
+    /// `~/.config/nushell/vendor/quiver/`.
     pub fn modules_dir(&self) -> Result<PathBuf> {
         if let Some(ref custom) = self.modules_dir {
             Ok(PathBuf::from(custom))
@@ -233,6 +327,18 @@ pub fn installs_plugins_dir() -> Result<PathBuf> {
     Ok(installs_root_dir()?.join("plugins"))
 }
 
+/// Returns Nushell's config directory.
+pub fn nushell_config_dir() -> Result<PathBuf> {
+    let config = dirs::config_dir()
+        .ok_or_else(|| QuiverError::Config("could not determine config directory".to_string()))?;
+    Ok(config.join("nushell"))
+}
+
+/// Returns Nushell's default plugin registry file.
+pub fn nushell_plugin_registry_path() -> Result<PathBuf> {
+    Ok(nushell_config_dir()?.join("plugin.msgpackz"))
+}
+
 /// Returns the shared Nushell-version install store:
 /// `~/.local/share/quiver/installs/nu_versions/` on macOS/Linux.
 pub fn installs_nu_versions_dir() -> Result<PathBuf> {
@@ -240,18 +346,12 @@ pub fn installs_nu_versions_dir() -> Result<PathBuf> {
 }
 
 /// Returns the default global modules directory, using the platform config
-/// directory (where Nushell stores its config) + `vendor/quiver/modules/`.
+/// directory (where Nushell stores its config) + `vendor/quiver/`.
 ///
-/// e.g. `~/Library/Application Support/nushell/vendor/quiver/modules/` on macOS,
-///      `~/.config/nushell/vendor/quiver/modules/` on Linux.
+/// e.g. `~/Library/Application Support/nushell/vendor/quiver/` on macOS,
+///      `~/.config/nushell/vendor/quiver/` on Linux.
 pub fn global_modules_dir() -> Result<PathBuf> {
-    let config = dirs::config_dir()
-        .ok_or_else(|| QuiverError::Config("could not determine config directory".to_string()))?;
-    Ok(config
-        .join("nushell")
-        .join("vendor")
-        .join("quiver")
-        .join("modules"))
+    Ok(nushell_config_dir()?.join("vendor").join("quiver"))
 }
 
 #[cfg(test)]
@@ -265,7 +365,7 @@ mod tests {
             default_git_provider: "github".to_string(),
             install_mode: default_install_mode(),
             security: SecurityConfig::default(),
-            dependencies: HashMap::from([(
+            modules: HashMap::from([(
                 "nu-utils".to_string(),
                 DependencySpec {
                     git: "https://github.com/user/nu-utils".to_string(),
@@ -274,13 +374,27 @@ mod tests {
                     branch: None,
                 },
             )]),
+            plugins: HashMap::from([(
+                "nu_plugin_inc".to_string(),
+                PluginDependencySpec {
+                    source: None,
+                    git: "https://github.com/nushell/nu_plugin_inc".to_string(),
+                    tag: Some("v0.91.0".to_string()),
+                    rev: None,
+                    branch: None,
+                    bin: Some("nu_plugin_inc".to_string()),
+                },
+            )]),
         };
 
-        let serialized = toml::to_string_pretty(&config).unwrap();
+        let serialized = config.to_toml_string().unwrap();
         let parsed: GlobalConfig = toml::from_str(&serialized).unwrap();
 
-        assert_eq!(parsed.dependencies.len(), 1);
-        assert!(parsed.dependencies.contains_key("nu-utils"));
+        assert!(serialized.contains("[modules]"));
+        assert!(!serialized.contains("[dependencies]"));
+        assert_eq!(parsed.modules.len(), 1);
+        assert!(parsed.modules.contains_key("nu-utils"));
+        assert!(parsed.plugins.contains_key("nu_plugin_inc"));
         assert!(parsed.modules_dir.is_none());
         assert_eq!(parsed.default_git_provider, "github");
         assert_eq!(parsed.install_mode, default_install_mode());
@@ -293,10 +407,11 @@ mod tests {
             default_git_provider: "gitlab".to_string(),
             install_mode: InstallMode::Copy,
             security: SecurityConfig::default(),
-            dependencies: HashMap::new(),
+            modules: HashMap::new(),
+            plugins: HashMap::new(),
         };
 
-        let serialized = toml::to_string_pretty(&config).unwrap();
+        let serialized = config.to_toml_string().unwrap();
         let parsed: GlobalConfig = toml::from_str(&serialized).unwrap();
 
         assert_eq!(parsed.modules_dir.as_deref(), Some("/custom/path"));
@@ -311,7 +426,8 @@ mod tests {
             default_git_provider: "github".to_string(),
             install_mode: default_install_mode(),
             security: SecurityConfig::default(),
-            dependencies: HashMap::new(),
+            modules: HashMap::new(),
+            plugins: HashMap::new(),
         };
         assert_eq!(
             config.modules_dir().unwrap(),
@@ -326,11 +442,12 @@ mod tests {
             default_git_provider: "github".to_string(),
             install_mode: default_install_mode(),
             security: SecurityConfig::default(),
-            dependencies: HashMap::new(),
+            modules: HashMap::new(),
+            plugins: HashMap::new(),
         };
         let dir = config.modules_dir().unwrap();
-        // Should end with nushell/vendor/quiver/modules
-        assert!(dir.ends_with("nushell/vendor/quiver/modules"));
+        // Should end with nushell/vendor/quiver
+        assert!(dir.ends_with("nushell/vendor/quiver"));
     }
 
     #[test]
@@ -357,6 +474,12 @@ mod tests {
         let plugins = installs_plugins_dir().unwrap();
         assert!(plugins.ends_with("quiver/installs/plugins"));
 
+        let nushell_config = nushell_config_dir().unwrap();
+        assert!(nushell_config.ends_with("nushell"));
+
+        let plugin_registry = nushell_plugin_registry_path().unwrap();
+        assert!(plugin_registry.ends_with("nushell/plugin.msgpackz"));
+
         let nu_versions = installs_nu_versions_dir().unwrap();
         assert!(nu_versions.ends_with("quiver/installs/nu_versions"));
     }
@@ -366,12 +489,24 @@ mod tests {
         let toml = r#"
 modules_dir = "/tmp/quiver-modules"
 
-[dependencies]
+[modules]
 "#;
         let parsed: GlobalConfig = toml::from_str(toml).unwrap();
         assert_eq!(parsed.default_git_provider, "github");
         assert_eq!(parsed.install_mode, default_install_mode());
         assert!(parsed.security.require_signed_assets);
+    }
+
+    #[test]
+    fn legacy_dependencies_table_still_parses_into_modules() {
+        let toml = r#"
+modules_dir = "/tmp/quiver-modules"
+
+[dependencies]
+nu-utils = { git = "https://github.com/user/nu-utils", tag = "v1.0.0" }
+"#;
+        let parsed: GlobalConfig = toml::from_str(toml).unwrap();
+        assert!(parsed.modules.contains_key("nu-utils"));
     }
 
     #[test]
@@ -396,7 +531,8 @@ modules_dir = "/tmp/quiver-modules"
             default_git_provider: "git.example.com".to_string(),
             install_mode: default_install_mode(),
             security: SecurityConfig::default(),
-            dependencies: HashMap::new(),
+            modules: HashMap::new(),
+            plugins: HashMap::new(),
         };
         assert_eq!(
             config.default_git_provider_base_url().unwrap(),
@@ -411,7 +547,8 @@ modules_dir = "/tmp/quiver-modules"
             default_git_provider: "not-a-provider".to_string(),
             install_mode: default_install_mode(),
             security: SecurityConfig::default(),
-            dependencies: HashMap::new(),
+            modules: HashMap::new(),
+            plugins: HashMap::new(),
         };
         let err = config.default_git_provider_base_url().unwrap_err();
         assert!(err.to_string().contains("unsupported default_git_provider"));
@@ -424,10 +561,11 @@ modules_dir = "/tmp/quiver-modules"
             default_git_provider: "github".to_string(),
             install_mode: InstallMode::Hardlink,
             security: SecurityConfig::default(),
-            dependencies: HashMap::new(),
+            modules: HashMap::new(),
+            plugins: HashMap::new(),
         };
 
-        let serialized = toml::to_string_pretty(&config).unwrap();
+        let serialized = config.to_toml_string().unwrap();
         let parsed: GlobalConfig = toml::from_str(&serialized).unwrap();
         assert_eq!(parsed.install_mode, InstallMode::Hardlink);
     }
@@ -441,10 +579,11 @@ modules_dir = "/tmp/quiver-modules"
             security: SecurityConfig {
                 require_signed_assets: false,
             },
-            dependencies: HashMap::new(),
+            modules: HashMap::new(),
+            plugins: HashMap::new(),
         };
 
-        let serialized = toml::to_string_pretty(&config).unwrap();
+        let serialized = config.to_toml_string().unwrap();
         let parsed: GlobalConfig = toml::from_str(&serialized).unwrap();
         assert!(!parsed.security.require_signed_assets);
     }

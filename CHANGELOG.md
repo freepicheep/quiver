@@ -1,5 +1,13 @@
 # Unreleased
 
+## Added
+
+- Global plugin installation. Global plugins are automatically registered to your default `plugin.msgpackz` upon installation. They are listed under the `[plugins]` table in your global `config.toml` for quiver.
+
+## Changed
+
+- Global module dependencies are now listed under a `[modules]` table in the quiver's global `config.toml`. 
+
 ## Fixed
 
 - Fixed args for lsp configs. Somehow the previous version worked for Nu <=0.110.

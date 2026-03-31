@@ -90,6 +90,10 @@ pub enum Commands {
 
     /// Add a plugin dependency from a git URL or owner/repo shorthand
     AddPlugin {
+        /// Add to global config instead of local nupackage.toml
+        #[arg(short = 'g', long)]
+        global: bool,
+
         /// Git URL, owner/repo shorthand, or core plugin name (e.g. polars)
         url: String,
 
@@ -207,6 +211,7 @@ mod tests {
         let cli = Cli::try_parse_from([
             "quiver",
             "add-plugin",
+            "--global",
             "nushell/nu_plugin_inc",
             "--tag",
             "v0.91.0",
@@ -216,12 +221,14 @@ mod tests {
         .unwrap();
         match cli.command {
             Commands::AddPlugin {
+                global,
                 url,
                 tag,
                 rev,
                 branch,
                 bin,
             } => {
+                assert!(global);
                 assert_eq!(url, "nushell/nu_plugin_inc");
                 assert_eq!(tag.as_deref(), Some("v0.91.0"));
                 assert!(rev.is_none());

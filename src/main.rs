@@ -72,12 +72,19 @@ fn run(command: Commands) -> Result<()> {
             }
         }
         Commands::AddPlugin {
+            global,
             url,
             tag,
             rev,
             branch,
             bin,
-        } => cmd_add_plugin(&cwd, url, tag, rev, branch, bin),
+        } => {
+            if global {
+                cmd_add_global_plugin(url, tag, rev, branch, bin)
+            } else {
+                cmd_add_plugin(&cwd, url, tag, rev, branch, bin)
+            }
+        }
         Commands::Remove { global, name } => {
             if global {
                 cmd_remove_global(name)
@@ -389,6 +396,114 @@ fn cmd_add_plugin(
     installer::install_with_options(dir, false, false, false, true)
 }
 
+fn cmd_add_global_plugin(
+    url: String,
+    tag: Option<String>,
+    rev: Option<String>,
+    branch: Option<String>,
+    bin: Option<String>,
+) -> Result<()> {
+    let mut config = GlobalConfig::load()?;
+
+    if !is_git_url(url.trim())
+        && let Some(core_plugin_name) = resolve_core_plugin_name(&url)
+    {
+        if config.plugins.contains_key(&core_plugin_name) {
+            return Err(error::QuiverError::Config(format!(
+                "plugin dependency '{core_plugin_name}' already exists in global config"
+            )));
+        }
+
+        let dep_spec = PluginDependencySpec {
+            source: Some("nu-core".to_string()),
+            git: String::new(),
+            tag: None,
+            rev: None,
+            branch: None,
+            bin: Some(core_plugin_name.clone()),
+        };
+        dep_spec.validate(&core_plugin_name)?;
+        config.plugins.insert(core_plugin_name.clone(), dep_spec);
+        config.save()?;
+        ui::success(format!(
+            "Added core plugin '{core_plugin_name}' to global config"
+        ));
+        return installer::install_global(false, false, false);
+    }
+
+    let provider_base = if is_git_url(url.trim()) {
+        None
+    } else {
+        Some(config.default_git_provider_base_url()?)
+    };
+    let url = normalize_dependency_source(&url, provider_base.as_deref())?;
+
+    let pkg_name = git::repo_name_from_url(&url).ok_or_else(|| {
+        error::QuiverError::Other(format!("could not determine package name from URL: {url}"))
+    })?;
+    validate_dependency_name(&pkg_name, "plugin dependency")?;
+    if let Some(ref bin_name) = bin {
+        validate_binary_name(bin_name, "plugin dependency bin")?;
+    }
+
+    if config.plugins.contains_key(&pkg_name) {
+        return Err(error::QuiverError::Config(format!(
+            "plugin dependency '{pkg_name}' already exists in global config"
+        )));
+    }
+
+    let dep_spec = if tag.is_none() && rev.is_none() && branch.is_none() {
+        ui::info(format!(
+            "{} plugin source {} to detect version",
+            ui::keyword("Fetching"),
+            url
+        ));
+        let repo_path = git::clone_or_fetch(&url)?;
+        if let Some(latest) = git::latest_tag(&repo_path)? {
+            ui::info(format!("{} latest tag {}", ui::keyword("Found"), latest));
+            PluginDependencySpec {
+                source: None,
+                git: url.to_string(),
+                tag: Some(latest),
+                rev: None,
+                branch: None,
+                bin,
+            }
+        } else {
+            let default_br = git::default_branch(&repo_path)?;
+            ui::warn(format!(
+                "{} tags found; using branch {}",
+                ui::keyword("No"),
+                default_br
+            ));
+            PluginDependencySpec {
+                source: None,
+                git: url.to_string(),
+                tag: None,
+                rev: None,
+                branch: Some(default_br),
+                bin,
+            }
+        }
+    } else {
+        PluginDependencySpec {
+            source: None,
+            git: url.to_string(),
+            tag,
+            rev,
+            branch,
+            bin,
+        }
+    };
+
+    dep_spec.validate(&pkg_name)?;
+    config.plugins.insert(pkg_name.clone(), dep_spec);
+    config.save()?;
+    ui::success(format!("Added plugin '{pkg_name}' to global config"));
+
+    installer::install_global(false, false, false)
+}
+
 fn cmd_add_global(
     url: String,
     tag: Option<String>,
@@ -410,7 +525,7 @@ fn cmd_add_global(
     validate_dependency_name(&pkg_name, "module dependency")?;
 
     // Check if already added
-    if config.dependencies.contains_key(&pkg_name) {
+    if config.modules.contains_key(&pkg_name) {
         return Err(error::QuiverError::Config(format!(
             "dependency '{pkg_name}' already exists in global config"
         )));
@@ -421,7 +536,7 @@ fn cmd_add_global(
     dep_spec.validate(&pkg_name)?;
 
     // Add to global config and save
-    config.dependencies.insert(pkg_name.clone(), dep_spec);
+    config.modules.insert(pkg_name.clone(), dep_spec);
     config.save()?;
 
     eprintln!("Added '{pkg_name}' to global config");
@@ -509,8 +624,9 @@ fn cmd_remove_global(name: String) -> Result<()> {
     validate_dependency_name(&name, "dependency")?;
     let mut config = GlobalConfig::load()?;
 
-    // Check the dep exists
-    if config.dependencies.remove(&name).is_none() {
+    let removed_module = config.modules.remove(&name).is_some();
+    let removed_plugin = config.plugins.remove(&name).is_some();
+    if !removed_module && !removed_plugin {
         return Err(error::QuiverError::Config(format!(
             "dependency '{name}' not found in global config"
         )));
@@ -520,24 +636,27 @@ fn cmd_remove_global(name: String) -> Result<()> {
     config.save()?;
     eprintln!("Removed '{name}' from global config");
 
-    // Remove from global modules dir
-    let modules_dir = config.modules_dir()?;
-    let module_dir = modules_dir.join(&name);
-    if module_dir.exists() {
-        std::fs::remove_dir_all(&module_dir)?;
-        eprintln!("Removed {}/", module_dir.display());
-    }
-    for removed in remove_module_dist_info_dirs(&modules_dir, &name)? {
-        eprintln!("Removed {}/", modules_dir.join(&removed).display());
+    if removed_module {
+        let modules_dir = config.modules_dir()?;
+        let module_dir = modules_dir.join(&name);
+        if module_dir.exists() {
+            std::fs::remove_dir_all(&module_dir)?;
+            eprintln!("Removed {}/", module_dir.display());
+        }
+        for removed in remove_module_dist_info_dirs(&modules_dir, &name)? {
+            eprintln!("Removed {}/", modules_dir.join(&removed).display());
+        }
     }
 
     // Update global lockfile
     let lock_path = config::global_lock_path()?;
     if lock_path.exists() {
         let mut lockfile = lockfile::Lockfile::from_path(&lock_path)?;
-        lockfile
-            .packages
-            .retain(|p| !(p.name == name && p.kind == lockfile::LockedPackageKind::Module));
+        lockfile.packages.retain(|p| {
+            !(p.name == name
+                && ((removed_module && p.kind == lockfile::LockedPackageKind::Module)
+                    || (removed_plugin && p.kind == lockfile::LockedPackageKind::Plugin)))
+        });
         lockfile.write_to(&lock_path)?;
         eprintln!("Updated global lockfile");
     }
@@ -649,7 +768,7 @@ fn cmd_hook() -> Result<()> {
 # Add this to your Nushell environment by running:
 #   mkdir ($nu.default-config-dir | path join "vendor" "autoload")
 #   qv hook | save -f ($nu.default-config-dir | path join "vendor" "autoload" "quiver_hook.nu")
-# Once saved, it will be automatically sourced when you start Nushell.
+# This saves the hook directly into vendor/autoload so Nushell will source it on startup.
 # You can add the above to your config.nu if you want any updates to the hook, but that may slow start time.
 
 $env.config.hooks.env_change.PWD = (
@@ -917,8 +1036,9 @@ fn cmd_list(cwd: &Path) -> Result<()> {
         let config = GlobalConfig::load_or_default()?;
         let modules_dir = config.modules_dir()?;
         let modules = list_installed_module_names(&modules_dir)?;
+        let plugins = list_installed_global_plugin_names(&config::global_lock_path()?)?;
 
-        if modules.is_empty() {
+        if modules.is_empty() && plugins.is_empty() {
             eprintln!(
                 "No installed global dependencies found in {}",
                 modules_dir.display(),
@@ -926,9 +1046,21 @@ fn cmd_list(cwd: &Path) -> Result<()> {
             return Ok(());
         }
 
-        eprintln!("Installed global modules from {}", modules_dir.display());
-        for module in modules {
-            eprintln!("{module}");
+        if !modules.is_empty() {
+            eprintln!("Installed global modules from {}", modules_dir.display());
+            for module in &modules {
+                eprintln!("  {module}");
+            }
+        }
+
+        if !plugins.is_empty() {
+            if !modules.is_empty() {
+                eprintln!();
+            }
+            eprintln!("Installed global plugins:");
+            for plugin in plugins {
+                eprintln!("  {plugin}");
+            }
         }
     }
 
@@ -1013,6 +1145,21 @@ fn list_installed_plugin_names(bin_dir: &Path) -> Result<Vec<String>> {
         }
     }
 
+    plugins.sort();
+    Ok(plugins)
+}
+
+fn list_installed_global_plugin_names(lock_path: &Path) -> Result<Vec<String>> {
+    if !lock_path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut plugins: Vec<String> = lockfile::Lockfile::from_path(lock_path)?
+        .packages
+        .into_iter()
+        .filter(|pkg| pkg.kind == lockfile::LockedPackageKind::Plugin)
+        .map(|pkg| pkg.name)
+        .collect();
     plugins.sort();
     Ok(plugins)
 }
@@ -1184,7 +1331,8 @@ mod tests {
             default_git_provider: provider.to_string(),
             install_mode: config::InstallMode::Copy,
             security: config::SecurityConfig::default(),
-            dependencies: HashMap::new(),
+            modules: HashMap::new(),
+            plugins: HashMap::new(),
         }
     }
 
@@ -1452,6 +1600,39 @@ mod tests {
         let root_dir = make_temp_dir("list_plugins_missing");
         let plugins = list_installed_plugin_names(&root_dir.join("missing")).unwrap();
         assert!(plugins.is_empty());
+        let _ = std::fs::remove_dir_all(root_dir);
+    }
+
+    #[test]
+    fn list_installed_global_plugin_names_reads_lockfile() {
+        let root_dir = make_temp_dir("list_global_plugins");
+        let lock_path = root_dir.join("config.lock");
+        std::fs::write(
+            &lock_path,
+            r#"version = 1
+
+[[package]]
+name = "nu-utils"
+git = "https://github.com/example/nu-utils"
+tag = "v1.0.0"
+rev = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+sha256 = "aaa"
+
+[[package]]
+name = "nu_plugin_inc"
+kind = "plugin"
+git = "https://github.com/nushell/nu_plugin_inc"
+tag = "v0.91.0"
+rev = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+path = "nu_plugin_inc"
+sha256 = "bbb"
+"#,
+        )
+        .unwrap();
+
+        let plugins = list_installed_global_plugin_names(&lock_path).unwrap();
+        assert_eq!(plugins, vec!["nu_plugin_inc".to_string()]);
+
         let _ = std::fs::remove_dir_all(root_dir);
     }
 
@@ -1753,8 +1934,10 @@ mod tests {
         let content = std::fs::read_to_string(&config_path).unwrap();
         assert!(content.contains("[language-server.nu-lsp]"));
         assert!(content.contains("command = \".nu-env/bin/nu\""));
-        assert!(content.contains("--config .nu-env/config.nu"));
-        assert!(content.contains("--plugin-config .nu-env/plugins.msgpackz"));
+        assert!(content.contains("\"--config\""));
+        assert!(content.contains("\".nu-env/config.nu\""));
+        assert!(content.contains("\"--plugin-config\""));
+        assert!(content.contains("\".nu-env/plugins.msgpackz\""));
         assert!(content.contains("--lsp"));
 
         let _ = std::fs::remove_dir_all(project_dir);
