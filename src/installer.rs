@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -198,10 +198,13 @@ pub fn install_global(frozen: bool, allow_unsigned: bool, no_build_fallback: boo
     let modules_dir = config.modules_dir()?;
     let lock_path = config::global_lock_path()?;
     let display_dir = modules_dir.display().to_string();
+    let has_no_dependencies = config.modules.is_empty() && config.plugins.is_empty();
 
-    if config.modules.is_empty() && config.plugins.is_empty() {
+    if has_no_dependencies {
         ui::warn("No dependencies declared in global config.");
-        return Ok(());
+        if frozen || !lock_path.exists() {
+            return Ok(());
+        }
     }
 
     let mut frozen_lockfile: Option<Lockfile> = None;
@@ -221,35 +224,47 @@ pub fn install_global(frozen: bool, allow_unsigned: bool, no_build_fallback: boo
             resolver::resolve_modules_from_lock(&lockfile.packages),
             resolver::resolve_plugins_from_lock(&lockfile.packages),
         )
-    } else if lock_path.exists() && !is_global_lockfile_stale(&config, &lock_path)? {
-        let lockfile = Lockfile::from_path(&lock_path)?;
-        ui::info(format!("{} existing global lockfile", ui::keyword("Using")));
-        (
-            resolver::resolve_modules_from_lock(&lockfile.packages),
-            resolver::resolve_plugins_from_lock(&lockfile.packages),
-        )
-    } else if config.modules.is_empty() && config.plugins.is_empty() {
+    } else if has_no_dependencies {
         (Vec::new(), Vec::new())
     } else {
-        let resolved_modules = if config.modules.is_empty() {
-            Vec::new()
+        let existing_lockfile = if lock_path.exists() {
+            Some(Lockfile::from_path(&lock_path)?)
         } else {
-            ui::info(format!(
-                "{} global module dependencies",
-                ui::keyword("Resolving")
-            ));
-            resolver::resolve_modules_from_deps(&config.modules)?
+            None
         };
-        let resolved_plugins = if config.plugins.is_empty() {
-            Vec::new()
+        if let Some(lockfile) = existing_lockfile.as_ref()
+            && !global_lockfile_is_stale(&config, lockfile)
+        {
+            ui::info(format!("{} existing global lockfile", ui::keyword("Using")));
+            (
+                resolver::resolve_modules_from_lock(&lockfile.packages),
+                resolver::resolve_plugins_from_lock(&lockfile.packages),
+            )
         } else {
-            ui::info(format!(
-                "{} global plugin dependencies",
-                ui::keyword("Resolving")
-            ));
-            resolver::resolve_plugins_from_deps(&config.plugins)?
-        };
-        (resolved_modules, resolved_plugins)
+            let (mut resolved_modules, unresolved_modules) =
+                partition_global_module_dependencies(&config.modules, existing_lockfile.as_ref());
+            if !unresolved_modules.is_empty() {
+                ui::info(format!(
+                    "{} global module dependencies",
+                    ui::keyword("Resolving")
+                ));
+                resolved_modules.extend(resolver::resolve_modules_from_deps(&unresolved_modules)?);
+                resolved_modules.sort_by(|a, b| a.name.cmp(&b.name));
+            }
+
+            let (mut resolved_plugins, unresolved_plugins) =
+                partition_global_plugin_dependencies(&config.plugins, existing_lockfile.as_ref());
+            if !unresolved_plugins.is_empty() {
+                ui::info(format!(
+                    "{} global plugin dependencies",
+                    ui::keyword("Resolving")
+                ));
+                resolved_plugins.extend(resolver::resolve_plugins_from_deps(&unresolved_plugins)?);
+                resolved_plugins.sort_by(|a, b| a.name.cmp(&b.name));
+            }
+
+            (resolved_modules, resolved_plugins)
+        }
     };
 
     install_resolved_global(
@@ -305,18 +320,34 @@ fn install_resolved_global(
 
     for dep in modules {
         safety::validate_dependency_name(&dep.name, "module dependency")?;
-        if !resolved_module_matches_existing_lock(dep, existing_lockfile.as_ref()) {
+        let existing_locked_module = existing_lockfile
+            .as_ref()
+            .and_then(|lock| lock.find_package(&dep.name, LockedPackageKind::Module));
+        let module_is_current =
+            installed_global_module_matches_lock(dep, modules_dir, existing_locked_module)?;
+        if !module_is_current {
             ui::info(format!(
                 "{} module {}@{}",
                 ui::keyword("Installing"),
                 dep.name,
                 &dep.rev[..12.min(dep.rev.len())]
             ));
+            install_dep(dep, modules_dir, install_mode)?;
         }
-        install_dep(dep, modules_dir, install_mode)?;
 
         let dest = modules_dir.join(&dep.name);
-        let sha256 = resolver::compute_checksum(&dest)?;
+        let sha256 = if module_is_current {
+            existing_locked_module
+                .map(|locked| locked.sha256.clone())
+                .ok_or_else(|| {
+                    crate::error::QuiverError::Other(format!(
+                        "missing existing lockfile entry for module '{}'",
+                        dep.name
+                    ))
+                })?
+        } else {
+            resolver::compute_checksum(&dest)?
+        };
         if frozen {
             verify_frozen_checksum(
                 frozen_lockfile,
@@ -436,7 +467,10 @@ fn install_resolved_global(
         lockfile.write_to(lock_path)?;
     }
 
-    reconcile_global_plugin_registry(existing_lockfile.as_ref(), plugins, &plugin_targets)?;
+    let removed_module_count =
+        reconcile_global_modules(existing_lockfile.as_ref(), modules, modules_dir)?;
+    let removed_plugin_count =
+        reconcile_global_plugin_registry(existing_lockfile.as_ref(), plugins, &plugin_targets)?;
 
     let mut summary_parts = Vec::new();
     if changed_module_count > 0 {
@@ -445,10 +479,23 @@ fn install_resolved_global(
             "Installed {changed_module_count} module{module_suffix} into {modules_display_name}/"
         ));
     }
+    if removed_module_count > 0 {
+        let module_suffix = if removed_module_count == 1 { "" } else { "s" };
+        summary_parts.push(format!(
+            "Removed {removed_module_count} stale global module{module_suffix} from {modules_display_name}/"
+        ));
+    }
     if changed_plugin_count > 0 {
         let plugin_suffix = if changed_plugin_count == 1 { "" } else { "s" };
         summary_parts.push(format!(
             "Registered {changed_plugin_count} global plugin{plugin_suffix} in {}",
+            config::nushell_plugin_registry_path()?.display()
+        ));
+    }
+    if removed_plugin_count > 0 {
+        let plugin_suffix = if removed_plugin_count == 1 { "" } else { "s" };
+        summary_parts.push(format!(
+            "Removed {removed_plugin_count} stale global plugin{plugin_suffix} from {}",
             config::nushell_plugin_registry_path()?.display()
         ));
     }
@@ -466,6 +513,175 @@ fn install_resolved_global(
     }
 
     Ok(())
+}
+
+fn reconcile_global_modules(
+    existing_lockfile: Option<&Lockfile>,
+    modules: &[ResolvedDep],
+    modules_dir: &Path,
+) -> Result<usize> {
+    let Some(lockfile) = existing_lockfile else {
+        return Ok(0);
+    };
+
+    let desired_names: HashSet<&str> = modules.iter().map(|dep| dep.name.as_str()).collect();
+    let mut removed_count = 0;
+
+    for pkg in &lockfile.packages {
+        if pkg.kind != LockedPackageKind::Module || desired_names.contains(pkg.name.as_str()) {
+            continue;
+        }
+
+        let module_dir = modules_dir.join(&pkg.name);
+        let mut removed_any = false;
+
+        if module_dir.exists() {
+            std::fs::remove_dir_all(&module_dir)?;
+            removed_any = true;
+            ui::success(format!(
+                "Removed global module '{}' from {}",
+                pkg.name,
+                module_dir.display()
+            ));
+        }
+
+        for _removed in remove_module_dist_info_dirs(modules_dir, &pkg.name)? {
+            removed_any = true;
+        }
+
+        if removed_any {
+            removed_count += 1;
+        }
+    }
+
+    Ok(removed_count)
+}
+
+fn partition_global_module_dependencies(
+    deps: &HashMap<String, DependencySpec>,
+    existing_lockfile: Option<&Lockfile>,
+) -> (Vec<ResolvedDep>, HashMap<String, DependencySpec>) {
+    let mut resolved = Vec::new();
+    let mut unresolved = HashMap::new();
+
+    for (name, spec) in deps {
+        let Some(locked) =
+            existing_lockfile.and_then(|lock| lock.find_package(name, LockedPackageKind::Module))
+        else {
+            unresolved.insert(name.clone(), spec.clone());
+            continue;
+        };
+
+        if module_dep_matches_lock(spec, locked) {
+            resolved.push(resolved_module_from_locked(locked));
+        } else {
+            unresolved.insert(name.clone(), spec.clone());
+        }
+    }
+
+    resolved.sort_by(|a, b| a.name.cmp(&b.name));
+    (resolved, unresolved)
+}
+
+fn partition_global_plugin_dependencies(
+    deps: &HashMap<String, PluginDependencySpec>,
+    existing_lockfile: Option<&Lockfile>,
+) -> (Vec<ResolvedPlugin>, HashMap<String, PluginDependencySpec>) {
+    let mut resolved = Vec::new();
+    let mut unresolved = HashMap::new();
+
+    for (name, spec) in deps {
+        let Some(locked) =
+            existing_lockfile.and_then(|lock| lock.find_package(name, LockedPackageKind::Plugin))
+        else {
+            unresolved.insert(name.clone(), spec.clone());
+            continue;
+        };
+
+        if plugin_dep_matches_lock(name, spec, locked, None) {
+            resolved.push(resolved_plugin_from_locked(locked));
+        } else {
+            unresolved.insert(name.clone(), spec.clone());
+        }
+    }
+
+    resolved.sort_by(|a, b| a.name.cmp(&b.name));
+    (resolved, unresolved)
+}
+
+fn resolved_module_from_locked(locked: &LockedPackage) -> ResolvedDep {
+    ResolvedDep {
+        name: locked.name.clone(),
+        git: locked.git.clone(),
+        tag: locked.tag.clone(),
+        rev: locked.rev.clone(),
+    }
+}
+
+fn resolved_plugin_from_locked(locked: &LockedPackage) -> ResolvedPlugin {
+    ResolvedPlugin {
+        name: locked.name.clone(),
+        git: locked.git.clone(),
+        tag: locked.tag.clone(),
+        rev: locked.rev.clone(),
+        bin: locked.path.clone(),
+    }
+}
+
+fn installed_global_module_matches_lock(
+    dep: &ResolvedDep,
+    modules_dir: &Path,
+    locked: Option<&LockedPackage>,
+) -> Result<bool> {
+    let Some(locked) = locked else {
+        return Ok(false);
+    };
+    if dep.git != locked.git || dep.tag != locked.tag || dep.rev != locked.rev {
+        return Ok(false);
+    }
+
+    let dest = modules_dir.join(&dep.name);
+    if !dest.is_dir() {
+        return Ok(false);
+    }
+
+    let dist_info_dest = modules_dir.join(dist_info_dir_name(dep));
+    if !dist_info_dest.is_dir() {
+        return Ok(false);
+    }
+
+    Ok(resolver::compute_checksum(&dest)? == locked.sha256)
+}
+
+fn remove_module_dist_info_dirs(modules_dir: &Path, module_name: &str) -> Result<Vec<String>> {
+    if !modules_dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut removed = Vec::new();
+    let prefix = format!("{module_name}-");
+
+    for entry in std::fs::read_dir(modules_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        if !name.starts_with(&prefix) || !name.ends_with(".dist-info") {
+            continue;
+        }
+
+        std::fs::remove_dir_all(&path)?;
+        removed.push(name.to_string());
+    }
+
+    removed.sort();
+    Ok(removed)
 }
 
 /// Install a list of resolved dependencies into a target directory and write the lockfile.
@@ -2305,7 +2521,17 @@ fn reconcile_global_plugin_registry(
     existing_lockfile: Option<&Lockfile>,
     plugins: &[ResolvedPlugin],
     plugin_targets: &[(String, PathBuf)],
-) -> Result<()> {
+) -> Result<usize> {
+    let desired_names: HashSet<&str> = plugins.iter().map(|plugin| plugin.name.as_str()).collect();
+    let has_stale_plugins = existing_lockfile.is_some_and(|lockfile| {
+        lockfile.packages.iter().any(|pkg| {
+            pkg.kind == LockedPackageKind::Plugin && !desired_names.contains(pkg.name.as_str())
+        })
+    });
+    if !has_stale_plugins && plugin_targets.is_empty() {
+        return Ok(0);
+    }
+
     let nu_bin = detect_nu_path().ok_or_else(|| {
         crate::error::QuiverError::Other(
             "cannot register global plugins because 'nu' was not found in PATH".to_string(),
@@ -2316,7 +2542,7 @@ fn reconcile_global_plugin_registry(
         std::fs::create_dir_all(parent)?;
     }
 
-    let desired_names: HashSet<&str> = plugins.iter().map(|plugin| plugin.name.as_str()).collect();
+    let mut removed_count = 0;
     if let Some(lockfile) = existing_lockfile {
         for pkg in &lockfile.packages {
             if pkg.kind != LockedPackageKind::Plugin || desired_names.contains(pkg.name.as_str()) {
@@ -2329,6 +2555,12 @@ fn reconcile_global_plugin_registry(
                 &pkg.name,
                 &global_plugin_remove_command(binary_name),
             )?;
+            ui::success(format!(
+                "Removed global plugin '{}' from {}",
+                pkg.name,
+                plugin_config_path.display()
+            ));
+            removed_count += 1;
         }
     }
 
@@ -2341,7 +2573,7 @@ fn reconcile_global_plugin_registry(
         )?;
     }
 
-    Ok(())
+    Ok(removed_count)
 }
 
 fn run_plugin_registry_command(
@@ -3290,19 +3522,23 @@ fn plugin_install_display_ref(plugin: &ResolvedPlugin, version_dir: &Path) -> St
 }
 
 /// Check if the global lockfile is stale relative to the global config.
+#[cfg(test)]
 fn is_global_lockfile_stale(config: &GlobalConfig, lock_path: &Path) -> Result<bool> {
     if !lock_path.exists() {
         return Ok(true);
     }
 
     let lockfile = Lockfile::from_path(lock_path)?;
+    Ok(global_lockfile_is_stale(config, &lockfile))
+}
 
+fn global_lockfile_is_stale(config: &GlobalConfig, lockfile: &Lockfile) -> bool {
     for name in config.modules.keys() {
         if lockfile
             .find_package(name, LockedPackageKind::Module)
             .is_none()
         {
-            return Ok(true);
+            return true;
         }
     }
 
@@ -3311,7 +3547,7 @@ fn is_global_lockfile_stale(config: &GlobalConfig, lock_path: &Path) -> Result<b
             .find_package(name, LockedPackageKind::Plugin)
             .is_none()
         {
-            return Ok(true);
+            return true;
         }
     }
 
@@ -3319,19 +3555,19 @@ fn is_global_lockfile_stale(config: &GlobalConfig, lock_path: &Path) -> Result<b
         match pkg.kind {
             LockedPackageKind::Module => {
                 if !config.modules.contains_key(&pkg.name) {
-                    return Ok(true);
+                    return true;
                 }
             }
             LockedPackageKind::Plugin => {
                 if !config.plugins.contains_key(&pkg.name) {
-                    return Ok(true);
+                    return true;
                 }
             }
-            LockedPackageKind::Other => return Ok(true),
+            LockedPackageKind::Other => return true,
         }
     }
 
-    Ok(false)
+    false
 }
 
 #[cfg(test)]
@@ -4156,6 +4392,211 @@ sha256 = "aaa"
     }
 
     #[test]
+    fn partition_global_dependencies_reuses_matching_lock_entries() {
+        let lockfile = Lockfile {
+            version: 1,
+            packages: vec![
+                LockedPackage {
+                    name: "nu-salesforce".to_string(),
+                    kind: LockedPackageKind::Module,
+                    git: "https://github.com/freepicheap/nu-salesforce".to_string(),
+                    tag: Some("v0.3.1".to_string()),
+                    rev: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+                    path: None,
+                    sha256: "module-sha".to_string(),
+                    asset_sha256: None,
+                    asset_url: None,
+                },
+                LockedPackage {
+                    name: "nu_plugin_file".to_string(),
+                    kind: LockedPackageKind::Plugin,
+                    git: "https://github.com/fdncred/nu_plugin_file".to_string(),
+                    tag: Some("v0.22.0".to_string()),
+                    rev: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+                    path: Some("nu_plugin_file".to_string()),
+                    sha256: "plugin-sha".to_string(),
+                    asset_sha256: None,
+                    asset_url: None,
+                },
+            ],
+        };
+
+        let module_deps = HashMap::from([
+            (
+                "nu-utils".to_string(),
+                crate::manifest::DependencySpec {
+                    git: "https://github.com/example/nu-utils".to_string(),
+                    tag: Some("v1.0.0".to_string()),
+                    rev: None,
+                    branch: None,
+                },
+            ),
+            (
+                "nu-salesforce".to_string(),
+                crate::manifest::DependencySpec {
+                    git: "https://github.com/freepicheap/nu-salesforce".to_string(),
+                    tag: Some("v0.3.1".to_string()),
+                    rev: None,
+                    branch: None,
+                },
+            ),
+        ]);
+        let plugin_deps = HashMap::from([
+            (
+                "nu_plugin_file".to_string(),
+                crate::manifest::PluginDependencySpec {
+                    source: None,
+                    git: "https://github.com/fdncred/nu_plugin_file".to_string(),
+                    tag: Some("v0.22.0".to_string()),
+                    rev: None,
+                    branch: None,
+                    bin: Some("nu_plugin_file".to_string()),
+                },
+            ),
+            (
+                "nu_plugin_semver".to_string(),
+                crate::manifest::PluginDependencySpec {
+                    source: None,
+                    git: "https://github.com/abusch/nu_plugin_semver".to_string(),
+                    tag: Some("v0.11.15".to_string()),
+                    rev: None,
+                    branch: None,
+                    bin: Some("nu_plugin_semver".to_string()),
+                },
+            ),
+        ]);
+
+        let (resolved_modules, unresolved_modules) =
+            partition_global_module_dependencies(&module_deps, Some(&lockfile));
+        assert_eq!(resolved_modules.len(), 1);
+        assert_eq!(resolved_modules[0].name, "nu-salesforce");
+        assert_eq!(
+            resolved_modules[0].rev,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        assert_eq!(unresolved_modules.len(), 1);
+        assert!(unresolved_modules.contains_key("nu-utils"));
+
+        let (resolved_plugins, unresolved_plugins) =
+            partition_global_plugin_dependencies(&plugin_deps, Some(&lockfile));
+        assert_eq!(resolved_plugins.len(), 1);
+        assert_eq!(resolved_plugins[0].name, "nu_plugin_file");
+        assert_eq!(resolved_plugins[0].bin.as_deref(), Some("nu_plugin_file"));
+        assert_eq!(unresolved_plugins.len(), 1);
+        assert!(unresolved_plugins.contains_key("nu_plugin_semver"));
+    }
+
+    #[test]
+    fn installed_global_module_matches_lock_requires_matching_tree_and_dist_info() {
+        let modules_dir = make_temp_dir("global_module_matches_lock");
+        let dep = ResolvedDep {
+            name: "nu-salesforce".to_string(),
+            git: "https://github.com/freepicheap/nu-salesforce".to_string(),
+            tag: Some("v0.3.1".to_string()),
+            rev: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        };
+
+        let module_dir = modules_dir.join(&dep.name);
+        std::fs::create_dir_all(&module_dir).unwrap();
+        std::fs::write(module_dir.join("mod.nu"), "export def hi [] { 'hi' }\n").unwrap();
+
+        let locked = LockedPackage {
+            name: dep.name.clone(),
+            kind: LockedPackageKind::Module,
+            git: dep.git.clone(),
+            tag: dep.tag.clone(),
+            rev: dep.rev.clone(),
+            path: None,
+            sha256: resolver::compute_checksum(&module_dir).unwrap(),
+            asset_sha256: None,
+            asset_url: None,
+        };
+
+        assert!(!installed_global_module_matches_lock(&dep, &modules_dir, Some(&locked)).unwrap());
+
+        std::fs::create_dir_all(modules_dir.join(dist_info_dir_name(&dep))).unwrap();
+        assert!(installed_global_module_matches_lock(&dep, &modules_dir, Some(&locked)).unwrap());
+
+        std::fs::write(module_dir.join("mod.nu"), "export def hi [] { 'bye' }\n").unwrap();
+        assert!(!installed_global_module_matches_lock(&dep, &modules_dir, Some(&locked)).unwrap());
+
+        let _ = std::fs::remove_dir_all(modules_dir);
+    }
+
+    #[test]
+    fn reconcile_global_modules_removes_stale_module_directories_and_metadata() {
+        let modules_dir = make_temp_dir("reconcile_global_modules");
+        let stale_name = "nu-salesforce";
+        let kept_name = "nu-utils";
+
+        std::fs::create_dir_all(modules_dir.join(stale_name)).unwrap();
+        std::fs::create_dir_all(modules_dir.join(format!("{stale_name}-v0.3.0.dist-info")))
+            .unwrap();
+        std::fs::create_dir_all(modules_dir.join(format!("{stale_name}-abcdef123456.dist-info")))
+            .unwrap();
+        std::fs::create_dir_all(modules_dir.join(kept_name)).unwrap();
+        std::fs::create_dir_all(modules_dir.join(format!("{kept_name}-v1.0.0.dist-info"))).unwrap();
+
+        let lockfile = Lockfile {
+            version: 1,
+            packages: vec![
+                LockedPackage {
+                    name: stale_name.to_string(),
+                    kind: LockedPackageKind::Module,
+                    git: "https://github.com/freepicheap/nu-salesforce".to_string(),
+                    tag: Some("v0.3.0".to_string()),
+                    rev: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+                    path: None,
+                    sha256: "stale-sha".to_string(),
+                    asset_sha256: None,
+                    asset_url: None,
+                },
+                LockedPackage {
+                    name: kept_name.to_string(),
+                    kind: LockedPackageKind::Module,
+                    git: "https://github.com/fdncred/nu-utils".to_string(),
+                    tag: Some("v1.0.0".to_string()),
+                    rev: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+                    path: None,
+                    sha256: "kept-sha".to_string(),
+                    asset_sha256: None,
+                    asset_url: None,
+                },
+            ],
+        };
+        let desired_modules = vec![ResolvedDep {
+            name: kept_name.to_string(),
+            git: "https://github.com/fdncred/nu-utils".to_string(),
+            tag: Some("v1.0.0".to_string()),
+            rev: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+        }];
+
+        let removed =
+            reconcile_global_modules(Some(&lockfile), &desired_modules, &modules_dir).unwrap();
+
+        assert_eq!(removed, 1);
+        assert!(!modules_dir.join(stale_name).exists());
+        assert!(
+            !modules_dir
+                .join(format!("{stale_name}-v0.3.0.dist-info"))
+                .exists()
+        );
+        assert!(
+            !modules_dir
+                .join(format!("{stale_name}-abcdef123456.dist-info"))
+                .exists()
+        );
+        assert!(modules_dir.join(kept_name).is_dir());
+        assert!(
+            modules_dir
+                .join(format!("{kept_name}-v1.0.0.dist-info"))
+                .is_dir()
+        );
+
+        let _ = std::fs::remove_dir_all(modules_dir);
+    }
+
+    #[test]
     fn plugin_registry_name_strips_common_prefix() {
         assert_eq!(plugin_registry_name("nu_plugin_inc"), "inc");
         assert_eq!(plugin_registry_name("nu_plugin_polars.exe"), "polars");
@@ -4655,6 +5096,20 @@ nu_plugin_inc = { git = "https://github.com/nushell/nu_plugin_inc", tag = "v0.91
         assert!(!plugin_config.exists());
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reconcile_global_plugin_registry_skips_nu_lookup_when_no_plugin_changes() {
+        let empty_path = make_temp_dir("no_nu_path");
+        let _path_guard = EnvVarGuard::set("PATH", &empty_path);
+        let plugins = Vec::<ResolvedPlugin>::new();
+        let plugin_targets = Vec::<(String, PathBuf)>::new();
+
+        let removed = reconcile_global_plugin_registry(None, &plugins, &plugin_targets).unwrap();
+
+        assert_eq!(removed, 0);
+
+        let _ = std::fs::remove_dir_all(empty_path);
     }
 
     #[test]

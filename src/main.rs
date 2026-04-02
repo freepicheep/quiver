@@ -539,7 +539,7 @@ fn cmd_add_global(
     config.modules.insert(pkg_name.clone(), dep_spec);
     config.save()?;
 
-    eprintln!("Added '{pkg_name}' to global config");
+    ui::success(format!("Added '{pkg_name}' to global config"));
 
     // Run global install
     installer::install_global(false, false, false)
@@ -624,45 +624,16 @@ fn cmd_remove_global(name: String) -> Result<()> {
     validate_dependency_name(&name, "dependency")?;
     let mut config = GlobalConfig::load()?;
 
-    let removed_module = config.modules.remove(&name).is_some();
-    let removed_plugin = config.plugins.remove(&name).is_some();
-    if !removed_module && !removed_plugin {
+    let removed = config.modules.remove(&name).is_some() || config.plugins.remove(&name).is_some();
+    if !removed {
         return Err(error::QuiverError::Config(format!(
             "dependency '{name}' not found in global config"
         )));
     }
 
-    // Save updated config
     config.save()?;
-    eprintln!("Removed '{name}' from global config");
+    ui::success(format!("Removed '{name}' from global config"));
 
-    if removed_module {
-        let modules_dir = config.modules_dir()?;
-        let module_dir = modules_dir.join(&name);
-        if module_dir.exists() {
-            std::fs::remove_dir_all(&module_dir)?;
-            eprintln!("Removed {}/", module_dir.display());
-        }
-        for removed in remove_module_dist_info_dirs(&modules_dir, &name)? {
-            eprintln!("Removed {}/", modules_dir.join(&removed).display());
-        }
-    }
-
-    // Update global lockfile
-    let lock_path = config::global_lock_path()?;
-    if lock_path.exists() {
-        let mut lockfile = lockfile::Lockfile::from_path(&lock_path)?;
-        lockfile.packages.retain(|p| {
-            !(p.name == name
-                && ((removed_module && p.kind == lockfile::LockedPackageKind::Module)
-                    || (removed_plugin && p.kind == lockfile::LockedPackageKind::Plugin)))
-        });
-        lockfile.write_to(&lock_path)?;
-        eprintln!("Updated global lockfile");
-    }
-
-    // Regenerate the activate.nu overlay with remaining global packages
-    eprintln!("Regenerating global activate.nu...");
     installer::install_global(false, false, false)?;
 
     Ok(())
