@@ -214,8 +214,8 @@ You can also set a custom host like `git.example.com` or a full `https://...` ba
 
 `install_mode` controls how modules are materialized into the install directory.
 - `clone`: prefers copy-on-write clone behavior when available; falls back to `copy` if clone fails
-- `hardlink`: uses hardlinks for files
-- `copy`: always copies files
+- `hardlink`: uses hardlinks for files; falls back to `copy` if hardlinking is unsupported
+- `copy`: always copies files; useful for CI/container filesystems
 
 ## Plugin Install Behavior
 
