@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Mutex, OnceLock};
 
 use flate2::read::GzDecoder;
 use semver::{Version, VersionReq};
@@ -28,6 +29,10 @@ const NU_ENV_DIR: &str = ".nu-env";
 const MODULES_SUBDIR: &str = "modules";
 /// The subdirectory within `.nu-env/` where the nu binary symlink lives.
 const BIN_SUBDIR: &str = "bin";
+const QUIVER_SKIP_NU_INSTALL_ENV: &str = "QUIVER_SKIP_NU_INSTALL";
+const QUIVER_NU_BIN_ENV: &str = "QUIVER_NU_BIN";
+
+static GITHUB_RELEASE_CACHE: OnceLock<Mutex<HashMap<String, Vec<GitHubRelease>>>> = OnceLock::new();
 
 #[derive(Debug, Default)]
 struct NupmMetadataHints {
@@ -53,6 +58,10 @@ struct GitHubReleaseAssetCandidate {
     release_tag: String,
     release_assets: Vec<GitHubReleaseAsset>,
     asset: GitHubReleaseAsset,
+}
+
+fn github_release_cache() -> &'static Mutex<HashMap<String, Vec<GitHubRelease>>> {
+    GITHUB_RELEASE_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 /// Run a full local install: resolve -> fetch -> checksum -> place -> lock.
@@ -1015,7 +1024,7 @@ export alias nu = ^{nu_bin_literal} --config {config_literal} --plugin-config {p
 /// Create a symlink at `.nu-env/bin/nu` pointing to a matching `nu` binary.
 ///
 /// Resolution order:
-/// 1. The active `nu` version from PATH, materialized into quiver's store
+/// 1. The active `nu` version from PATH
 /// 2. `~/.local/share/quiver/installs/nu_versions/<version>/` store
 /// 3. A matching GitHub release installed into quiver's store
 pub fn create_nu_symlink(nu_env_dir: &Path, nu_version_req: Option<&str>) -> Result<()> {
@@ -1035,6 +1044,15 @@ fn create_nu_symlink_with_policy(
     nu_version_req: Option<&str>,
     security_policy: SecurityPolicy,
 ) -> Result<()> {
+    if env_var_is_truthy(QUIVER_SKIP_NU_INSTALL_ENV) {
+        ui::info(format!(
+            "{} .nu-env/bin/nu because {} is set",
+            ui::keyword("Skipping"),
+            QUIVER_SKIP_NU_INSTALL_ENV
+        ));
+        return Ok(());
+    }
+
     let bin_dir = nu_env_dir.join(BIN_SUBDIR);
     std::fs::create_dir_all(&bin_dir)?;
 
@@ -1131,7 +1149,6 @@ fn resolve_nu_store_candidate(
 
     Ok(None)
 }
-
 fn core_plugin_candidate_paths(nu_path: &Path, binary_filename: &str) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
 
@@ -1170,6 +1187,18 @@ fn find_core_plugin_binary_for_nu(nu_path: &Path, binary_filename: &str) -> Opti
 
 /// Detect the absolute path to the user's `nu` binary from PATH.
 fn detect_nu_path() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os(QUIVER_NU_BIN_ENV) {
+        let candidate = PathBuf::from(path);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        ui::warn(format!(
+            "{} points to '{}', but that file does not exist; falling back to PATH lookup",
+            QUIVER_NU_BIN_ENV,
+            candidate.display()
+        ));
+    }
+
     let output = if cfg!(windows) {
         Command::new("where").arg("nu").output().ok()?
     } else {
@@ -1185,6 +1214,18 @@ fn detect_nu_path() -> Option<PathBuf> {
     } else {
         Some(PathBuf::from(path_str))
     }
+}
+
+fn env_var_is_truthy(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
 }
 
 fn detect_nu_binary_version(path: &Path) -> Option<Version> {
@@ -1318,35 +1359,142 @@ fn exact_required_version(requirement: &VersionReq) -> Option<Version> {
 }
 
 fn fetch_nu_github_releases() -> Result<Vec<GitHubRelease>> {
-    ui::info(format!(
-        "{} Nushell release metadata from GitHub",
-        ui::keyword("Querying")
-    ));
-    let output = Command::new("curl")
-        .args([
-            "-fsSL",
-            "-H",
-            "Accept: application/vnd.github+json",
-            "-H",
-            "User-Agent: quiver",
-            "https://api.github.com/repos/nushell/nushell/releases?per_page=100",
-        ])
-        .output()?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(crate::error::QuiverError::Other(format!(
-            "failed to query Nushell releases from GitHub: {stderr}"
-        )));
-    }
-
-    serde_json::from_slice(&output.stdout).map_err(|err| {
-        crate::error::QuiverError::Other(format!("invalid GitHub release response: {err}"))
-    })
+    fetch_github_releases(
+        "https://api.github.com/repos/nushell/nushell/releases?per_page=100",
+        "Nushell",
+    )
 }
 
 fn parse_version_from_release_tag(tag: &str) -> Option<Version> {
     let trimmed = tag.trim().trim_start_matches('v');
     Version::parse(trimmed).ok()
+}
+
+fn fetch_github_releases(url: &str, label: &str) -> Result<Vec<GitHubRelease>> {
+    if let Ok(cache) = github_release_cache().lock()
+        && let Some(cached) = cache.get(url)
+    {
+        return Ok(cached.clone());
+    }
+
+    ui::info(format!(
+        "{} release metadata for {label} from GitHub",
+        ui::keyword("Querying")
+    ));
+    let body = github_api_get(url)?;
+    let releases: Vec<GitHubRelease> = serde_json::from_slice(&body).map_err(|err| {
+        crate::error::QuiverError::Other(format!(
+            "invalid GitHub release response for {label}: {err}"
+        ))
+    })?;
+
+    if let Ok(mut cache) = github_release_cache().lock() {
+        cache.insert(url.to_string(), releases.clone());
+    }
+
+    Ok(releases)
+}
+
+fn github_api_get(url: &str) -> Result<Vec<u8>> {
+    let temp_dir = std::env::temp_dir().join(format!("quiver-gh-{}", std::process::id()));
+    std::fs::create_dir_all(&temp_dir)?;
+    let headers_path = temp_dir.join("headers.txt");
+    let body_path = temp_dir.join("body.json");
+
+    let mut command = Command::new("curl");
+    command.args([
+        "-sSL",
+        "-D",
+        headers_path.to_string_lossy().as_ref(),
+        "-o",
+        body_path.to_string_lossy().as_ref(),
+        "-w",
+        "%{http_code}",
+        "-H",
+        "Accept: application/vnd.github+json",
+        "-H",
+        "User-Agent: quiver",
+    ]);
+
+    if let Some(token) = github_token_from_env() {
+        command.arg("-H");
+        command.arg(format!("Authorization: Bearer {token}"));
+    }
+
+    command.arg(url);
+    let output = command.output()?;
+
+    let status_code = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse::<u16>()
+        .unwrap_or_default();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let headers = parse_http_headers(&std::fs::read_to_string(&headers_path).unwrap_or_default());
+    let body = std::fs::read(&body_path).unwrap_or_default();
+
+    let _ = std::fs::remove_file(&headers_path);
+    let _ = std::fs::remove_file(&body_path);
+    let _ = std::fs::remove_dir(&temp_dir);
+
+    if !output.status.success() || !(200..300).contains(&status_code) {
+        let detail = format_github_api_error(status_code, &stderr, &headers, &body);
+        return Err(crate::error::QuiverError::Other(format!(
+            "GitHub API request failed for {url}: {detail}"
+        )));
+    }
+
+    Ok(body)
+}
+
+fn github_token_from_env() -> Option<String> {
+    ["GITHUB_TOKEN", "GH_TOKEN"]
+        .into_iter()
+        .find_map(|name| std::env::var(name).ok())
+        .filter(|token| !token.trim().is_empty())
+}
+
+fn parse_http_headers(raw: &str) -> Vec<(String, String)> {
+    raw.lines()
+        .filter_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            Some((name.trim().to_string(), value.trim().to_string()))
+        })
+        .collect()
+}
+
+fn format_github_api_error(
+    status_code: u16,
+    stderr: &str,
+    headers: &[(String, String)],
+    body: &[u8],
+) -> String {
+    let mut details = Vec::new();
+    details.push(format!("HTTP {status_code}"));
+
+    if !stderr.is_empty() {
+        details.push(stderr.to_string());
+    }
+
+    if status_code == 403 {
+        let rate_limit_headers: Vec<String> = headers
+            .iter()
+            .filter(|(name, _)| name.to_ascii_lowercase().starts_with("x-ratelimit-"))
+            .map(|(name, value)| format!("{name}: {value}"))
+            .collect();
+        if !rate_limit_headers.is_empty() {
+            details.push(format!(
+                "rate limit headers: {}",
+                rate_limit_headers.join(", ")
+            ));
+        }
+    }
+
+    let body_text = String::from_utf8_lossy(body).trim().to_string();
+    if !body_text.is_empty() {
+        details.push(format!("response body: {body_text}"));
+    }
+
+    details.join("; ")
 }
 
 fn download_file_with_progress(url: &str, output_path: &Path, label: &str) -> Result<()> {
@@ -1767,7 +1915,7 @@ fn install_nu_version_from_github_release(
 
     let target_bin_dir = version_dir.join("bin");
     std::fs::create_dir_all(&target_bin_dir)?;
-    std::fs::copy(&extracted_binary, &installed_path)?;
+    copy_file(&extracted_binary, &installed_path)?;
     make_executable(&installed_path)?;
     let plugins_root = config::installs_plugins_dir()?;
     let installed_plugins = install_extracted_nu_plugins(&extract_dir, &plugins_root, version)?;
@@ -2004,7 +2152,7 @@ fn install_extracted_nu_plugins(
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::copy(plugin, &target)?;
+        copy_file(plugin, &target)?;
         make_executable(&target)?;
     }
 
@@ -2199,7 +2347,7 @@ fn install_core_plugin(
     }
 
     std::fs::create_dir_all(version_dir.join("bin"))?;
-    std::fs::copy(&source_binary, &installed_bin)?;
+    copy_file(&source_binary, &installed_bin)?;
     make_executable(&installed_bin)?;
 
     Ok(PluginInstallResult {
@@ -2314,7 +2462,7 @@ fn install_plugin_from_github_release(
     };
 
     let target = version_dir.join("bin").join(binary_filename);
-    std::fs::copy(&binary, &target)?;
+    copy_file(&binary, &target)?;
     make_executable(&target)?;
     let _ = std::fs::remove_dir_all(&temp_root);
 
@@ -2362,7 +2510,7 @@ fn install_plugin_from_cargo_source(
     }
 
     let target = version_dir.join("bin").join(binary_filename);
-    std::fs::copy(&built_binary, &target)?;
+    copy_file(&built_binary, &target)?;
     make_executable(&target)?;
     let _ = std::fs::remove_dir_all(&staging);
     Ok(())
@@ -2626,7 +2774,7 @@ fn ensure_symlink_or_file(link_path: &Path, target: &Path) -> Result<bool> {
     {
         if let Err(err) = std::os::windows::fs::symlink_file(target, link_path) {
             ui::warn(format!("symlink failed ({err}); copying file instead"));
-            std::fs::copy(target, link_path)?;
+            copy_file(target, link_path)?;
         }
     }
 
@@ -2695,30 +2843,7 @@ fn parse_github_owner_repo(git_url: &str) -> Option<(String, String)> {
 
 fn fetch_repo_github_releases(owner: &str, repo: &str) -> Result<Vec<GitHubRelease>> {
     let url = format!("https://api.github.com/repos/{owner}/{repo}/releases?per_page=100");
-    ui::info(format!(
-        "{} release metadata for {owner}/{repo}",
-        ui::keyword("Querying")
-    ));
-    let output = Command::new("curl")
-        .args([
-            "-fsSL",
-            "-H",
-            "Accept: application/vnd.github+json",
-            "-H",
-            "User-Agent: quiver",
-        ])
-        .arg(&url)
-        .output()?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(crate::error::QuiverError::Other(format!(
-            "failed to query plugin releases from GitHub: {stderr}"
-        )));
-    }
-
-    serde_json::from_slice(&output.stdout).map_err(|err| {
-        crate::error::QuiverError::Other(format!("invalid GitHub release response: {err}"))
-    })
+    fetch_github_releases(&url, &format!("{owner}/{repo}"))
 }
 
 fn select_plugin_release_asset(
@@ -2904,7 +3029,18 @@ fn materialize_module_dir(src: &Path, dest: &Path, mode: InstallMode) -> Result<
             }
             Ok(())
         }
-        InstallMode::Hardlink => hardlink_dir(src, dest),
+        InstallMode::Hardlink => {
+            if let Err(err) = hardlink_dir(src, dest) {
+                ui::warn(format!(
+                    "hardlink mode failed ({err}); falling back to copy"
+                ));
+                if dest.exists() {
+                    std::fs::remove_dir_all(dest)?;
+                }
+                copy_dir(src, dest)?;
+            }
+            Ok(())
+        }
         InstallMode::Copy => copy_dir(src, dest),
     }
 }
@@ -2992,8 +3128,29 @@ fn copy_dir(src: &Path, dest: &Path) -> Result<()> {
             if let Some(parent) = target.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            std::fs::copy(entry.path(), &target)?;
+            copy_file(entry.path(), &target)?;
         }
+    }
+    Ok(())
+}
+
+fn copy_file(src: &Path, dest: &Path) -> Result<()> {
+    match std::fs::copy(src, dest) {
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
+            copy_file_by_streaming(src, dest)?;
+            Ok(())
+        }
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn copy_file_by_streaming(src: &Path, dest: &Path) -> io::Result<()> {
+    let mut input = std::fs::File::open(src)?;
+    let mut output = std::fs::File::create(dest)?;
+    io::copy(&mut input, &mut output)?;
+    if let Ok(metadata) = input.metadata() {
+        output.set_permissions(metadata.permissions())?;
     }
     Ok(())
 }
@@ -3066,7 +3223,7 @@ fn copy_repo_except_subdir(src_root: &Path, dest_root: &Path, skip_subdir: &Path
             if let Some(parent) = target.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            std::fs::copy(entry.path(), &target)?;
+            copy_file(entry.path(), &target)?;
         }
     }
 
@@ -3082,7 +3239,7 @@ fn copy_root_peripheral_entries(repo_root: &Path, dist_info_dir: &Path) -> Resul
             if !should_include_root_peripheral_file(&name) {
                 continue;
             }
-            std::fs::copy(&path, dist_info_dir.join(entry.file_name()))?;
+            copy_file(&path, &dist_info_dir.join(entry.file_name()))?;
         } else if path.is_dir() {
             if !should_include_root_peripheral_dir(&name) {
                 continue;
@@ -3623,6 +3780,22 @@ mod tests {
                 _lock: lock,
             }
         }
+
+        fn set_os(key: &'static str, value: OsString) -> Self {
+            let lock = crate::TEST_ENV_MUTEX
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let original = std::env::var_os(key);
+            // SAFETY: tests serialize environment mutation through TEST_ENV_MUTEX.
+            unsafe {
+                std::env::set_var(key, &value);
+            }
+            Self {
+                key,
+                original,
+                _lock: lock,
+            }
+        }
     }
 
     impl Drop for EnvVarGuard {
@@ -3662,6 +3835,23 @@ mod tests {
             .unwrap();
         let encoder = builder.into_inner().unwrap();
         encoder.finish().unwrap();
+    }
+
+    #[test]
+    fn streaming_copy_preserves_file_contents() {
+        let root = make_temp_dir("streaming_copy");
+        let src = root.join("src.nu");
+        let dest = root.join("dest.nu");
+        std::fs::write(&src, "export def hi [] { 'there' }\n").unwrap();
+
+        copy_file_by_streaming(&src, &dest).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&dest).unwrap(),
+            "export def hi [] { 'there' }\n"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -4679,7 +4869,7 @@ sha256 = "aaa"
 
         match resolved {
             Some(NuBinaryResolution::Install(version)) => assert_eq!(version, current),
-            other => panic!("expected current version to be materialized, got {other:?}"),
+            other => panic!("expected current version to be selected, got {other:?}"),
         }
     }
 
@@ -4697,7 +4887,7 @@ sha256 = "aaa"
 
         match resolved {
             Some(NuBinaryResolution::Install(version)) => assert_eq!(version, current),
-            other => panic!("expected current matching version to be materialized, got {other:?}"),
+            other => panic!("expected current matching version to be selected, got {other:?}"),
         }
     }
 
@@ -4718,6 +4908,30 @@ sha256 = "aaa"
             Some(NuBinaryResolution::Installed(path)) => assert_eq!(path, installed_path),
             other => panic!("expected installed store version, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn detect_nu_path_prefers_quiver_nu_bin_override() {
+        let override_dir = make_temp_dir("nu_bin_override");
+        let override_path = override_dir.join("nu");
+        std::fs::write(&override_path, "nu").unwrap();
+        let _guard = EnvVarGuard::set_os(QUIVER_NU_BIN_ENV, override_path.clone().into_os_string());
+
+        assert_eq!(detect_nu_path(), Some(override_path));
+
+        let _ = std::fs::remove_dir_all(override_dir);
+    }
+
+    #[test]
+    fn create_nu_symlink_skips_when_env_requests_it() {
+        let nu_env_dir = make_temp_dir("skip_nu_symlink");
+        let _guard = EnvVarGuard::set_os(QUIVER_SKIP_NU_INSTALL_ENV, OsString::from("1"));
+
+        create_nu_symlink(&nu_env_dir, Some("=255.255.255")).unwrap();
+
+        assert!(!nu_env_dir.join("bin").join("nu").exists());
+
+        let _ = std::fs::remove_dir_all(nu_env_dir);
     }
 
     #[test]

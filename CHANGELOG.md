@@ -1,5 +1,19 @@
 # Unreleased
 
+# Version 0.4.1 (2026-04-21)
+
+## Added
+
+- `hardlink` mode now falls back to `copy` instead of failing.
+- copy operations now fall back to manual streaming copy when `std::fs::copy` hits `PermissionDenied`
+- CI-oriented overrides:
+  - `QUIVER_SKIP_NU_INSTALL=1` skips `.nu-env/bin/nu` creation entirely.
+  - `QUIVER_NU_BIN=/path/to/nu` forces Quiver to use a specific Nushell binary.
+- GitHub release lookups now:
+  - send `Authorization: Bearer ...` when `GITHUB_TOKEN` or `GH_TOKEN` is present
+  - cache release metadata within the process
+  - include the response body and `X-RateLimit-*` headers on HTTP 403s
+
 # Version 0.4.0 (2026-03-31)
 
 ## Added
