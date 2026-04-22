@@ -11,8 +11,9 @@ mod resolver;
 mod safety;
 mod ui;
 
+use std::collections::HashMap;
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 #[cfg(test)]
 use std::sync::{LazyLock, Mutex};
@@ -22,6 +23,7 @@ use config::GlobalConfig;
 use error::Result;
 use manifest::{DependencySpec, Manifest, Package, PluginDependencySpec};
 use safety::{validate_binary_name, validate_dependency_name};
+use sha2::{Digest, Sha256};
 
 #[cfg(test)]
 pub(crate) static TEST_ENV_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
@@ -97,6 +99,14 @@ fn run(command: Commands) -> Result<()> {
         Commands::Hook => cmd_hook(),
         Commands::Lsp { editor } => cmd_lsp(&cwd, editor),
         Commands::Run { command } => cmd_run(&cwd, command),
+        Commands::Qvx {
+            tag,
+            rev,
+            branch,
+            source,
+            command,
+            args,
+        } => cmd_qvx(&cwd, source, tag, rev, branch, command, args),
     }
 }
 
@@ -678,6 +688,225 @@ fn cmd_run(cwd: &Path, command: Vec<String>) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn cmd_qvx(
+    cwd: &Path,
+    source: String,
+    tag: Option<String>,
+    rev: Option<String>,
+    branch: Option<String>,
+    command: String,
+    args: Vec<String>,
+) -> Result<()> {
+    let qvx_source = resolve_qvx_source(&source, tag, rev, branch)?;
+    let provider_base = if is_git_url(qvx_source.source.trim()) {
+        None
+    } else {
+        let config = GlobalConfig::load_or_default()?;
+        Some(config.default_git_provider_base_url()?)
+    };
+    let url = normalize_dependency_source(&qvx_source.source, provider_base.as_deref())?;
+    let pkg_name = git::repo_name_from_url(&url).ok_or_else(|| {
+        error::QuiverError::Other(format!("could not determine package name from URL: {url}"))
+    })?;
+    validate_dependency_name(&pkg_name, "module dependency")?;
+
+    let dep_spec = auto_detect_dep_spec(&url, qvx_source.tag, qvx_source.rev, qvx_source.branch)?;
+    dep_spec.validate(&pkg_name)?;
+
+    let env_dir = qvx_env_dir(&pkg_name, &dep_spec)?;
+    write_qvx_manifest(&env_dir, &pkg_name, dep_spec)?;
+    installer::install_with_options(&env_dir, false, false, false, false)?;
+
+    let nu_env_dir = env_dir.join(".nu-env");
+    let config_path = nu_env_dir.join("config.nu");
+    let plugin_config_path = nu_env_dir.join("plugins.msgpackz");
+    let wrapper_path = nu_env_dir.join("qvx-run.nu");
+    let wrapper = build_qvx_wrapper(&pkg_name, &command, &args)?;
+    std::fs::write(&wrapper_path, wrapper)?;
+
+    let status = Command::new("nu")
+        .arg("--config")
+        .arg(config_path)
+        .arg("--plugin-config")
+        .arg(plugin_config_path)
+        .arg(wrapper_path)
+        .current_dir(cwd)
+        .status()?;
+
+    if !status.success() {
+        std::process::exit(status.code().unwrap_or(1));
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct QvxSource {
+    source: String,
+    tag: Option<String>,
+    rev: Option<String>,
+    branch: Option<String>,
+}
+
+fn resolve_qvx_source(
+    source: &str,
+    tag: Option<String>,
+    rev: Option<String>,
+    branch: Option<String>,
+) -> Result<QvxSource> {
+    let (source, shorthand_tag) = split_qvx_source_tag(source)?;
+    if shorthand_tag.is_some() && (tag.is_some() || rev.is_some() || branch.is_some()) {
+        return Err(error::QuiverError::Other(
+            "source@tag cannot be combined with --tag, --rev, or --branch".to_string(),
+        ));
+    }
+
+    Ok(QvxSource {
+        source,
+        tag: shorthand_tag.or(tag),
+        rev,
+        branch,
+    })
+}
+
+fn split_qvx_source_tag(source: &str) -> Result<(String, Option<String>)> {
+    let trimmed = source.trim();
+    if trimmed.is_empty() {
+        return Err(error::QuiverError::Other(
+            "qvx source cannot be empty".to_string(),
+        ));
+    }
+
+    let last_path_separator = trimmed
+        .rmatch_indices(['/', ':'])
+        .next()
+        .map(|(idx, _)| idx)
+        .unwrap_or(0);
+    let Some(tag_separator) = trimmed.rfind('@') else {
+        return Ok((trimmed.to_string(), None));
+    };
+
+    if tag_separator <= last_path_separator {
+        return Ok((trimmed.to_string(), None));
+    }
+
+    let source_part = trimmed[..tag_separator].trim();
+    let tag_part = trimmed[tag_separator + 1..].trim();
+    if source_part.is_empty() || tag_part.is_empty() {
+        return Err(error::QuiverError::Other(
+            "qvx source@tag shorthand requires both source and tag".to_string(),
+        ));
+    }
+    Ok((source_part.to_string(), Some(tag_part.to_string())))
+}
+
+fn qvx_env_dir(pkg_name: &str, dep_spec: &DependencySpec) -> Result<PathBuf> {
+    let ref_kind = if let Some(tag) = dep_spec.tag.as_deref() {
+        format!("tag:{tag}")
+    } else if let Some(rev) = dep_spec.rev.as_deref() {
+        format!("rev:{rev}")
+    } else if let Some(branch) = dep_spec.branch.as_deref() {
+        format!("branch:{branch}")
+    } else {
+        "unresolved".to_string()
+    };
+    let key = format!("{pkg_name}\n{}\n{ref_kind}", dep_spec.git);
+    let digest = Sha256::digest(key.as_bytes());
+    Ok(config::installs_root_dir()?
+        .join("qvx")
+        .join(format!("env-{}", hex::encode(digest))))
+}
+
+fn write_qvx_manifest(env_dir: &Path, pkg_name: &str, dep_spec: DependencySpec) -> Result<()> {
+    std::fs::create_dir_all(env_dir)?;
+    let mut modules = HashMap::new();
+    modules.insert(pkg_name.to_string(), dep_spec);
+    let manifest = Manifest {
+        package: Package {
+            name: format!("qvx-{pkg_name}"),
+            version: "0.0.0".to_string(),
+            description: Some(format!("ephemeral qvx environment for {pkg_name}")),
+            license: None,
+            authors: None,
+            nu_version: None,
+        },
+        dependencies: manifest::DependencyGroups {
+            modules,
+            plugins: HashMap::new(),
+        },
+    };
+    let content = manifest.to_toml_string()?;
+    let path = env_dir.join("nupackage.toml");
+    let should_write = std::fs::read_to_string(&path)
+        .map(|existing| existing != content)
+        .unwrap_or(true);
+    if should_write {
+        std::fs::write(path, content)?;
+    }
+    Ok(())
+}
+
+fn build_qvx_wrapper(module_name: &str, command: &str, args: &[String]) -> Result<String> {
+    validate_dependency_name(module_name, "module dependency")?;
+    let command = qvx_command_invocation(command)?;
+    let mut invocation = command;
+    for arg in args {
+        invocation.push(' ');
+        invocation.push_str(&nu_arg_token(arg));
+    }
+
+    Ok(format!(
+        "# Generated by quiver - do not edit\nuse {:?} *\n\n{}\n",
+        module_name, invocation
+    ))
+}
+
+fn qvx_command_invocation(command: &str) -> Result<String> {
+    let trimmed = command.trim();
+    if trimmed.is_empty() {
+        return Err(error::QuiverError::Other(
+            "qvx command cannot be empty".to_string(),
+        ));
+    }
+    if trimmed != command {
+        return Err(error::QuiverError::Other(
+            "qvx command cannot have leading or trailing whitespace".to_string(),
+        ));
+    }
+    if !trimmed
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | ' '))
+    {
+        return Err(error::QuiverError::Other(format!(
+            "qvx command '{command}' contains unsupported characters"
+        )));
+    }
+    Ok(trimmed.to_string())
+}
+
+fn nu_arg_token(arg: &str) -> String {
+    if arg == "--" {
+        return "--".to_string();
+    }
+    if let Some((flag, value)) = arg.split_once('=')
+        && is_safe_nu_flag(flag)
+    {
+        return format!("{flag}={value:?}");
+    }
+    if is_safe_nu_flag(arg) {
+        return arg.to_string();
+    }
+    format!("{arg:?}")
+}
+
+fn is_safe_nu_flag(arg: &str) -> bool {
+    arg.starts_with('-')
+        && arg.len() > 1
+        && arg
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
 }
 
 fn resolve_run_invocation(
@@ -1465,6 +1694,64 @@ mod tests {
         let err =
             normalize_dependency_source("owner/repo", Some("http://example.com")).unwrap_err();
         assert!(err.to_string().contains("insecure HTTP"));
+    }
+
+    #[test]
+    fn split_qvx_source_tag_parses_repo_tag_shorthand() {
+        let (source, tag) = split_qvx_source_tag("freepicheep/nu-doc-gen@v1.2.0").unwrap();
+        assert_eq!(source, "freepicheep/nu-doc-gen");
+        assert_eq!(tag, Some("v1.2.0".to_string()));
+    }
+
+    #[test]
+    fn split_qvx_source_tag_does_not_treat_ssh_user_as_tag() {
+        let (source, tag) = split_qvx_source_tag("git@github.com:freepicheep/nu-doc-gen").unwrap();
+        assert_eq!(source, "git@github.com:freepicheep/nu-doc-gen");
+        assert_eq!(tag, None);
+    }
+
+    #[test]
+    fn split_qvx_source_tag_parses_ssh_repo_tag_shorthand() {
+        let (source, tag) =
+            split_qvx_source_tag("git@github.com:freepicheep/nu-doc-gen@v1.2.0").unwrap();
+        assert_eq!(source, "git@github.com:freepicheep/nu-doc-gen");
+        assert_eq!(tag, Some("v1.2.0".to_string()));
+    }
+
+    #[test]
+    fn resolve_qvx_source_rejects_shorthand_and_explicit_ref() {
+        let err = resolve_qvx_source(
+            "freepicheep/nu-doc-gen@v1.2.0",
+            None,
+            None,
+            Some("main".to_string()),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("cannot be combined"));
+    }
+
+    #[test]
+    fn build_qvx_wrapper_imports_module_and_invokes_command() {
+        let wrapper = build_qvx_wrapper(
+            "nu-doc-gen",
+            "generate-doc-site",
+            &[
+                "nu-salesforce".to_string(),
+                ".".to_string(),
+                "--theme".to_string(),
+                "plain".to_string(),
+            ],
+        )
+        .unwrap();
+
+        assert!(wrapper.contains("use \"nu-doc-gen\" *"));
+        assert!(wrapper.contains("generate-doc-site \"nu-salesforce\" \".\" --theme \"plain\""));
+    }
+
+    #[test]
+    fn build_qvx_wrapper_rejects_unsafe_command_text() {
+        let err = build_qvx_wrapper("nu-doc-gen", "generate; evil", &[]).unwrap_err();
+        assert!(err.to_string().contains("unsupported characters"));
     }
 
     #[test]

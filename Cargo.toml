@@ -43,3 +43,7 @@ lto = "thin"
 [[bin]]
 name = "qv"
 path = "src/main.rs"
+
+[[bin]]
+name = "qvx"
+path = "src/main.rs"
