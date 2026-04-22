@@ -1,5 +1,11 @@
 # Unreleased
 
+# Version 0.5.0 (2026-04-22)
+
+## Added
+
+- New `qvx` command to run remote Nu modules as a tool with an ephemeral env.
+
 # Version 0.4.1 (2026-04-21)
 
 ## Added
