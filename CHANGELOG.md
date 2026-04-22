@@ -1,5 +1,16 @@
 # Unreleased
 
+# Version 0.5.1 (2026-04-22)
+
+## Added
+
+- `qvx` now accepts `--nu-version <requirement>` and writes that requirement into its ephemeral environment manifest.
+- When `--nu-version` is not supplied, `qvx` now reads the remote module's `nupackage.toml` when present and reuses its `package.nu-version` requirement.
+
+## Fixed
+
+- `qvx` now runs the environment-local `.nu-env/bin/nu` when Quiver installs or links one, instead of always requiring `nu` to already be on `PATH`.
+
 # Version 0.5.0 (2026-04-22)
 
 ## Added

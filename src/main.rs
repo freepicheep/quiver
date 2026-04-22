@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 #[cfg(test)]
 use std::sync::{LazyLock, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use cli::Commands;
 use config::GlobalConfig;
@@ -103,10 +104,11 @@ fn run(command: Commands) -> Result<()> {
             tag,
             rev,
             branch,
+            nu_version,
             source,
             command,
             args,
-        } => cmd_qvx(&cwd, source, tag, rev, branch, command, args),
+        } => cmd_qvx(&cwd, source, tag, rev, branch, nu_version, command, args),
     }
 }
 
@@ -696,6 +698,7 @@ fn cmd_qvx(
     tag: Option<String>,
     rev: Option<String>,
     branch: Option<String>,
+    nu_version: Option<String>,
     command: String,
     args: Vec<String>,
 ) -> Result<()> {
@@ -714,9 +717,10 @@ fn cmd_qvx(
 
     let dep_spec = auto_detect_dep_spec(&url, qvx_source.tag, qvx_source.rev, qvx_source.branch)?;
     dep_spec.validate(&pkg_name)?;
+    let nu_version = qvx_nu_version(&url, &dep_spec, nu_version)?;
 
     let env_dir = qvx_env_dir(&pkg_name, &dep_spec)?;
-    write_qvx_manifest(&env_dir, &pkg_name, dep_spec)?;
+    write_qvx_manifest(&env_dir, &pkg_name, dep_spec, nu_version)?;
     installer::install_with_options(&env_dir, false, false, false, false)?;
 
     let nu_env_dir = env_dir.join(".nu-env");
@@ -725,8 +729,16 @@ fn cmd_qvx(
     let wrapper_path = nu_env_dir.join("qvx-run.nu");
     let wrapper = build_qvx_wrapper(&pkg_name, &command, &args)?;
     std::fs::write(&wrapper_path, wrapper)?;
+    let nu_bin = nu_env_dir
+        .join("bin")
+        .join(if cfg!(windows) { "nu.exe" } else { "nu" });
+    let nu_command = if nu_bin.symlink_metadata().is_ok() {
+        nu_bin.as_path()
+    } else {
+        Path::new("nu")
+    };
 
-    let status = Command::new("nu")
+    let status = Command::new(nu_command)
         .arg("--config")
         .arg(config_path)
         .arg("--plugin-config")
@@ -819,7 +831,12 @@ fn qvx_env_dir(pkg_name: &str, dep_spec: &DependencySpec) -> Result<PathBuf> {
         .join(format!("env-{}", hex::encode(digest))))
 }
 
-fn write_qvx_manifest(env_dir: &Path, pkg_name: &str, dep_spec: DependencySpec) -> Result<()> {
+fn write_qvx_manifest(
+    env_dir: &Path,
+    pkg_name: &str,
+    dep_spec: DependencySpec,
+    nu_version: Option<String>,
+) -> Result<()> {
     std::fs::create_dir_all(env_dir)?;
     let mut modules = HashMap::new();
     modules.insert(pkg_name.to_string(), dep_spec);
@@ -830,7 +847,7 @@ fn write_qvx_manifest(env_dir: &Path, pkg_name: &str, dep_spec: DependencySpec) 
             description: Some(format!("ephemeral qvx environment for {pkg_name}")),
             license: None,
             authors: None,
-            nu_version: None,
+            nu_version,
         },
         dependencies: manifest::DependencyGroups {
             modules,
@@ -846,6 +863,50 @@ fn write_qvx_manifest(env_dir: &Path, pkg_name: &str, dep_spec: DependencySpec) 
         std::fs::write(path, content)?;
     }
     Ok(())
+}
+
+fn qvx_nu_version(
+    url: &str,
+    dep_spec: &DependencySpec,
+    explicit: Option<String>,
+) -> Result<Option<String>> {
+    if let Some(nu_version) = explicit {
+        nu::parse_nu_version_requirement(&nu_version).map_err(|err| {
+            error::QuiverError::Manifest(format!(
+                "package nu-version '{nu_version}' is invalid: {err}"
+            ))
+        })?;
+        return Ok(Some(nu_version));
+    }
+
+    detect_qvx_module_nu_version(url, dep_spec)
+}
+
+fn detect_qvx_module_nu_version(url: &str, dep_spec: &DependencySpec) -> Result<Option<String>> {
+    let repo_path = git::clone_or_fetch(url)?;
+    let kind = git::RefKind::from_spec(&dep_spec.tag, &dep_spec.rev, &dep_spec.branch);
+    let rev = git::resolve_ref(&repo_path, dep_spec.ref_spec(), kind)?;
+    let tmp = unique_temp_dir("quiver_qvx_manifest");
+
+    let result = (|| {
+        git::export_to(&repo_path, &rev, &tmp)?;
+        match Manifest::from_dir(&tmp) {
+            Ok(manifest) => Ok(manifest.package.nu_version),
+            Err(error::QuiverError::NoManifest(_)) => Ok(None),
+            Err(err) => Err(err),
+        }
+    })();
+
+    let _ = std::fs::remove_dir_all(&tmp);
+    result
+}
+
+fn unique_temp_dir(label: &str) -> PathBuf {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    std::env::temp_dir().join(format!("{}-{}-{}", label, std::process::id(), unique))
 }
 
 fn build_qvx_wrapper(module_name: &str, command: &str, args: &[String]) -> Result<String> {
@@ -1752,6 +1813,50 @@ mod tests {
     fn build_qvx_wrapper_rejects_unsafe_command_text() {
         let err = build_qvx_wrapper("nu-doc-gen", "generate; evil", &[]).unwrap_err();
         assert!(err.to_string().contains("unsupported characters"));
+    }
+
+    #[test]
+    fn write_qvx_manifest_includes_nu_version() {
+        let env_dir = make_temp_dir("qvx_manifest_nu_version");
+        let dep_spec = DependencySpec {
+            git: "https://github.com/freepicheep/nu-doc-gen".to_string(),
+            tag: Some("v1.2.0".to_string()),
+            rev: None,
+            branch: None,
+        };
+
+        write_qvx_manifest(
+            &env_dir,
+            "nu-doc-gen",
+            dep_spec,
+            Some(">=0.110.0, <0.112.0".to_string()),
+        )
+        .unwrap();
+
+        let manifest = Manifest::from_dir(&env_dir).unwrap();
+        assert_eq!(
+            manifest.package.nu_version.as_deref(),
+            Some(">=0.110.0, <0.112.0")
+        );
+    }
+
+    #[test]
+    fn qvx_nu_version_rejects_invalid_explicit_requirement() {
+        let dep_spec = DependencySpec {
+            git: "https://github.com/freepicheep/nu-doc-gen".to_string(),
+            tag: Some("v1.2.0".to_string()),
+            rev: None,
+            branch: None,
+        };
+
+        let err = qvx_nu_version(
+            "https://github.com/freepicheep/nu-doc-gen",
+            &dep_spec,
+            Some("not-semver".to_string()),
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("nu-version"));
     }
 
     #[test]

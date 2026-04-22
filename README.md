@@ -88,6 +88,9 @@ qv run script.nu
 # Run a remote module command without creating a project
 qvx freepicheep/nu-doc-gen generate-doc-site nu-salesforce .
 
+# Run a remote module command with an explicit Nushell version requirement
+qvx --nu-version ">=0.109,<0.111" freepicheep/nu-doc-gen generate-doc-site nu-salesforce .
+
 # Activate the environment and run nu with everything loaded
 overlay use .nu-env/activate.nu
 nu
@@ -123,9 +126,12 @@ qvx freepicheep/nu-doc-gen@v1.2.0 generate-doc-site nu-salesforce .
 qvx --tag v1.2.0 freepicheep/nu-doc-gen generate-doc-site nu-salesforce .
 qvx --branch main freepicheep/nu-doc-gen generate-doc-site nu-salesforce .
 qvx --rev a3f9c12 freepicheep/nu-doc-gen generate-doc-site nu-salesforce .
+
+# Pin the Nushell version used for the ephemeral environment
+qvx --nu-version ">=0.109,<0.111" freepicheep/nu-doc-gen generate-doc-site nu-salesforce .
 ```
 
-The first argument is the module source (`owner/repo` shorthand or a git URL). The second argument is the command exported by that module. Everything after the command is passed through to the command. Internally, Quiver creates a cached ephemeral environment, installs the module there, starts Nu with that environment, and runs a generated wrapper equivalent to:
+The first argument is the module source (`owner/repo` shorthand or a git URL). The second argument is the command exported by that module. Everything after the command is passed through to the command. If `--nu-version` is supplied, qvx uses that Nushell version requirement for the ephemeral environment. Otherwise, if the remote module has a `nupackage.toml` with `package.nu-version`, qvx reuses that requirement. Internally, Quiver creates a cached ephemeral environment, installs the module there, starts the environment's Nu binary with that environment, and runs a generated wrapper equivalent to:
 
 ```nushell
 use nu-doc-gen *
@@ -210,7 +216,7 @@ Plugin dependencies support either:
 | `qv install --frozen` | Install from lockfile only (CI-friendly) |
 | `qv update` | Re-resolve all dependencies |
 | `qv run <command...>` | Run a command in the current project using `.nu-env` (injects `--config` and `--plugin-config` for `nu`) |
-| `qvx <source>[@tag] <command> [args...]` | Run a command exported by a remote module in a cached ephemeral environment |
+| `qvx [--nu-version <requirement>] <source>[@tag] <command> [args...]` | Run a command exported by a remote module in a cached ephemeral environment |
 | `qv remove <name>` / `qv rm <name>` | Remove a project dependency (module or plugin) |
 | `qv list` / `qv ls` | List installed dependencies (project modules/plugins or global modules) |
 | `qv lsp` | Generate editor-specific LSP configuration (interactive picker) |

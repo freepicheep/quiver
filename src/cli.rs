@@ -54,6 +54,10 @@ struct QvxCli {
     #[arg(long)]
     branch: Option<String>,
 
+    /// Nushell version requirement for this qvx run (e.g. 0.109.0, >=0.109,<0.111)
+    #[arg(long = "nu-version")]
+    nu_version: Option<String>,
+
     /// Git URL or owner/repo shorthand, optionally suffixed with @tag
     source: String,
 
@@ -205,6 +209,10 @@ pub enum Commands {
         #[arg(long)]
         branch: Option<String>,
 
+        /// Nushell version requirement for this qvx run (e.g. 0.109.0, >=0.109,<0.111)
+        #[arg(long = "nu-version")]
+        nu_version: Option<String>,
+
         /// Git URL or owner/repo shorthand, optionally suffixed with @tag
         source: String,
 
@@ -227,6 +235,7 @@ pub fn parse() -> Cli {
                 tag: qvx.tag,
                 rev: qvx.rev,
                 branch: qvx.branch,
+                nu_version: qvx.nu_version,
                 source: qvx.source,
                 command: qvx.command,
                 args: qvx.args,
@@ -298,6 +307,7 @@ mod tests {
                 tag,
                 rev,
                 branch,
+                nu_version,
                 source,
                 command,
                 args,
@@ -305,6 +315,7 @@ mod tests {
                 assert_eq!(tag, None);
                 assert_eq!(rev, None);
                 assert_eq!(branch, None);
+                assert_eq!(nu_version, None);
                 assert_eq!(source, "freepicheep/nu-doc-gen@v1.2.0");
                 assert_eq!(command, "generate-doc-site");
                 assert_eq!(args, vec!["nu-salesforce", "."]);
@@ -338,6 +349,32 @@ mod tests {
                 assert_eq!(source, "freepicheep/nu-doc-gen");
                 assert_eq!(command, "generate-doc-site");
                 assert_eq!(args, vec!["--theme", "plain"]);
+            }
+            _ => panic!("expected qvx command"),
+        }
+    }
+
+    #[test]
+    fn qvx_subcommand_parses_nu_version() {
+        let cli = Cli::try_parse_from([
+            "quiver",
+            "qvx",
+            "--nu-version",
+            "0.110.0",
+            "freepicheep/nu-doc-gen",
+            "generate-doc-site",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Qvx {
+                nu_version,
+                source,
+                command,
+                ..
+            } => {
+                assert_eq!(nu_version, Some("0.110.0".to_string()));
+                assert_eq!(source, "freepicheep/nu-doc-gen");
+                assert_eq!(command, "generate-doc-site");
             }
             _ => panic!("expected qvx command"),
         }
