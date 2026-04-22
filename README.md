@@ -85,6 +85,9 @@ qv install
 # Run a Nushell script with quiver's environment (including any plugins)
 qv run script.nu
 
+# Run a remote module command without creating a project
+qvx freepicheep/nu-doc-gen generate-doc-site nu-salesforce .
+
 # Activate the environment and run nu with everything loaded
 overlay use .nu-env/activate.nu
 nu
@@ -103,6 +106,30 @@ qv list
 
 # Generate editor LSP configuration (for helix and zed currently)
 qv lsp
+```
+
+## qvx
+
+Use `qvx` to run an exported command from a remote Nushell module without creating a local project, adding the module, and calling `qv run` yourself.
+
+```nushell
+# Run the latest detected tag, falling back to the default branch if no tags exist
+qvx freepicheep/nu-doc-gen generate-doc-site nu-salesforce site
+
+# Pin a tag with shorthand
+qvx freepicheep/nu-doc-gen@v1.2.0 generate-doc-site nu-salesforce .
+
+# Or pin explicitly
+qvx --tag v1.2.0 freepicheep/nu-doc-gen generate-doc-site nu-salesforce .
+qvx --branch main freepicheep/nu-doc-gen generate-doc-site nu-salesforce .
+qvx --rev a3f9c12 freepicheep/nu-doc-gen generate-doc-site nu-salesforce .
+```
+
+The first argument is the module source (`owner/repo` shorthand or a git URL). The second argument is the command exported by that module. Everything after the command is passed through to the command. Internally, Quiver creates a cached ephemeral environment, installs the module there, starts Nu with that environment, and runs a generated wrapper equivalent to:
+
+```nushell
+use nu-doc-gen *
+generate-doc-site nu-salesforce .
 ```
 
 ## Activation
@@ -183,6 +210,7 @@ Plugin dependencies support either:
 | `qv install --frozen` | Install from lockfile only (CI-friendly) |
 | `qv update` | Re-resolve all dependencies |
 | `qv run <command...>` | Run a command in the current project using `.nu-env` (injects `--config` and `--plugin-config` for `nu`) |
+| `qvx <source>[@tag] <command> [args...]` | Run a command exported by a remote module in a cached ephemeral environment |
 | `qv remove <name>` / `qv rm <name>` | Remove a project dependency (module or plugin) |
 | `qv list` / `qv ls` | List installed dependencies (project modules/plugins or global modules) |
 | `qv lsp` | Generate editor-specific LSP configuration (interactive picker) |

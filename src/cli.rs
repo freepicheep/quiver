@@ -1,4 +1,6 @@
 use clap::{ArgAction, Parser, Subcommand};
+use std::ffi::OsString;
+use std::path::Path;
 
 /// Quiver — A module manager for Nushell
 #[derive(Parser, Debug)]
@@ -21,6 +23,46 @@ pub struct Cli {
 
     #[command(subcommand)]
     pub command: Commands,
+}
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "qvx",
+    version,
+    about = "Run a command exported by a remote Nushell module",
+    disable_version_flag = true
+)]
+struct QvxCli {
+    #[arg(
+        short = 'v',
+        short_alias = 'V',
+        long = "version",
+        action = ArgAction::Version,
+        help = "Print version"
+    )]
+    version: Option<bool>,
+
+    /// Pin to a specific tag
+    #[arg(long)]
+    tag: Option<String>,
+
+    /// Pin to a specific commit SHA
+    #[arg(long)]
+    rev: Option<String>,
+
+    /// Track a branch
+    #[arg(long)]
+    branch: Option<String>,
+
+    /// Git URL or owner/repo shorthand, optionally suffixed with @tag
+    source: String,
+
+    /// Exported Nushell command to invoke
+    command: String,
+
+    /// Arguments to pass to the exported command
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    args: Vec<String>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -148,10 +190,56 @@ pub enum Commands {
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
+
+    /// Run a command exported by a remote Nushell module
+    Qvx {
+        /// Pin to a specific tag
+        #[arg(long)]
+        tag: Option<String>,
+
+        /// Pin to a specific commit SHA
+        #[arg(long)]
+        rev: Option<String>,
+
+        /// Track a branch
+        #[arg(long)]
+        branch: Option<String>,
+
+        /// Git URL or owner/repo shorthand, optionally suffixed with @tag
+        source: String,
+
+        /// Exported Nushell command to invoke
+        command: String,
+
+        /// Arguments to pass to the exported command
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
 }
 
 pub fn parse() -> Cli {
-    Cli::parse()
+    let args: Vec<OsString> = std::env::args_os().collect();
+    if invoked_as_qvx(args.first()) {
+        let qvx = QvxCli::parse_from(args);
+        return Cli {
+            version: qvx.version,
+            command: Commands::Qvx {
+                tag: qvx.tag,
+                rev: qvx.rev,
+                branch: qvx.branch,
+                source: qvx.source,
+                command: qvx.command,
+                args: qvx.args,
+            },
+        };
+    }
+    Cli::parse_from(args)
+}
+
+fn invoked_as_qvx(arg0: Option<&OsString>) -> bool {
+    arg0.and_then(|arg| Path::new(arg).file_stem())
+        .and_then(|stem| stem.to_str())
+        .is_some_and(|stem| stem.eq_ignore_ascii_case("qvx"))
 }
 
 #[cfg(test)]
@@ -191,6 +279,67 @@ mod tests {
                 assert_eq!(command, vec!["nu", "script.nu", "--flag"]);
             }
             _ => panic!("expected run command"),
+        }
+    }
+
+    #[test]
+    fn qvx_subcommand_parses_source_command_and_args() {
+        let cli = Cli::try_parse_from([
+            "quiver",
+            "qvx",
+            "freepicheep/nu-doc-gen@v1.2.0",
+            "generate-doc-site",
+            "nu-salesforce",
+            ".",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Qvx {
+                tag,
+                rev,
+                branch,
+                source,
+                command,
+                args,
+            } => {
+                assert_eq!(tag, None);
+                assert_eq!(rev, None);
+                assert_eq!(branch, None);
+                assert_eq!(source, "freepicheep/nu-doc-gen@v1.2.0");
+                assert_eq!(command, "generate-doc-site");
+                assert_eq!(args, vec!["nu-salesforce", "."]);
+            }
+            _ => panic!("expected qvx command"),
+        }
+    }
+
+    #[test]
+    fn qvx_subcommand_preserves_hyphenated_args() {
+        let cli = Cli::try_parse_from([
+            "quiver",
+            "qvx",
+            "--branch",
+            "main",
+            "freepicheep/nu-doc-gen",
+            "generate-doc-site",
+            "--theme",
+            "plain",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Qvx {
+                branch,
+                source,
+                command,
+                args,
+                ..
+            } => {
+                assert_eq!(branch, Some("main".to_string()));
+                assert_eq!(source, "freepicheep/nu-doc-gen");
+                assert_eq!(command, "generate-doc-site");
+                assert_eq!(args, vec!["--theme", "plain"]);
+            }
+            _ => panic!("expected qvx command"),
         }
     }
 
