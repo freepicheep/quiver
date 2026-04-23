@@ -25,12 +25,22 @@ Quiver is alpha software. I release breaking changes ~~frequently~~ occasionally
 
 ### Install prebuilt binaries via ...
 
-- brew: `brew install freepicheep/tap/quiver`
-- mise: `mise use -g github:freepicheep/quiver`
-- shell script: `curl --proto '=https' --tlsv1.2 -LsSf https://github.com/freepicheep/quiver/releases/latest/download/quiver-installer.sh | sh`
+**brew**
+```nushell
+brew install freepicheep/tap/quiver
+```
 
-### Build from source via Cargo
+**mise**
+```nushell
+mise use -g github:freepicheep/quiver
+```
 
+**shell script**
+```nushell
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/freepicheep/quiver/releases/latest/download/quiver-installer.sh | sh
+```
+
+**Install from source with Cargo**
 ```nushell
 cargo install --git https://github.com/freepicheep/quiver
 ```
