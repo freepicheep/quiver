@@ -8,7 +8,7 @@ cargo-dist-version = "0.31.0"
 # CI backends to support
 ci = "github"
 # The installers to generate for each app
-installers = ["shell", "homebrew"]
+installers = ["shell", "powershell", "homebrew"]
 # A GitHub repo to push Homebrew formulas to
 tap = "freepicheep/homebrew-tap"
 # Target platforms to build apps for (Rust target-triple syntax)
@@ -19,5 +19,5 @@ install-path = "CARGO_HOME"
 publish-jobs = ["homebrew"]
 # Whether to install an updater program
 install-updater = false
-# so users don't have to install xz as a dependency
+# The archive format to use for non-windows builds (defaults .tar.xz)
 unix-archive = ".tar.gz"
