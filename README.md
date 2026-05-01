@@ -14,7 +14,7 @@ Quiver handles dependency resolution, fetching, and lockfile management for Nush
 
 ## Install
 
-Quiver is alpha software. I release breaking changes ~~frequently~~ occasionally. Most of the code is written with Codex 5.3. I release build for the following platforms and have confirmed quiver works great on macOS silicon and ARM64 Linux (thanks Asahi devs).
+Quiver is alpha software. I release breaking changes ~~frequently~~ occasionally. Most of the code is written with Codex 5.3. I release builds for the following platforms and have tested Quiver on macOS, Linux, and Windows.
 
 ![Apple Silicon macOS](https://img.shields.io/badge/macOS%20Apple%20Silicon-000000?logo=apple&logoColor=white)
 ![Intel macOS](https://img.shields.io/badge/macOS%20Intel-000000?logo=apple&logoColor=white)
