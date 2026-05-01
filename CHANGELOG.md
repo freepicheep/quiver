@@ -1,5 +1,7 @@
 # Unreleased
 
+# Version 0.5.2 (2026-05-01)
+
 ## Added
 
 - Project-local commands now discover the nearest enclosing `nupackage.toml` by walking up from the current working directory, so commands like `qv run amazing.nu` work from subdirectories of a Quiver project.
