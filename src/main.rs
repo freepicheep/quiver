@@ -57,10 +57,14 @@ fn run(command: Commands) -> Result<()> {
             if global {
                 cmd_install_global(frozen, allow_unsigned, no_build_fallback)
             } else {
-                cmd_install(&cwd, frozen, allow_unsigned, no_build_fallback)
+                let project_dir = require_project_dir(&cwd)?;
+                cmd_install(&project_dir, frozen, allow_unsigned, no_build_fallback)
             }
         }
-        Commands::Update => cmd_update(&cwd),
+        Commands::Update => {
+            let project_dir = require_project_dir(&cwd)?;
+            cmd_update(&project_dir)
+        }
         Commands::Add {
             global,
             url,
@@ -71,7 +75,8 @@ fn run(command: Commands) -> Result<()> {
             if global {
                 cmd_add_global(url, tag, rev, branch)
             } else {
-                cmd_add(&cwd, url, tag, rev, branch)
+                let project_dir = require_project_dir(&cwd)?;
+                cmd_add(&project_dir, url, tag, rev, branch)
             }
         }
         Commands::AddPlugin {
@@ -85,20 +90,25 @@ fn run(command: Commands) -> Result<()> {
             if global {
                 cmd_add_global_plugin(url, tag, rev, branch, bin)
             } else {
-                cmd_add_plugin(&cwd, url, tag, rev, branch, bin)
+                let project_dir = require_project_dir(&cwd)?;
+                cmd_add_plugin(&project_dir, url, tag, rev, branch, bin)
             }
         }
         Commands::Remove { global, name } => {
             if global {
                 cmd_remove_global(name)
             } else {
-                cmd_remove(&cwd, name)
+                let project_dir = require_project_dir(&cwd)?;
+                cmd_remove(&project_dir, name)
             }
         }
         Commands::List => cmd_list(&cwd),
         Commands::Version => cmd_version(),
         Commands::Hook => cmd_hook(),
-        Commands::Lsp { editor } => cmd_lsp(&cwd, editor),
+        Commands::Lsp { editor } => {
+            let project_dir = require_project_dir(&cwd)?;
+            cmd_lsp(&project_dir, editor)
+        }
         Commands::Run { command } => cmd_run(&cwd, command),
         Commands::Qvx {
             tag,
@@ -110,6 +120,11 @@ fn run(command: Commands) -> Result<()> {
             args,
         } => cmd_qvx(&cwd, source, tag, rev, branch, nu_version, command, args),
     }
+}
+
+fn require_project_dir(start: &Path) -> Result<PathBuf> {
+    Manifest::find_project_dir(start)
+        .ok_or_else(|| error::QuiverError::NoManifest(start.to_path_buf()))
 }
 
 fn cmd_init(
@@ -658,19 +673,16 @@ fn cmd_run(cwd: &Path, command: Vec<String>) -> Result<()> {
         ));
     }
 
-    if !cwd.join("nupackage.toml").exists() {
-        return Err(error::QuiverError::NoManifest(cwd.to_path_buf()));
-    }
-
-    let manifest = Manifest::from_dir(cwd)?;
-    let config_path = cwd.join(".nu-env").join("config.nu");
-    let plugin_config_path = cwd.join(".nu-env").join("plugins.msgpackz");
+    let project_dir = require_project_dir(cwd)?;
+    let manifest = Manifest::from_dir(&project_dir)?;
+    let config_path = project_dir.join(".nu-env").join("config.nu");
+    let plugin_config_path = project_dir.join(".nu-env").join("plugins.msgpackz");
     let needs_install = !config_path.exists()
         || (!manifest.dependencies.plugins.is_empty() && !plugin_config_path.exists());
 
     if needs_install {
         eprintln!("Project environment is incomplete; running install first...");
-        installer::install_with_options(cwd, false, false, false, false)?;
+        installer::install_with_options(&project_dir, false, false, false, false)?;
     }
 
     if !config_path.exists() {
@@ -1266,9 +1278,9 @@ fn write_zed_lsp_config(project_dir: &Path) -> Result<()> {
 }
 
 fn cmd_list(cwd: &Path) -> Result<()> {
-    if cwd.join("nupackage.toml").exists() {
-        let modules_dir = cwd.join(".nu-env").join("modules");
-        let bin_dir = cwd.join(".nu-env").join("bin");
+    if let Some(project_dir) = Manifest::find_project_dir(cwd) {
+        let modules_dir = project_dir.join(".nu-env").join("modules");
+        let bin_dir = project_dir.join(".nu-env").join("bin");
         let modules = list_installed_module_names(&modules_dir)?;
         let plugins = list_installed_plugin_names(&bin_dir)?;
 
@@ -2097,6 +2109,30 @@ sha256 = "bbb"
         assert!(matches!(err, error::QuiverError::NoManifest(_)));
 
         let _ = std::fs::remove_dir_all(cwd);
+    }
+
+    #[test]
+    fn cmd_run_discovers_project_from_subdirectory() {
+        let root = make_temp_dir("run_from_subdir");
+        let nested = root.join("examples").join("demo");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(
+            root.join("nupackage.toml"),
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join(".nu-env")).unwrap();
+        std::fs::write(root.join(".nu-env").join("config.nu"), "").unwrap();
+        std::fs::write(nested.join("check-cwd.sh"), "test -f local.txt\n").unwrap();
+        std::fs::write(nested.join("local.txt"), "ok\n").unwrap();
+
+        cmd_run(
+            &nested,
+            vec!["sh".to_string(), "./check-cwd.sh".to_string()],
+        )
+        .unwrap();
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

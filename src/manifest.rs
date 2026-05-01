@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::error::{QuiverError, Result};
 use crate::nu;
@@ -219,6 +219,14 @@ fn validate_ref_fields(
 }
 
 impl Manifest {
+    /// Find the nearest ancestor directory containing `nupackage.toml`.
+    pub fn find_project_dir(start: &Path) -> Option<PathBuf> {
+        start
+            .ancestors()
+            .find(|dir| dir.join("nupackage.toml").exists())
+            .map(Path::to_path_buf)
+    }
+
     /// Read and parse a `nupackage.toml` from the given directory.
     pub fn from_dir(dir: &Path) -> Result<Self> {
         let path = dir.join("nupackage.toml");
@@ -346,6 +354,17 @@ fn bare_key_or_quoted(key: &str) -> String {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn make_temp_dir(prefix: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("quiver_manifest_{prefix}_{nanos}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
 
     #[test]
     fn round_trip_parse_manifest() {
@@ -607,5 +626,23 @@ nu_plugin_polars = { source = "nu-core", git = "https://example.com/x", tag = "v
 
         let err = Manifest::from_str(toml).unwrap_err();
         assert!(err.to_string().contains("source = 'nu-core'"));
+    }
+
+    #[test]
+    fn find_project_dir_walks_up_parent_directories() {
+        let root = make_temp_dir("find_project_dir");
+        let nested = root.join("src").join("commands");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(
+            root.join("nupackage.toml"),
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+
+        let found = Manifest::find_project_dir(&nested);
+
+        assert_eq!(found.as_deref(), Some(root.as_path()));
+
+        let _ = std::fs::remove_dir_all(root);
     }
 }
