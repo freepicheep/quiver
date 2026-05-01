@@ -942,7 +942,7 @@ fn verify_frozen_checksum(
 pub fn write_activate_overlay(nu_env_dir: &Path, project_dir: &Path) -> Result<()> {
     std::fs::create_dir_all(nu_env_dir)?;
 
-    let nu_bin = nu_env_dir.join(BIN_SUBDIR).join("nu");
+    let nu_bin = nu_env_binary_path(nu_env_dir);
     let env_bin_dir = nu_env_dir.join(BIN_SUBDIR);
     let config_nu = nu_env_dir.join("config.nu");
     let plugin_config = nu_env_dir.join("plugins.msgpackz");
@@ -986,7 +986,7 @@ pub fn write_config_nu(nu_env_dir: &Path, modules_dir: &Path) -> Result<()> {
 
     let modules_literal = nu_string_literal(modules_dir);
     let bin_literal = nu_string_literal(&nu_env_dir.join(BIN_SUBDIR));
-    let nu_bin_literal = nu_string_literal(&nu_env_dir.join(BIN_SUBDIR).join("nu"));
+    let nu_bin_literal = nu_string_literal(&nu_env_binary_path(nu_env_dir));
     let plugin_config_literal = nu_string_literal(&nu_env_dir.join("plugins.msgpackz"));
     let config_literal = nu_string_literal(&nu_env_dir.join("config.nu"));
 
@@ -1056,19 +1056,22 @@ fn create_nu_symlink_with_policy(
     let bin_dir = nu_env_dir.join(BIN_SUBDIR);
     std::fs::create_dir_all(&bin_dir)?;
 
-    let symlink_path = bin_dir.join("nu");
+    let symlink_path = nu_env_binary_path(nu_env_dir);
+    let env_binary_name = nu_env_binary_name();
 
     let nu_path = match resolve_nu_binary_for_requirement(nu_version_req, security_policy)? {
         Some(path) => path,
         None if nu_version_req.is_none() => {
-            ui::warn("could not find 'nu' in PATH; skipping .nu-env/bin/nu symlink.");
+            ui::warn(format!(
+                "could not find 'nu' in PATH; skipping .nu-env/bin/{env_binary_name} link."
+            ));
             return Ok(());
         }
         None => {
             let required = nu_version_req.unwrap_or_default();
             let installs = config::installs_nu_versions_dir()?;
             return Err(crate::error::QuiverError::Other(format!(
-                "could not find a Nushell binary matching '{required}' in PATH or {}; install it under {}/<version>/nu",
+                "could not find a Nushell binary matching '{required}' in PATH or {}; install it under {}/<version>/bin/{env_binary_name}",
                 installs.display(),
                 installs.display()
             )));
@@ -1076,9 +1079,20 @@ fn create_nu_symlink_with_policy(
     };
 
     if ensure_symlink_or_file(&symlink_path, &nu_path)? {
-        ui::success(format!("Linked .nu-env/bin/nu -> {}", nu_path.display()));
+        ui::success(format!(
+            "Linked .nu-env/bin/{env_binary_name} -> {}",
+            nu_path.display()
+        ));
     }
     Ok(())
+}
+
+pub(crate) fn nu_env_binary_name() -> &'static str {
+    if cfg!(windows) { "nu.exe" } else { "nu" }
+}
+
+pub(crate) fn nu_env_binary_path(nu_env_dir: &Path) -> PathBuf {
+    nu_env_dir.join(BIN_SUBDIR).join(nu_env_binary_name())
 }
 
 fn resolve_nu_binary_for_requirement(
@@ -2602,7 +2616,7 @@ fn sync_plugin_registry(nu_env_dir: &Path, plugins: &[ResolvedPlugin]) -> Result
         return Ok(());
     }
 
-    let nu_bin = bin_dir.join("nu");
+    let nu_bin = nu_env_binary_path(nu_env_dir);
     if !nu_bin.exists() {
         return Err(crate::error::QuiverError::Other(format!(
             "cannot register plugins because '{}' was not found",
@@ -3816,7 +3830,7 @@ mod tests {
         let guard = EnvVarGuard::set("QUIVER_INSTALLS_ROOT", &store_root);
         let version_dir = store_root.join("nu_versions").join(version).join("bin");
         std::fs::create_dir_all(&version_dir).unwrap();
-        std::fs::write(version_dir.join("nu"), "nu").unwrap();
+        std::fs::write(version_dir.join(nu_env_binary_name()), "nu").unwrap();
         (store_root, guard)
     }
 
@@ -3858,6 +3872,7 @@ mod tests {
     fn writes_activate_overlay() {
         let project_dir = make_temp_dir("activate_overlay");
         let nu_env_dir = project_dir.join(".nu-env");
+        let expected_nu_path = format!(".nu-env/bin/{}", nu_env_binary_name());
 
         write_activate_overlay(&nu_env_dir, &project_dir).unwrap();
 
@@ -3866,7 +3881,7 @@ mod tests {
         assert!(activate.contains("source-env"));
         assert!(activate.contains("export alias nu = ^"));
         assert!(activate.contains("^"));
-        assert!(activate.contains(".nu-env/bin/nu"));
+        assert!(activate.contains(&expected_nu_path));
         assert!(activate.contains("--config"));
         assert!(activate.contains(".nu-env/config.nu"));
         assert!(activate.contains("use std [ 'path add' ]"));
@@ -4803,11 +4818,12 @@ sha256 = "aaa"
             .join("255.255.255")
             .join("bin");
         std::fs::create_dir_all(&version_dir).unwrap();
-        std::fs::write(version_dir.join("nu"), "nu").unwrap();
+        let installed_nu = version_dir.join(nu_env_binary_name());
+        std::fs::write(&installed_nu, "nu").unwrap();
 
         create_nu_symlink(&nu_env_dir, Some("=255.255.255")).unwrap();
 
-        let symlink_path = nu_env_dir.join("bin").join("nu");
+        let symlink_path = nu_env_binary_path(&nu_env_dir);
         assert!(symlink_path.exists());
         assert!(
             symlink_path
@@ -4817,7 +4833,7 @@ sha256 = "aaa"
                 .is_symlink()
         );
         let target = std::fs::read_link(&symlink_path).unwrap();
-        assert_eq!(target, version_dir.join("nu"));
+        assert_eq!(target, installed_nu);
 
         let _ = std::fs::remove_dir_all(nu_env_dir);
         let _ = std::fs::remove_dir_all(store_root);
@@ -4833,15 +4849,16 @@ sha256 = "aaa"
             .join("255.255.255")
             .join("bin");
         std::fs::create_dir_all(&version_dir).unwrap();
-        std::fs::write(version_dir.join("nu"), "nu").unwrap();
+        let installed_nu = version_dir.join(nu_env_binary_name());
+        std::fs::write(&installed_nu, "nu").unwrap();
         let bin_dir = nu_env_dir.join("bin");
         std::fs::create_dir_all(&bin_dir).unwrap();
         // Create a dummy file where the symlink would go
-        std::fs::write(bin_dir.join("nu"), "dummy").unwrap();
+        std::fs::write(nu_env_binary_path(&nu_env_dir), "dummy").unwrap();
 
         create_nu_symlink(&nu_env_dir, Some("=255.255.255")).unwrap();
 
-        let symlink_path = bin_dir.join("nu");
+        let symlink_path = nu_env_binary_path(&nu_env_dir);
         assert!(symlink_path.exists());
         assert!(
             symlink_path
@@ -4851,7 +4868,7 @@ sha256 = "aaa"
                 .is_symlink()
         );
         let target = std::fs::read_link(&symlink_path).unwrap();
-        assert_eq!(target, version_dir.join("nu"));
+        assert_eq!(target, installed_nu);
 
         let _ = std::fs::remove_dir_all(nu_env_dir);
         let _ = std::fs::remove_dir_all(store_root);
@@ -4913,7 +4930,7 @@ sha256 = "aaa"
     #[test]
     fn detect_nu_path_prefers_quiver_nu_bin_override() {
         let override_dir = make_temp_dir("nu_bin_override");
-        let override_path = override_dir.join("nu");
+        let override_path = override_dir.join(nu_env_binary_name());
         std::fs::write(&override_path, "nu").unwrap();
         let _guard = EnvVarGuard::set_os(QUIVER_NU_BIN_ENV, override_path.clone().into_os_string());
 
@@ -4929,7 +4946,7 @@ sha256 = "aaa"
 
         create_nu_symlink(&nu_env_dir, Some("=255.255.255")).unwrap();
 
-        assert!(!nu_env_dir.join("bin").join("nu").exists());
+        assert!(!nu_env_binary_path(&nu_env_dir).exists());
 
         let _ = std::fs::remove_dir_all(nu_env_dir);
     }
@@ -5143,7 +5160,7 @@ nu_plugin_inc = { git = "https://github.com/nushell/nu_plugin_inc", tag = "v0.91
         let nested = extracted.join("nu-0.110.0");
         std::fs::create_dir_all(&nested).unwrap();
 
-        std::fs::write(nested.join("nu"), "nu").unwrap();
+        std::fs::write(nested.join(nu_env_binary_name()), "nu").unwrap();
         std::fs::write(nested.join("README.txt"), "readme").unwrap();
         let formats = plugin_test_name("nu_plugin_formats");
         let query = plugin_test_name("nu_plugin_query");
@@ -5206,7 +5223,7 @@ nu_plugin_inc = { git = "https://github.com/nushell/nu_plugin_inc", tag = "v0.91
         let root = make_temp_dir("core_plugin_same_dir");
         let nu_dir = root.join("usr").join("local").join("bin");
         std::fs::create_dir_all(&nu_dir).unwrap();
-        let nu_path = nu_dir.join("nu");
+        let nu_path = nu_dir.join(nu_env_binary_name());
         std::fs::write(&nu_path, "nu").unwrap();
         let plugin_name = plugin_test_name("nu_plugin_query");
         let plugin_path = nu_dir.join(&plugin_name);
@@ -5224,7 +5241,7 @@ nu_plugin_inc = { git = "https://github.com/nushell/nu_plugin_inc", tag = "v0.91
         let root = make_temp_dir("core_plugin_quiver_store");
         let version_bin = root.join("nu_versions").join("0.110.0").join("bin");
         std::fs::create_dir_all(&version_bin).unwrap();
-        let nu_path = version_bin.join("nu");
+        let nu_path = version_bin.join(nu_env_binary_name());
         std::fs::write(&nu_path, "nu").unwrap();
         let plugin_name = plugin_test_name("nu_plugin_polars");
         let plugins_dir = root.join("nu_versions").join("0.110.0").join("plugins");

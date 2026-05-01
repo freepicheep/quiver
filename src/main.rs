@@ -741,9 +741,7 @@ fn cmd_qvx(
     let wrapper_path = nu_env_dir.join("qvx-run.nu");
     let wrapper = build_qvx_wrapper(&pkg_name, &command, &args)?;
     std::fs::write(&wrapper_path, wrapper)?;
-    let nu_bin = nu_env_dir
-        .join("bin")
-        .join(if cfg!(windows) { "nu.exe" } else { "nu" });
+    let nu_bin = installer::nu_env_binary_path(&nu_env_dir);
     let nu_command = if nu_bin.symlink_metadata().is_ok() {
         nu_bin.as_path()
     } else {
@@ -993,7 +991,7 @@ fn resolve_run_invocation(
     let config = config_path.to_string_lossy().to_string();
     let plugin_config = plugin_config_path.to_string_lossy().to_string();
 
-    if executable == "nu" {
+    if is_nushell_command_name(&executable) {
         if !args.iter().any(|arg| arg == "--plugin-config") {
             args.insert(0, plugin_config);
             args.insert(0, "--plugin-config".to_string());
@@ -1018,6 +1016,10 @@ fn resolve_run_invocation(
     }
 
     (executable, args)
+}
+
+fn is_nushell_command_name(executable: &str) -> bool {
+    executable.eq_ignore_ascii_case("nu") || executable.eq_ignore_ascii_case("nu.exe")
 }
 
 fn is_nushell_script_command(executable: &str, cwd: &Path) -> bool {
@@ -1111,121 +1113,132 @@ fn cmd_lsp(cwd: &Path, editors: Vec<String>) -> Result<()> {
 
 /// Interactive checkbox picker rendered to stderr.
 fn pick_editors(options: &[&str]) -> Result<Vec<String>> {
-    use std::io::Read;
+    #[cfg(windows)]
+    {
+        let supported = options.join(", ");
+        return Err(error::QuiverError::Other(format!(
+            "interactive editor selection is not supported on Windows; pass one or more editors explicitly: {supported}"
+        )));
+    }
 
-    let mut selected = vec![false; options.len()];
-    let mut cursor = 0usize;
+    #[cfg(not(windows))]
+    {
+        use std::io::Read;
 
-    // Save terminal state and enable raw mode
-    let stdin = io::stdin();
-    let mut stderr = io::stderr();
+        let mut selected = vec![false; options.len()];
+        let mut cursor = 0usize;
 
-    // Set raw mode via stty
-    let _ = Command::new("stty")
-        .arg("raw")
-        .arg("-echo")
-        .stdin(std::process::Stdio::inherit())
-        .status();
+        // Save terminal state and enable raw mode
+        let stdin = io::stdin();
+        let mut stderr = io::stderr();
 
-    let render = |selected: &[bool], cursor: usize, out: &mut io::Stderr| -> io::Result<()> {
-        // Move to start and clear
-        write!(out, "\r\x1b[J")?;
-        write!(
-            out,
-            "Select editors to configure (space=toggle, j/k=move, enter=confirm):\r\n"
-        )?;
-        for (i, option) in options.iter().enumerate() {
-            let check = if selected[i] { "x" } else { " " };
-            let prefix = if i == cursor { "> " } else { "  " };
-            write!(out, "{prefix}[{check}] {option}\r\n")?;
-        }
-        out.flush()
-    };
+        // Set raw mode via stty
+        let _ = Command::new("stty")
+            .arg("raw")
+            .arg("-echo")
+            .stdin(std::process::Stdio::inherit())
+            .status();
 
-    render(&selected, cursor, &mut stderr)?;
+        let render = |selected: &[bool], cursor: usize, out: &mut io::Stderr| -> io::Result<()> {
+            // Move to start and clear
+            write!(out, "\r\x1b[J")?;
+            write!(
+                out,
+                "Select editors to configure (space=toggle, j/k=move, enter=confirm):\r\n"
+            )?;
+            for (i, option) in options.iter().enumerate() {
+                let check = if selected[i] { "x" } else { " " };
+                let prefix = if i == cursor { "> " } else { "  " };
+                write!(out, "{prefix}[{check}] {option}\r\n")?;
+            }
+            out.flush()
+        };
 
-    let result = (|| -> Result<Vec<String>> {
-        let mut bytes = stdin.lock().bytes();
-        loop {
-            let b = match bytes.next() {
-                Some(Ok(b)) => b,
-                _ => break,
-            };
+        render(&selected, cursor, &mut stderr)?;
 
-            match b {
-                b'\n' | b'\r' => {
-                    // Enter — confirm
-                    break;
-                }
-                b' ' => {
-                    selected[cursor] = !selected[cursor];
-                }
-                b'j' => {
-                    if cursor + 1 < options.len() {
-                        cursor += 1;
+        let result = (|| -> Result<Vec<String>> {
+            let mut bytes = stdin.lock().bytes();
+            loop {
+                let b = match bytes.next() {
+                    Some(Ok(b)) => b,
+                    _ => break,
+                };
+
+                match b {
+                    b'\n' | b'\r' => {
+                        // Enter — confirm
+                        break;
                     }
-                }
-                b'k' => {
-                    if cursor > 0 {
-                        cursor -= 1;
+                    b' ' => {
+                        selected[cursor] = !selected[cursor];
                     }
-                }
-                b'q' | 3 => {
-                    // q or Ctrl-C — abort
-                    let _ = Command::new("stty")
-                        .arg("sane")
-                        .stdin(std::process::Stdio::inherit())
-                        .status();
-                    write!(stderr, "\r\x1b[J")?;
-                    stderr.flush()?;
-                    std::process::exit(0);
-                }
-                27 => {
-                    // Escape sequence (arrow keys)
-                    let next = bytes.next();
-                    if let Some(Ok(b'[')) = next {
-                        if let Some(Ok(arrow)) = bytes.next() {
-                            match arrow {
-                                b'A' => {
-                                    if cursor > 0 {
-                                        cursor -= 1;
-                                    }
-                                } // Up
-                                b'B' => {
-                                    if cursor + 1 < options.len() {
-                                        cursor += 1;
-                                    }
-                                } // Down
-                                _ => {}
+                    b'j' => {
+                        if cursor + 1 < options.len() {
+                            cursor += 1;
+                        }
+                    }
+                    b'k' => {
+                        if cursor > 0 {
+                            cursor -= 1;
+                        }
+                    }
+                    b'q' | 3 => {
+                        // q or Ctrl-C — abort
+                        let _ = Command::new("stty")
+                            .arg("sane")
+                            .stdin(std::process::Stdio::inherit())
+                            .status();
+                        write!(stderr, "\r\x1b[J")?;
+                        stderr.flush()?;
+                        std::process::exit(0);
+                    }
+                    27 => {
+                        // Escape sequence (arrow keys)
+                        let next = bytes.next();
+                        if let Some(Ok(b'[')) = next {
+                            if let Some(Ok(arrow)) = bytes.next() {
+                                match arrow {
+                                    b'A' => {
+                                        if cursor > 0 {
+                                            cursor -= 1;
+                                        }
+                                    } // Up
+                                    b'B' => {
+                                        if cursor + 1 < options.len() {
+                                            cursor += 1;
+                                        }
+                                    } // Down
+                                    _ => {}
+                                }
                             }
                         }
                     }
+                    _ => {}
                 }
-                _ => {}
+
+                // Move cursor up to re-render
+                let lines_to_move = options.len() + 1; // +1 for the header line
+                write!(stderr, "\x1b[{}A", lines_to_move)?;
+                render(&selected, cursor, &mut stderr)?;
             }
 
-            // Move cursor up to re-render
-            let lines_to_move = options.len() + 1; // +1 for the header line
-            write!(stderr, "\x1b[{}A", lines_to_move)?;
-            render(&selected, cursor, &mut stderr)?;
-        }
+            Ok(options
+                .iter()
+                .zip(selected.iter())
+                .filter_map(|(name, &sel)| if sel { Some(name.to_string()) } else { None })
+                .collect())
+        })();
 
-        Ok(options
-            .iter()
-            .zip(selected.iter())
-            .filter_map(|(name, &sel)| if sel { Some(name.to_string()) } else { None })
-            .collect())
-    })();
+        // Restore terminal
+        let _ = Command::new("stty")
+            .arg("sane")
+            .stdin(std::process::Stdio::inherit())
+            .status();
+        write!(stderr, "\r\x1b[J")?;
+        stderr.flush()?;
 
-    // Restore terminal
-    let _ = Command::new("stty")
-        .arg("sane")
-        .stdin(std::process::Stdio::inherit())
-        .status();
-    write!(stderr, "\r\x1b[J")?;
-    stderr.flush()?;
-
-    result
+        result
+    }
 }
 
 fn write_helix_lsp_config(project_dir: &Path) -> Result<()> {
@@ -1234,7 +1247,7 @@ fn write_helix_lsp_config(project_dir: &Path) -> Result<()> {
 
     let config_path = helix_dir.join("languages.toml");
     let config = r#"[language-server.nu-lsp]
-command = ".nu-env/bin/nu"
+command = "__QUIVER_NU_BIN__"
 args = [
   "--config",
   ".nu-env/config.nu",
@@ -1242,7 +1255,11 @@ args = [
   ".nu-env/plugins.msgpackz",
   "--lsp"
 ]
-"#;
+"#
+    .replace(
+        "__QUIVER_NU_BIN__",
+        &format!(".nu-env/bin/{}", installer::nu_env_binary_name()),
+    );
 
     std::fs::write(&config_path, config)?;
     eprintln!("Generated .helix/languages.toml");
@@ -1258,7 +1275,7 @@ fn write_zed_lsp_config(project_dir: &Path) -> Result<()> {
   "lsp": {
     "nu": {
       "binary": {
-        "path": ".nu-env/bin/nu",
+        "path": "__QUIVER_NU_BIN__",
         "arguments": [
           "--config",
           ".nu-env/config.nu",
@@ -1270,7 +1287,11 @@ fn write_zed_lsp_config(project_dir: &Path) -> Result<()> {
     }
   }
 }
-"#;
+"#
+    .replace(
+        "__QUIVER_NU_BIN__",
+        &format!(".nu-env/bin/{}", installer::nu_env_binary_name()),
+    );
 
     std::fs::write(&config_path, config)?;
     eprintln!("Generated .zed/settings.json");
@@ -1682,7 +1703,11 @@ mod tests {
         let guard = EnvVarGuard::set("QUIVER_INSTALLS_ROOT", &store_root);
         let version_dir = store_root.join("nu_versions").join(version).join("bin");
         std::fs::create_dir_all(&version_dir).unwrap();
-        std::fs::write(version_dir.join("nu"), "nu").unwrap();
+        std::fs::write(
+            version_dir.join(crate::installer::nu_env_binary_name()),
+            "nu",
+        )
+        .unwrap();
         (store_root, guard)
     }
 
@@ -1954,7 +1979,11 @@ mod tests {
         let bin_dir = make_temp_dir("list_plugins");
         std::fs::write(bin_dir.join("nu_plugin_query"), "binary").unwrap();
         std::fs::write(bin_dir.join("nu_plugin_polars"), "binary").unwrap();
-        std::fs::write(bin_dir.join("nu"), "binary").unwrap(); // should be excluded
+        std::fs::write(
+            bin_dir.join(crate::installer::nu_env_binary_name()),
+            "binary",
+        )
+        .unwrap(); // should be excluded
         std::fs::write(bin_dir.join("other_file"), "binary").unwrap(); // should be excluded
 
         let plugins = list_installed_plugin_names(&bin_dir).unwrap();
@@ -2324,6 +2353,7 @@ sha256 = "bbb"
     #[test]
     fn helix_lsp_config_generates_languages_toml() {
         let project_dir = make_temp_dir("helix_lsp");
+        let expected_nu_path = format!(".nu-env/bin/{}", crate::installer::nu_env_binary_name());
 
         write_helix_lsp_config(&project_dir).unwrap();
 
@@ -2332,7 +2362,7 @@ sha256 = "bbb"
 
         let content = std::fs::read_to_string(&config_path).unwrap();
         assert!(content.contains("[language-server.nu-lsp]"));
-        assert!(content.contains("command = \".nu-env/bin/nu\""));
+        assert!(content.contains(&format!("command = \"{expected_nu_path}\"")));
         assert!(content.contains("\"--config\""));
         assert!(content.contains("\".nu-env/config.nu\""));
         assert!(content.contains("\"--plugin-config\""));
@@ -2345,6 +2375,7 @@ sha256 = "bbb"
     #[test]
     fn zed_lsp_config_generates_settings_json() {
         let project_dir = make_temp_dir("zed_lsp");
+        let expected_nu_path = format!(".nu-env/bin/{}", crate::installer::nu_env_binary_name());
 
         write_zed_lsp_config(&project_dir).unwrap();
 
@@ -2353,7 +2384,7 @@ sha256 = "bbb"
 
         let content = std::fs::read_to_string(&config_path).unwrap();
         assert!(content.contains("\"nu\""));
-        assert!(content.contains("\"path\": \".nu-env/bin/nu\""));
+        assert!(content.contains(&format!("\"path\": \"{expected_nu_path}\"")));
         assert!(content.contains("--config"));
         assert!(content.contains(".nu-env/config.nu"));
         assert!(content.contains("--plugin-config"));
@@ -2383,5 +2414,12 @@ sha256 = "bbb"
         assert!(err.to_string().contains("unknown editor"));
 
         let _ = std::fs::remove_dir_all(project_dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pick_editors_requires_explicit_selection_on_windows() {
+        let err = pick_editors(&["helix", "zed"]).unwrap_err();
+        assert!(err.to_string().contains("not supported on Windows"));
     }
 }

@@ -276,19 +276,30 @@ impl GlobalConfig {
     }
 }
 
-/// Returns the global config directory: `~/.config/quiver/`.
+/// Returns the global config directory.
 pub fn global_config_dir() -> Result<PathBuf> {
-    let home = dirs::home_dir()
-        .ok_or_else(|| QuiverError::Config("could not determine home directory".to_string()))?;
-    Ok(home.join(".config").join("quiver"))
+    #[cfg(windows)]
+    {
+        let config = dirs::config_dir().ok_or_else(|| {
+            QuiverError::Config("could not determine config directory".to_string())
+        })?;
+        return Ok(config.join("quiver"));
+    }
+
+    #[cfg(not(windows))]
+    {
+        let home = dirs::home_dir()
+            .ok_or_else(|| QuiverError::Config("could not determine home directory".to_string()))?;
+        Ok(home.join(".config").join("quiver"))
+    }
 }
 
-/// Returns the path to the global config file: `~/.config/quiver/config.toml`.
+/// Returns the path to the global config file.
 pub fn global_config_path() -> Result<PathBuf> {
     Ok(global_config_dir()?.join("config.toml"))
 }
 
-/// Returns the path to the global lockfile: `~/.config/quiver/config.lock`.
+/// Returns the path to the global lockfile.
 pub fn global_lock_path() -> Result<PathBuf> {
     Ok(global_config_dir()?.join("config.lock"))
 }
@@ -452,15 +463,19 @@ mod tests {
 
     #[test]
     fn config_dir_paths() {
-        // These should not error on any platform with a home directory
+        #[cfg(windows)]
+        let expected_dir = dirs::config_dir().unwrap().join("quiver");
+        #[cfg(not(windows))]
+        let expected_dir = dirs::home_dir().unwrap().join(".config").join("quiver");
+
         let dir = global_config_dir().unwrap();
-        assert!(dir.ends_with("quiver"));
+        assert_eq!(dir, expected_dir);
 
         let path = global_config_path().unwrap();
-        assert!(path.ends_with("quiver/config.toml"));
+        assert_eq!(path, expected_dir.join("config.toml"));
 
         let lock = global_lock_path().unwrap();
-        assert!(lock.ends_with("quiver/config.lock"));
+        assert_eq!(lock, expected_dir.join("config.lock"));
     }
 
     #[test]
