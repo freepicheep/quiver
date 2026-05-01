@@ -1,5 +1,15 @@
 # Unreleased
 
+## Added
+
+- Project-local commands now discover the nearest enclosing `nupackage.toml` by walking up from the current working directory, so commands like `qv run amazing.nu` work from subdirectories of a Quiver project.
+
+## Fixed
+
+- Improved Windows compatibility for Quiver-managed Nushell binaries by consistently using the platform-specific `.nu-env/bin/nu` path (`nu.exe` on Windows) across `qvx`, generated project env files, plugin registration, and editor LSP configs.
+- Global Quiver config and lockfile paths now use the platform config directory on windows and `~/.config` on macOS/linux.
+- `qv lsp` now fails clearly on Windows when invoked without explicit editor names, instead of attempting to use the Unix-only interactive picker (hopefully switch to ratatui for this at some point).
+
 # Version 0.5.1 (2026-04-22)
 
 ## Added
