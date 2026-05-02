@@ -14,9 +14,23 @@ export def release [] {
 # Bump the package's minor version
 @example "specify a new version" { bump-cargo-version 1.0.0 } --result $"Quiver updated from (ansi yellow)0.3.4(ansi reset) to (ansi green)1.0.0"
 @example "bump the minor version" { bump-cargo-version } --result $"Quiver updated from (ansi yellow)0.3.4(ansi reset) to (ansi green)0.4.0"
-export def bump-cargo-version [version?: string] {
+export def bump-cargo-version [
+    version?: string
+    --major (-M) # bump the major version
+    --minor (-m) # bump the minor version (default)
+    --patch (-p) # bump the patch version
+] {
+    mut new_version = open Cargo.toml | get package.version
+    if $version != null {
+        $new_version = $version
+    } else if $major {
+        $new_version = $new_version | inc -M
+    } else if $patch {
+        $new_version = $new_version | inc -p
+    } else {
+        $new_version = $new_version | inc -m
+    }
     let current_version = open Cargo.toml | get package.version
-    mut new_version = $version | default ($current_version | inc -m)
     open Cargo.toml | update package.version $new_version | collect | save -f Cargo.toml
     print $"Quiver updated from (ansi yellow)($current_version)(ansi reset) to (ansi green)($new_version)"
 }
