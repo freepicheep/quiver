@@ -12,7 +12,7 @@ mod safety;
 mod ui;
 
 use std::collections::HashMap;
-use std::io::{self, Write};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 #[cfg(test)]
@@ -1113,132 +1113,133 @@ fn cmd_lsp(cwd: &Path, editors: Vec<String>) -> Result<()> {
 
 /// Interactive checkbox picker rendered to stderr.
 fn pick_editors(options: &[&str]) -> Result<Vec<String>> {
-    #[cfg(windows)]
-    {
-        let supported = options.join(", ");
-        return Err(error::QuiverError::Other(format!(
-            "interactive editor selection is not supported on Windows; pass one or more editors explicitly: {supported}"
-        )));
+    if options.is_empty() {
+        return Ok(Vec::new());
     }
 
-    #[cfg(not(windows))]
-    {
-        use std::io::Read;
+    use crossterm::{
+        event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+        execute,
+        terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    };
+    use ratatui::{
+        Terminal,
+        backend::CrosstermBackend,
+        layout::{Constraint, Direction, Layout},
+        style::{Color, Modifier, Style},
+        text::Line,
+        widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
+    };
 
-        let mut selected = vec![false; options.len()];
-        let mut cursor = 0usize;
+    let mut selected = vec![false; options.len()];
+    let mut cursor = 0usize;
 
-        // Save terminal state and enable raw mode
-        let stdin = io::stdin();
-        let mut stderr = io::stderr();
+    enable_raw_mode()?;
+    let mut stderr = io::stderr();
+    execute!(stderr, EnterAlternateScreen)?;
 
-        // Set raw mode via stty
-        let _ = Command::new("stty")
-            .arg("raw")
-            .arg("-echo")
-            .stdin(std::process::Stdio::inherit())
-            .status();
+    let backend = CrosstermBackend::new(stderr);
+    let mut terminal = Terminal::new(backend)?;
 
-        let render = |selected: &[bool], cursor: usize, out: &mut io::Stderr| -> io::Result<()> {
-            // Move to start and clear
-            write!(out, "\r\x1b[J")?;
-            write!(
-                out,
-                "Select editors to configure (space=toggle, j/k=move, enter=confirm):\r\n"
-            )?;
-            for (i, option) in options.iter().enumerate() {
-                let check = if selected[i] { "x" } else { " " };
-                let prefix = if i == cursor { "> " } else { "  " };
-                write!(out, "{prefix}[{check}] {option}\r\n")?;
-            }
-            out.flush()
-        };
+    let picker_result = (|| -> Result<Vec<String>> {
+        loop {
+            terminal.draw(|frame| {
+                let area = frame.area();
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(3),
+                        Constraint::Min(options.len() as u16 + 2),
+                        Constraint::Length(2),
+                    ])
+                    .split(area);
 
-        render(&selected, cursor, &mut stderr)?;
+                let title = Paragraph::new("Select editors to configure")
+                    .style(Style::default().add_modifier(Modifier::BOLD));
+                frame.render_widget(title, chunks[0]);
 
-        let result = (|| -> Result<Vec<String>> {
-            let mut bytes = stdin.lock().bytes();
-            loop {
-                let b = match bytes.next() {
-                    Some(Ok(b)) => b,
-                    _ => break,
-                };
+                let items: Vec<ListItem> = options
+                    .iter()
+                    .enumerate()
+                    .map(|(index, option)| {
+                        let check = if selected[index] { "[x]" } else { "[ ]" };
+                        ListItem::new(format!("{check} {option}"))
+                    })
+                    .collect();
+                let list = List::new(items)
+                    .block(Block::default().borders(Borders::ALL))
+                    .highlight_symbol("> ")
+                    .highlight_style(
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    );
+                let mut list_state = ListState::default();
+                list_state.select(Some(cursor));
+                frame.render_stateful_widget(list, chunks[1], &mut list_state);
 
-                match b {
-                    b'\n' | b'\r' => {
-                        // Enter — confirm
-                        break;
-                    }
-                    b' ' => {
-                        selected[cursor] = !selected[cursor];
-                    }
-                    b'j' => {
+                let help = Paragraph::new(Line::from(
+                    "Space toggles, up/down or j/k moves, Enter confirms, Esc/q cancels",
+                ));
+                frame.render_widget(help, chunks[2]);
+            })?;
+
+            if let Event::Key(key) = event::read()? {
+                if key.kind != KeyEventKind::Press {
+                    continue;
+                }
+
+                match key.code {
+                    KeyCode::Enter => break,
+                    KeyCode::Char(' ') => selected[cursor] = !selected[cursor],
+                    KeyCode::Down | KeyCode::Char('j') => {
                         if cursor + 1 < options.len() {
                             cursor += 1;
                         }
                     }
-                    b'k' => {
-                        if cursor > 0 {
-                            cursor -= 1;
-                        }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        cursor = cursor.saturating_sub(1);
                     }
-                    b'q' | 3 => {
-                        // q or Ctrl-C — abort
-                        let _ = Command::new("stty")
-                            .arg("sane")
-                            .stdin(std::process::Stdio::inherit())
-                            .status();
-                        write!(stderr, "\r\x1b[J")?;
-                        stderr.flush()?;
-                        std::process::exit(0);
-                    }
-                    27 => {
-                        // Escape sequence (arrow keys)
-                        let next = bytes.next();
-                        if let Some(Ok(b'[')) = next {
-                            if let Some(Ok(arrow)) = bytes.next() {
-                                match arrow {
-                                    b'A' => {
-                                        if cursor > 0 {
-                                            cursor -= 1;
-                                        }
-                                    } // Up
-                                    b'B' => {
-                                        if cursor + 1 < options.len() {
-                                            cursor += 1;
-                                        }
-                                    } // Down
-                                    _ => {}
-                                }
-                            }
-                        }
+                    KeyCode::Home => cursor = 0,
+                    KeyCode::End => cursor = options.len() - 1,
+                    KeyCode::Esc | KeyCode::Char('q') => return Ok(Vec::new()),
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        return Ok(Vec::new());
                     }
                     _ => {}
                 }
-
-                // Move cursor up to re-render
-                let lines_to_move = options.len() + 1; // +1 for the header line
-                write!(stderr, "\x1b[{}A", lines_to_move)?;
-                render(&selected, cursor, &mut stderr)?;
             }
+        }
 
-            Ok(options
-                .iter()
-                .zip(selected.iter())
-                .filter_map(|(name, &sel)| if sel { Some(name.to_string()) } else { None })
-                .collect())
-        })();
+        Ok(selected_editor_names(options, &selected))
+    })();
 
-        // Restore terminal
-        let _ = Command::new("stty")
-            .arg("sane")
-            .stdin(std::process::Stdio::inherit())
-            .status();
-        write!(stderr, "\r\x1b[J")?;
-        stderr.flush()?;
+    let cleanup_result = (|| -> io::Result<()> {
+        disable_raw_mode()?;
+        execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+        terminal.show_cursor()?;
+        Ok(())
+    })();
 
-        result
+    match (picker_result, cleanup_result) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(err), Ok(())) => Err(err),
+        (Ok(_), Err(err)) | (Err(_), Err(err)) => Err(err.into()),
     }
+}
+
+fn selected_editor_names(options: &[&str], selected: &[bool]) -> Vec<String> {
+    options
+        .iter()
+        .zip(selected.iter())
+        .filter_map(|(name, &is_selected)| {
+            if is_selected {
+                Some(name.to_string())
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 fn write_helix_lsp_config(project_dir: &Path) -> Result<()> {
@@ -2416,10 +2417,9 @@ sha256 = "bbb"
         let _ = std::fs::remove_dir_all(project_dir);
     }
 
-    #[cfg(windows)]
     #[test]
-    fn pick_editors_requires_explicit_selection_on_windows() {
-        let err = pick_editors(&["helix", "zed"]).unwrap_err();
-        assert!(err.to_string().contains("not supported on Windows"));
+    fn selected_editor_names_keeps_selected_options_in_order() {
+        let selected = selected_editor_names(&["helix", "zed"], &[true, false]);
+        assert_eq!(selected, vec!["helix".to_string()]);
     }
 }

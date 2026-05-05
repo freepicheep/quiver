@@ -1,5 +1,13 @@
 # Unreleased
 
+## Added
+
+- `qv lsp` now uses a Ratatui/Crossterm interactive picker, so editor selection works on Windows too.
+
+## Fixed
+
+- Release builds now vendor libgit2 through the `git2` crate, avoiding failures from missing or stale system libgit2 installations.
+
 # Version 0.5.2 (2026-05-01)
 
 ## Added
