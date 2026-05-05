@@ -1,5 +1,7 @@
 # Unreleased
 
+# Version 0.6.0 (2026-05-05)
+
 ## Added
 
 - `qv` now launches a TUI where you can manage dependencies for your Quiver project. It includes a dependency graph, README and info viewer for installed dependencies, and an interactive mode to view dependency README's from github before adding them.
