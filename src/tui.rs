@@ -4,7 +4,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, EnableMouseCapture, DisableMouseCapture, MouseEventKind},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+        MouseEventKind,
+    },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -23,6 +26,17 @@ use ratatui::{
 use crate::error::{QuiverError, Result};
 use crate::lockfile::{LockedPackageKind, Lockfile};
 use crate::manifest::Manifest;
+
+const BUILTIN_PLUGINS: &[&str] = &[
+    "nu_plugin_custom_values",
+    "nu_plugin_example",
+    "nu_plugin_formats",
+    "nu_plugin_gstat",
+    "nu_plugin_inc",
+    "nu_plugin_polars",
+    "nu_plugin_query",
+    "nu_plugin_stress_internals",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TuiAction {
@@ -72,8 +86,10 @@ struct App {
     rows: Vec<DependencyRow>,
     tab: Tab,
     selected: usize,
+    search_selected: usize,
     readme_scroll: u16,
     detail_readme_scroll: u16,
+    graph_scroll: u16,
     local_readme: String,
     local_license: String,
     status: String,
@@ -124,6 +140,12 @@ pub fn run(cwd: &Path) -> Result<Option<TuiAction>> {
                     MouseEventKind::ScrollUp if app.tab == Tab::Search => {
                         app.readme_scroll = app.readme_scroll.saturating_sub(3);
                     }
+                    MouseEventKind::ScrollDown if app.tab == Tab::Graph => {
+                        app.graph_scroll = app.graph_scroll.saturating_add(3);
+                    }
+                    MouseEventKind::ScrollUp if app.tab == Tab::Graph => {
+                        app.graph_scroll = app.graph_scroll.saturating_sub(3);
+                    }
                     _ => {}
                 },
                 _ => continue,
@@ -138,7 +160,11 @@ pub fn run(cwd: &Path) -> Result<Option<TuiAction>> {
 
     let cleanup_result = (|| -> io::Result<()> {
         disable_raw_mode()?;
-        execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
+        execute!(
+            terminal.backend_mut(),
+            LeaveAlternateScreen,
+            DisableMouseCapture
+        )?;
         terminal.show_cursor()?;
         Ok(())
     })();
@@ -160,8 +186,10 @@ impl App {
                 rows: Vec::new(),
                 tab: Tab::Dependencies,
                 selected: 0,
+                search_selected: 0,
                 readme_scroll: 0,
                 detail_readme_scroll: 0,
+                graph_scroll: 0,
                 local_readme: String::new(),
                 local_license: String::new(),
                 status: "Run qv init to create nupackage.toml, or q to quit.".to_string(),
@@ -196,8 +224,10 @@ impl App {
             rows,
             tab: Tab::Dependencies,
             selected: 0,
+            search_selected: 0,
             readme_scroll: 0,
             detail_readme_scroll: 0,
+            graph_scroll: 0,
             local_readme,
             local_license,
             status,
@@ -343,7 +373,7 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut App) {
 }
 
 fn render_header(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
-    let titles = ["Dependencies", "Graph", "GitHub README"]
+    let titles = ["Dependencies", "Graph", "Add"]
         .iter()
         .map(|title| Line::from(Span::styled(*title, Style::default().fg(Color::Cyan))))
         .collect::<Vec<_>>();
@@ -439,8 +469,8 @@ fn render_dependencies(frame: &mut ratatui::Frame<'_>, app: &mut App, area: Rect
     frame.render_widget(readme_paragraph, right_chunks[1]);
 
     let content_height = app.local_readme.lines().count().saturating_sub(1) as u16;
-    let mut scrollbar_state = ScrollbarState::new(content_height as usize)
-        .position(app.detail_readme_scroll as usize);
+    let mut scrollbar_state =
+        ScrollbarState::new(content_height as usize).position(app.detail_readme_scroll as usize);
     frame.render_stateful_widget(
         Scrollbar::new(ScrollbarOrientation::VerticalRight),
         right_chunks[1],
@@ -472,62 +502,231 @@ fn selected_detail(app: &App) -> String {
     detail
 }
 
-fn render_graph(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
-    let mut lines = Vec::new();
-    lines.push(app.package_name.clone());
+struct Canvas {
+    grid: Vec<Vec<char>>,
+    width: usize,
+    height: usize,
+}
 
-    let direct_count = app
-        .rows
-        .iter()
-        .filter(|row| !matches!(row.kind, DependencyKind::Transitive))
-        .count();
-    for (index, row) in app
-        .rows
-        .iter()
-        .filter(|row| !matches!(row.kind, DependencyKind::Transitive))
-        .enumerate()
-    {
-        let prefix = if index + 1 == direct_count {
-            "`--"
-        } else {
-            "|--"
-        };
-        lines.push(format!("{prefix} {} ({})", row.name, kind_label(&row.kind)));
+impl Canvas {
+    fn new(width: usize, height: usize) -> Self {
+        Self {
+            grid: vec![vec![' '; width]; height],
+            width,
+            height,
+        }
     }
+
+    fn write(&mut self, x: usize, y: usize, s: &str) {
+        if y >= self.height {
+            return;
+        }
+        for (i, c) in s.chars().enumerate() {
+            if x + i < self.width {
+                self.grid[y][x + i] = c;
+            }
+        }
+    }
+
+    fn to_string(&self) -> String {
+        self.grid
+            .iter()
+            .map(|row| row.iter().collect::<String>())
+            .map(|s| s.trim_end().to_string())
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
+fn draw_root_box(
+    canvas: &mut Canvas,
+    x: usize,
+    y: usize,
+    name: &str,
+    has_children: bool,
+) -> (usize, usize) {
+    let name_len = name.chars().count();
+    let w = name_len.max(10) + 4;
+    let top = format!("┌{}┐", "─".repeat(w));
+    let empty = format!("│{}│", " ".repeat(w));
+
+    let pad_left = (w - name_len) / 2;
+    let pad_right = w - name_len - pad_left;
+    let text = format!(
+        "│{}{}{}│",
+        " ".repeat(pad_left),
+        name,
+        " ".repeat(pad_right)
+    );
+
+    let mid = w / 2;
+    let bottom = if has_children {
+        format!("└{}┬{}┘", "─".repeat(mid), "─".repeat(w - mid - 1))
+    } else {
+        format!("└{}┘", "─".repeat(w))
+    };
+
+    canvas.write(x, y, &top);
+    canvas.write(x, y + 1, &empty);
+    canvas.write(x, y + 2, &text);
+    canvas.write(x, y + 3, &empty);
+    canvas.write(x, y + 4, &bottom);
+
+    (x + mid + 1, y + 4)
+}
+
+fn draw_dep_box(
+    canvas: &mut Canvas,
+    x: usize,
+    y: usize,
+    kind: &str,
+    version: &str,
+    name: &str,
+) -> (usize, usize) {
+    let kind_len = kind.chars().count();
+    let ver_len = version.chars().count();
+    let name_len = name.chars().count();
+
+    let w1 = kind_len.max(ver_len) + 2;
+    let w2 = name_len + 2;
+
+    let top = format!("┌{}┬{}┐", "─".repeat(w1), "─".repeat(w2));
+
+    let pad_kind_l = (w1 - kind_len) / 2;
+    let pad_kind_r = w1 - kind_len - pad_kind_l;
+    let line1 = format!(
+        "│{}{}{}│{}│",
+        " ".repeat(pad_kind_l),
+        kind,
+        " ".repeat(pad_kind_r),
+        " ".repeat(w2)
+    );
+
+    let line2 = format!(
+        "├{}┤ {}{}│",
+        "─".repeat(w1),
+        name,
+        " ".repeat(w2 - name_len - 1)
+    );
+
+    let pad_ver_l = (w1 - ver_len) / 2;
+    let pad_ver_r = w1 - ver_len - pad_ver_l;
+    let line3 = format!(
+        "│{}{}{}│{}│",
+        " ".repeat(pad_ver_l),
+        version,
+        " ".repeat(pad_ver_r),
+        " ".repeat(w2)
+    );
+
+    let bottom = format!("└{}┴{}┘", "─".repeat(w1), "─".repeat(w2));
+
+    canvas.write(x, y, &top);
+    canvas.write(x, y + 1, &line1);
+    canvas.write(x, y + 2, &line2);
+    canvas.write(x, y + 3, &line3);
+    canvas.write(x, y + 4, &bottom);
+
+    (x, y + 2)
+}
+
+fn render_graph(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
+    let mut deps = Vec::new();
+
+    let direct: Vec<_> = app
+        .rows
+        .iter()
+        .filter(|row| !matches!(row.kind, DependencyKind::Transitive))
+        .collect();
+    deps.extend(direct);
 
     let transitive: Vec<_> = app
         .rows
         .iter()
         .filter(|row| matches!(row.kind, DependencyKind::Transitive))
         .collect();
-    if !transitive.is_empty() {
-        lines.push("`-- transitive modules from quiver.lock".to_string());
-        for row in transitive {
-            lines.push(format!("    |-- {} ({})", row.name, row.requested));
+    deps.extend(transitive);
+
+    let height = 5 + (deps.len().max(1)) * 6 + 2;
+    let width = 200;
+    let mut canvas = Canvas::new(width, height);
+
+    let package_name = if app.package_name.is_empty() {
+        "No Project"
+    } else {
+        &app.package_name
+    };
+    let (root_px, root_py) = draw_root_box(&mut canvas, 4, 1, package_name, !deps.is_empty());
+
+    let spine_x = root_px;
+    let mut current_y = root_py;
+
+    for (i, row) in deps.iter().enumerate() {
+        let is_last = i == deps.len() - 1;
+        let dep_y = 6 + i * 6 + 1;
+        let dep_x = spine_x + 8;
+
+        let version = if let Some(tag) = &row.locked_tag {
+            tag.clone()
+        } else if let Some(rev) = &row.locked_rev {
+            short_rev(rev).to_string()
+        } else {
+            row.requested.clone()
+        };
+
+        let (in_x, in_y) = draw_dep_box(
+            &mut canvas,
+            dep_x,
+            dep_y,
+            kind_label(&row.kind),
+            &version,
+            &row.name,
+        );
+
+        for y in (current_y + 1)..=in_y {
+            let ch = if y == in_y {
+                if is_last { '└' } else { '├' }
+            } else {
+                '│'
+            };
+            canvas.write(spine_x, y, &ch.to_string());
         }
+
+        for x in (spine_x + 1)..(in_x - 1) {
+            canvas.write(x, in_y, "─");
+        }
+
+        canvas.write(in_x - 1, in_y, "►");
+
+        current_y = in_y;
     }
 
-    if lines.len() == 1 {
-        lines.push("`-- no dependencies".to_string());
-    }
+    let text = canvas.to_string();
 
     frame.render_widget(
-        Paragraph::new(lines.join("\n"))
+        Paragraph::new(text)
             .block(
                 Block::default()
                     .title("Dependency Graph")
                     .borders(Borders::ALL),
             )
+            .scroll((app.graph_scroll, 0))
             .wrap(Wrap { trim: false }),
         area,
     );
 }
 
 fn render_search(frame: &mut ratatui::Frame<'_>, app: &mut App, area: Rect) {
-    let chunks = Layout::default()
+    let horizontal_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(area);
+
+    let left_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(3), Constraint::Min(5)])
-        .split(area);
+        .split(horizontal_chunks[0]);
 
     let url = if app.readme_url.is_empty() {
         "No repository loaded".to_string()
@@ -535,24 +734,48 @@ fn render_search(frame: &mut ratatui::Frame<'_>, app: &mut App, area: Rect) {
         app.readme_url.clone()
     };
     frame.render_widget(
-        Paragraph::new(url).block(Block::default().title("Repository").borders(Borders::ALL)),
-        chunks[0],
+        Paragraph::new(url).block(
+            Block::default()
+                .title("GitHub Repository")
+                .borders(Borders::ALL),
+        ),
+        left_chunks[0],
     );
 
     let paragraph = Paragraph::new(tui_markdown::from_str(app.readme.as_str()))
         .block(Block::default().title("README").borders(Borders::ALL))
         .scroll((app.readme_scroll, 0))
         .wrap(Wrap { trim: false });
-    frame.render_widget(paragraph, chunks[1]);
+    frame.render_widget(paragraph, left_chunks[1]);
 
     let content_height = app.readme.lines().count().saturating_sub(1) as u16;
     let mut scrollbar_state =
         ScrollbarState::new(content_height as usize).position(app.readme_scroll as usize);
     frame.render_stateful_widget(
         Scrollbar::new(ScrollbarOrientation::VerticalRight),
-        chunks[1],
+        left_chunks[1],
         &mut scrollbar_state,
     );
+
+    let items: Vec<ListItem> = BUILTIN_PLUGINS
+        .iter()
+        .map(|p| ListItem::new(Line::from(p.to_string())))
+        .collect();
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .title("Built-in Plugins")
+                .borders(Borders::ALL),
+        )
+        .highlight_symbol("> ")
+        .highlight_style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        );
+    let mut list_state = ListState::default();
+    list_state.select(Some(app.search_selected));
+    frame.render_stateful_widget(list, horizontal_chunks[1], &mut list_state);
 }
 
 fn render_footer(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
@@ -562,7 +785,7 @@ fn render_footer(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
         }
         Tab::Graph => "q quit | tab switch | d dependencies | a add URL",
         Tab::Search => {
-            "q quit | tab switch | a paste URL | m add module | p add plugin | j/k scroll"
+            "q quit | tab switch | j/k select plugin | Enter add plugin | a paste URL | m add repo module | p add repo plugin | PgUp/PgDn scroll README"
         }
     };
     let text = format!("{keys}\n{}", app.status);
@@ -614,7 +837,11 @@ fn handle_normal_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
         KeyCode::Char('s') => app.tab = Tab::Search,
         KeyCode::Down | KeyCode::Char('j') => {
             if app.tab == Tab::Search {
-                app.readme_scroll = app.readme_scroll.saturating_add(1);
+                if app.search_selected + 1 < BUILTIN_PLUGINS.len() {
+                    app.search_selected += 1;
+                }
+            } else if app.tab == Tab::Graph {
+                app.graph_scroll = app.graph_scroll.saturating_add(1);
             } else if app.selected + 1 < app.rows.len() {
                 app.selected += 1;
                 reload_selected_dist_info(app);
@@ -622,7 +849,11 @@ fn handle_normal_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
         }
         KeyCode::Up | KeyCode::Char('k') => {
             if app.tab == Tab::Search {
-                app.readme_scroll = app.readme_scroll.saturating_sub(1);
+                if app.search_selected > 0 {
+                    app.search_selected -= 1;
+                }
+            } else if app.tab == Tab::Graph {
+                app.graph_scroll = app.graph_scroll.saturating_sub(1);
             } else if app.selected > 0 {
                 app.selected -= 1;
                 reload_selected_dist_info(app);
@@ -633,6 +864,8 @@ fn handle_normal_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
                 app.detail_readme_scroll = app.detail_readme_scroll.saturating_add(10);
             } else if app.tab == Tab::Search {
                 app.readme_scroll = app.readme_scroll.saturating_add(10);
+            } else if app.tab == Tab::Graph {
+                app.graph_scroll = app.graph_scroll.saturating_add(10);
             }
         }
         KeyCode::PageUp => {
@@ -640,6 +873,8 @@ fn handle_normal_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
                 app.detail_readme_scroll = app.detail_readme_scroll.saturating_sub(10);
             } else if app.tab == Tab::Search {
                 app.readme_scroll = app.readme_scroll.saturating_sub(10);
+            } else if app.tab == Tab::Graph {
+                app.graph_scroll = app.graph_scroll.saturating_sub(10);
             }
         }
         KeyCode::Home => {
@@ -647,6 +882,8 @@ fn handle_normal_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
                 app.readme_scroll = 0;
             } else if app.tab == Tab::Dependencies {
                 app.detail_readme_scroll = 0;
+            } else if app.tab == Tab::Graph {
+                app.graph_scroll = 0;
             } else {
                 app.selected = 0;
             }
@@ -676,6 +913,13 @@ fn handle_normal_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
             app.action = Some(TuiAction::AddPlugin {
                 url: app.readme_url.clone(),
             });
+        }
+        KeyCode::Enter => {
+            if app.tab == Tab::Search && app.can_manage() {
+                app.action = Some(TuiAction::AddPlugin {
+                    url: BUILTIN_PLUGINS[app.search_selected].to_string(),
+                });
+            }
         }
         _ => {}
     }
@@ -839,7 +1083,11 @@ fn dist_info_path(project_dir: &Path, row: &DependencyRow) -> Option<PathBuf> {
 }
 
 fn read_local_readme(dist_info_dir: &Path) -> String {
-    for entry in std::fs::read_dir(dist_info_dir).into_iter().flatten().flatten() {
+    for entry in std::fs::read_dir(dist_info_dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
         let name = entry.file_name().to_string_lossy().to_lowercase();
         let base = name.split('.').next().unwrap_or(&name);
         if base == "readme" {
@@ -864,7 +1112,11 @@ fn read_local_license(dist_info_dir: &Path) -> String {
         }
     }
 
-    for entry in std::fs::read_dir(dist_info_dir).into_iter().flatten().flatten() {
+    for entry in std::fs::read_dir(dist_info_dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
         let name = entry.file_name().to_string_lossy().to_lowercase();
         let base = name.split('.').next().unwrap_or(&name);
         if matches!(base, "license" | "licenses" | "copying") {
