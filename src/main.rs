@@ -9,6 +9,7 @@ mod manifest;
 mod nu;
 mod resolver;
 mod safety;
+mod tui;
 mod ui;
 
 use std::collections::HashMap;
@@ -38,22 +39,23 @@ fn main() {
     }
 }
 
-fn run(command: Commands) -> Result<()> {
+fn run(command: Option<Commands>) -> Result<()> {
     let cwd = std::env::current_dir()?;
 
     match command {
-        Commands::Init {
+        None => cmd_tui(&cwd),
+        Some(Commands::Init {
             name,
             version,
             nu_version,
             description,
-        } => cmd_init(&cwd, name, version, nu_version, description),
-        Commands::Install {
+        }) => cmd_init(&cwd, name, version, nu_version, description),
+        Some(Commands::Install {
             global,
             frozen,
             allow_unsigned,
             no_build_fallback,
-        } => {
+        }) => {
             if global {
                 cmd_install_global(frozen, allow_unsigned, no_build_fallback)
             } else {
@@ -61,17 +63,17 @@ fn run(command: Commands) -> Result<()> {
                 cmd_install(&project_dir, frozen, allow_unsigned, no_build_fallback)
             }
         }
-        Commands::Update => {
+        Some(Commands::Update) => {
             let project_dir = require_project_dir(&cwd)?;
             cmd_update(&project_dir)
         }
-        Commands::Add {
+        Some(Commands::Add {
             global,
             url,
             tag,
             rev,
             branch,
-        } => {
+        }) => {
             if global {
                 cmd_add_global(url, tag, rev, branch)
             } else {
@@ -79,14 +81,14 @@ fn run(command: Commands) -> Result<()> {
                 cmd_add(&project_dir, url, tag, rev, branch)
             }
         }
-        Commands::AddPlugin {
+        Some(Commands::AddPlugin {
             global,
             url,
             tag,
             rev,
             branch,
             bin,
-        } => {
+        }) => {
             if global {
                 cmd_add_global_plugin(url, tag, rev, branch, bin)
             } else {
@@ -94,7 +96,7 @@ fn run(command: Commands) -> Result<()> {
                 cmd_add_plugin(&project_dir, url, tag, rev, branch, bin)
             }
         }
-        Commands::Remove { global, name } => {
+        Some(Commands::Remove { global, name }) => {
             if global {
                 cmd_remove_global(name)
             } else {
@@ -102,15 +104,15 @@ fn run(command: Commands) -> Result<()> {
                 cmd_remove(&project_dir, name)
             }
         }
-        Commands::List => cmd_list(&cwd),
-        Commands::Version => cmd_version(),
-        Commands::Hook => cmd_hook(),
-        Commands::Lsp { editor } => {
+        Some(Commands::List) => cmd_list(&cwd),
+        Some(Commands::Version) => cmd_version(),
+        Some(Commands::Hook) => cmd_hook(),
+        Some(Commands::Lsp { editor }) => {
             let project_dir = require_project_dir(&cwd)?;
             cmd_lsp(&project_dir, editor)
         }
-        Commands::Run { command } => cmd_run(&cwd, command),
-        Commands::Qvx {
+        Some(Commands::Run { command }) => cmd_run(&cwd, command),
+        Some(Commands::Qvx {
             tag,
             rev,
             branch,
@@ -118,7 +120,36 @@ fn run(command: Commands) -> Result<()> {
             source,
             command,
             args,
-        } => cmd_qvx(&cwd, source, tag, rev, branch, nu_version, command, args),
+        }) => cmd_qvx(&cwd, source, tag, rev, branch, nu_version, command, args),
+    }
+}
+
+fn cmd_tui(cwd: &Path) -> Result<()> {
+    let Some(action) = tui::run(cwd)? else {
+        return Ok(());
+    };
+
+    match action {
+        tui::TuiAction::Install => {
+            let project_dir = require_project_dir(cwd)?;
+            cmd_install(&project_dir, false, false, false)
+        }
+        tui::TuiAction::Update => {
+            let project_dir = require_project_dir(cwd)?;
+            cmd_update(&project_dir)
+        }
+        tui::TuiAction::Remove { name } => {
+            let project_dir = require_project_dir(cwd)?;
+            cmd_remove(&project_dir, name)
+        }
+        tui::TuiAction::AddModule { url } => {
+            let project_dir = require_project_dir(cwd)?;
+            cmd_add(&project_dir, url, None, None, None)
+        }
+        tui::TuiAction::AddPlugin { url } => {
+            let project_dir = require_project_dir(cwd)?;
+            cmd_add_plugin(&project_dir, url, None, None, None, None)
+        }
     }
 }
 

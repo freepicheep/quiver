@@ -33,7 +33,7 @@ pub struct LockedPackage {
 /// The kind of installed artifact in the lockfile.
 ///
 /// Unknown kinds are preserved for forward compatibility.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum LockedPackageKind {
     #[default]
