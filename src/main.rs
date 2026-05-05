@@ -2473,11 +2473,7 @@ sha256 = "bbb"
 
         cmd_lsp(
             &project_dir,
-            vec![
-                "helix".to_string(),
-                "vscode".to_string(),
-                "zed".to_string(),
-            ],
+            vec!["helix".to_string(), "vscode".to_string(), "zed".to_string()],
         )
         .unwrap();
 
