@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, EnableMouseCapture, DisableMouseCapture, MouseEventKind},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -61,6 +61,7 @@ struct DependencyRow {
     git: String,
     requested: String,
     locked_rev: Option<String>,
+    locked_tag: Option<String>,
     checksum: Option<String>,
 }
 
@@ -72,6 +73,9 @@ struct App {
     tab: Tab,
     selected: usize,
     readme_scroll: u16,
+    detail_readme_scroll: u16,
+    local_readme: String,
+    local_license: String,
     status: String,
     input: String,
     readme_url: String,
@@ -92,7 +96,7 @@ pub fn run(cwd: &Path) -> Result<Option<TuiAction>> {
 
     enable_raw_mode()?;
     let mut stderr = io::stderr();
-    execute!(stderr, EnterAlternateScreen)?;
+    execute!(stderr, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stderr);
     let mut terminal = Terminal::new(backend)?;
 
@@ -100,14 +104,32 @@ pub fn run(cwd: &Path) -> Result<Option<TuiAction>> {
         loop {
             terminal.draw(|frame| render(frame, &mut app))?;
 
-            if let Event::Key(key) = event::read()? {
-                if key.kind != KeyEventKind::Press {
-                    continue;
+            match event::read()? {
+                Event::Key(key) => {
+                    if key.kind != KeyEventKind::Press {
+                        continue;
+                    }
+                    handle_key(&mut app, key.code, key.modifiers);
                 }
-                handle_key(&mut app, key.code, key.modifiers);
-                if app.quit || app.action.is_some() {
-                    break;
-                }
+                Event::Mouse(mouse) => match mouse.kind {
+                    MouseEventKind::ScrollDown if app.tab == Tab::Dependencies => {
+                        app.detail_readme_scroll = app.detail_readme_scroll.saturating_add(3);
+                    }
+                    MouseEventKind::ScrollUp if app.tab == Tab::Dependencies => {
+                        app.detail_readme_scroll = app.detail_readme_scroll.saturating_sub(3);
+                    }
+                    MouseEventKind::ScrollDown if app.tab == Tab::Search => {
+                        app.readme_scroll = app.readme_scroll.saturating_add(3);
+                    }
+                    MouseEventKind::ScrollUp if app.tab == Tab::Search => {
+                        app.readme_scroll = app.readme_scroll.saturating_sub(3);
+                    }
+                    _ => {}
+                },
+                _ => continue,
+            }
+            if app.quit || app.action.is_some() {
+                break;
             }
         }
 
@@ -116,7 +138,7 @@ pub fn run(cwd: &Path) -> Result<Option<TuiAction>> {
 
     let cleanup_result = (|| -> io::Result<()> {
         disable_raw_mode()?;
-        execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+        execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
         terminal.show_cursor()?;
         Ok(())
     })();
@@ -139,6 +161,9 @@ impl App {
                 tab: Tab::Dependencies,
                 selected: 0,
                 readme_scroll: 0,
+                detail_readme_scroll: 0,
+                local_readme: String::new(),
+                local_license: String::new(),
                 status: "Run qv init to create nupackage.toml, or q to quit.".to_string(),
                 input: String::new(),
                 readme_url: String::new(),
@@ -159,6 +184,11 @@ impl App {
                 .to_string()
         };
 
+        let (local_readme, local_license) = rows
+            .first()
+            .map(|row| load_dist_info_for_row(&project_dir, row))
+            .unwrap_or_default();
+
         Ok(Self {
             project_dir: Some(project_dir),
             package_name: manifest.package.name,
@@ -167,6 +197,9 @@ impl App {
             tab: Tab::Dependencies,
             selected: 0,
             readme_scroll: 0,
+            detail_readme_scroll: 0,
+            local_readme,
+            local_license,
             status,
             input: String::new(),
             readme_url: String::new(),
@@ -218,6 +251,7 @@ fn dependency_rows(manifest: &Manifest, lockfile: Option<&Lockfile>) -> Vec<Depe
             git: spec.git.clone(),
             requested: requested_ref(&spec.tag, &spec.rev, &spec.branch),
             locked_rev: locked.map(|p| p.rev.clone()),
+            locked_tag: locked.and_then(|p| p.tag.clone()),
             checksum: locked.map(|p| p.sha256.clone()),
         });
     }
@@ -237,6 +271,7 @@ fn dependency_rows(manifest: &Manifest, lockfile: Option<&Lockfile>) -> Vec<Depe
             },
             requested: requested_ref(&spec.tag, &spec.rev, &spec.branch),
             locked_rev: locked.map(|p| p.rev.clone()),
+            locked_tag: locked.and_then(|p| p.tag.clone()),
             checksum: locked.map(|p| p.sha256.clone()),
         });
     }
@@ -258,6 +293,7 @@ fn dependency_rows(manifest: &Manifest, lockfile: Option<&Lockfile>) -> Vec<Depe
                 git: package.git.clone(),
                 requested: package.tag.clone().unwrap_or_else(|| "locked".to_string()),
                 locked_rev: Some(package.rev.clone()),
+                locked_tag: package.tag.clone(),
                 checksum: Some(package.sha256.clone()),
             });
         }
@@ -372,12 +408,43 @@ fn render_dependencies(frame: &mut ratatui::Frame<'_>, app: &mut App, area: Rect
     }
     frame.render_stateful_widget(list, chunks[0], &mut list_state);
 
+    // Right pane: split into details (top) and README (bottom)
+    let right_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(9), Constraint::Min(4)])
+        .split(chunks[1]);
+
     let detail = selected_detail(app);
     frame.render_widget(
         Paragraph::new(detail)
             .block(Block::default().title("Details").borders(Borders::ALL))
             .wrap(Wrap { trim: false }),
-        chunks[1],
+        right_chunks[0],
+    );
+
+    let readme_content = if app.local_readme.is_empty() {
+        if app.selected_row().is_some_and(|r| r.locked_rev.is_some()) {
+            "No README found in dist-info."
+        } else {
+            "Not installed."
+        }
+    } else {
+        app.local_readme.as_str()
+    };
+
+    let readme_paragraph = Paragraph::new(tui_markdown::from_str(readme_content))
+        .block(Block::default().title("README").borders(Borders::ALL))
+        .scroll((app.detail_readme_scroll, 0))
+        .wrap(Wrap { trim: false });
+    frame.render_widget(readme_paragraph, right_chunks[1]);
+
+    let content_height = app.local_readme.lines().count().saturating_sub(1) as u16;
+    let mut scrollbar_state = ScrollbarState::new(content_height as usize)
+        .position(app.detail_readme_scroll as usize);
+    frame.render_stateful_widget(
+        Scrollbar::new(ScrollbarOrientation::VerticalRight),
+        right_chunks[1],
+        &mut scrollbar_state,
     );
 }
 
@@ -389,6 +456,9 @@ fn selected_detail(app: &App) -> String {
     let mut detail = String::new();
     detail.push_str(&format!("name: {}\n", row.name));
     detail.push_str(&format!("kind: {}\n", kind_label(&row.kind)));
+    if !app.local_license.is_empty() {
+        detail.push_str(&format!("license: {}\n", app.local_license));
+    }
     detail.push_str(&format!("source: {}\n", row.git));
     detail.push_str(&format!("requested: {}\n", row.requested));
     if let Some(rev) = &row.locked_rev {
@@ -469,7 +539,7 @@ fn render_search(frame: &mut ratatui::Frame<'_>, app: &mut App, area: Rect) {
         chunks[0],
     );
 
-    let paragraph = Paragraph::new(app.readme.as_str())
+    let paragraph = Paragraph::new(tui_markdown::from_str(app.readme.as_str()))
         .block(Block::default().title("README").borders(Borders::ALL))
         .scroll((app.readme_scroll, 0))
         .wrap(Wrap { trim: false });
@@ -488,7 +558,7 @@ fn render_search(frame: &mut ratatui::Frame<'_>, app: &mut App, area: Rect) {
 fn render_footer(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
     let keys = match app.tab {
         Tab::Dependencies => {
-            "q quit | tab switch | i install | u update | r remove | a add URL | g graph"
+            "q quit | tab switch | j/k select | PgUp/PgDn scroll | i install | u update | r remove | a add"
         }
         Tab::Graph => "q quit | tab switch | d dependencies | a add URL",
         Tab::Search => {
@@ -547,18 +617,36 @@ fn handle_normal_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
                 app.readme_scroll = app.readme_scroll.saturating_add(1);
             } else if app.selected + 1 < app.rows.len() {
                 app.selected += 1;
+                reload_selected_dist_info(app);
             }
         }
         KeyCode::Up | KeyCode::Char('k') => {
             if app.tab == Tab::Search {
                 app.readme_scroll = app.readme_scroll.saturating_sub(1);
-            } else {
-                app.selected = app.selected.saturating_sub(1);
+            } else if app.selected > 0 {
+                app.selected -= 1;
+                reload_selected_dist_info(app);
+            }
+        }
+        KeyCode::PageDown => {
+            if app.tab == Tab::Dependencies {
+                app.detail_readme_scroll = app.detail_readme_scroll.saturating_add(10);
+            } else if app.tab == Tab::Search {
+                app.readme_scroll = app.readme_scroll.saturating_add(10);
+            }
+        }
+        KeyCode::PageUp => {
+            if app.tab == Tab::Dependencies {
+                app.detail_readme_scroll = app.detail_readme_scroll.saturating_sub(10);
+            } else if app.tab == Tab::Search {
+                app.readme_scroll = app.readme_scroll.saturating_sub(10);
             }
         }
         KeyCode::Home => {
             if app.tab == Tab::Search {
                 app.readme_scroll = 0;
+            } else if app.tab == Tab::Dependencies {
+                app.detail_readme_scroll = 0;
             } else {
                 app.selected = 0;
             }
@@ -699,6 +787,109 @@ fn short_rev(rev: &str) -> &str {
     rev.get(..12).unwrap_or(rev)
 }
 
+fn reload_selected_dist_info(app: &mut App) {
+    if let (Some(project_dir), Some(row)) = (&app.project_dir, app.selected_row()) {
+        let (readme, license) = load_dist_info_for_row(project_dir, row);
+        app.local_readme = readme;
+        app.local_license = license;
+        app.detail_readme_scroll = 0;
+    } else {
+        app.local_readme.clear();
+        app.local_license.clear();
+        app.detail_readme_scroll = 0;
+    }
+}
+
+fn load_dist_info_for_row(project_dir: &Path, row: &DependencyRow) -> (String, String) {
+    let mut readme = String::new();
+    let mut license = String::new();
+
+    if let Some(dist_info) = dist_info_path(project_dir, row) {
+        readme = read_local_readme(&dist_info);
+        license = read_local_license(&dist_info);
+    }
+
+    (readme, license)
+}
+
+fn dist_info_path(project_dir: &Path, row: &DependencyRow) -> Option<PathBuf> {
+    let rev = row.locked_rev.as_ref()?;
+    let tag = row
+        .locked_tag
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .unwrap_or(&rev[..12.min(rev.len())]);
+
+    let mut version = String::with_capacity(tag.len());
+    for ch in tag.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-') {
+            version.push(ch);
+        } else {
+            version.push('_');
+        }
+    }
+
+    if version.is_empty() {
+        version.push_str("unknown");
+    }
+
+    let dir_name = format!("{}-{version}.dist-info", row.name);
+    Some(project_dir.join(".nu-env").join("modules").join(dir_name))
+}
+
+fn read_local_readme(dist_info_dir: &Path) -> String {
+    for entry in std::fs::read_dir(dist_info_dir).into_iter().flatten().flatten() {
+        let name = entry.file_name().to_string_lossy().to_lowercase();
+        let base = name.split('.').next().unwrap_or(&name);
+        if base == "readme" {
+            if let Ok(content) = std::fs::read_to_string(entry.path()) {
+                return content;
+            }
+        }
+    }
+    String::new()
+}
+
+fn read_local_license(dist_info_dir: &Path) -> String {
+    let nupackage = dist_info_dir.join("nupackage.toml");
+    if let Ok(content) = std::fs::read_to_string(&nupackage) {
+        if let Ok(manifest) = crate::manifest::Manifest::from_str(&content) {
+            if let Some(license) = manifest.package.license {
+                let trimmed = license.trim();
+                if !trimmed.is_empty() {
+                    return trimmed.to_string();
+                }
+            }
+        }
+    }
+
+    for entry in std::fs::read_dir(dist_info_dir).into_iter().flatten().flatten() {
+        let name = entry.file_name().to_string_lossy().to_lowercase();
+        let base = name.split('.').next().unwrap_or(&name);
+        if matches!(base, "license" | "licenses" | "copying") {
+            if let Ok(content) = std::fs::read_to_string(entry.path()) {
+                let upper = content.to_ascii_uppercase();
+                if upper.contains("MIT") {
+                    return "MIT".to_string();
+                }
+                if upper.contains("APACHE") {
+                    return "Apache-2.0".to_string();
+                }
+                if upper.contains("GPL") {
+                    return "GPL".to_string();
+                }
+                if upper.contains("BSD") {
+                    return "BSD".to_string();
+                }
+                return "Unknown".to_string();
+            }
+        }
+    }
+
+    String::new()
+}
+
 fn next_tab(tab: Tab) -> Tab {
     match tab {
         Tab::Dependencies => Tab::Graph,
@@ -758,5 +949,61 @@ mod tests {
     #[test]
     fn rejects_non_github_url() {
         assert_eq!(parse_github_owner_repo("https://example.com/a/b"), None);
+    }
+
+    #[test]
+    fn test_dist_info_path() {
+        let row = DependencyRow {
+            name: "nu-salesforce".to_string(),
+            kind: DependencyKind::Module,
+            git: "test".to_string(),
+            requested: "test".to_string(),
+            locked_rev: Some("0123456789abcdef".to_string()),
+            locked_tag: Some("v0.3.0".to_string()),
+            checksum: None,
+        };
+        let path = dist_info_path(Path::new("/project"), &row).unwrap();
+        assert_eq!(
+            path,
+            PathBuf::from("/project/.nu-env/modules/nu-salesforce-v0.3.0.dist-info")
+        );
+
+        let row_no_tag = DependencyRow {
+            name: "nu-salesforce".to_string(),
+            kind: DependencyKind::Module,
+            git: "test".to_string(),
+            requested: "test".to_string(),
+            locked_rev: Some("0123456789abcdef".to_string()),
+            locked_tag: None,
+            checksum: None,
+        };
+        let path_no_tag = dist_info_path(Path::new("/project"), &row_no_tag).unwrap();
+        assert_eq!(
+            path_no_tag,
+            PathBuf::from("/project/.nu-env/modules/nu-salesforce-0123456789ab.dist-info")
+        );
+    }
+
+    #[test]
+    fn test_read_local_license() {
+        let temp_dir = std::env::temp_dir().join("quiver_test_license");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        std::fs::write(temp_dir.join("LICENSE"), "This is an MIT license.\n").unwrap();
+        assert_eq!(read_local_license(&temp_dir), "MIT");
+
+        std::fs::write(
+            temp_dir.join("nupackage.toml"),
+            r#"[package]
+name = "test"
+version = "0.1.0"
+license = "Apache-2.0"
+"#,
+        )
+        .unwrap();
+        assert_eq!(read_local_license(&temp_dir), "Apache-2.0");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }
