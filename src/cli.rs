@@ -22,7 +22,7 @@ pub struct Cli {
     pub version: Option<bool>,
 
     #[command(subcommand)]
-    pub command: Commands,
+    pub command: Option<Commands>,
 }
 
 #[derive(Parser, Debug)]
@@ -183,7 +183,7 @@ pub enum Commands {
 
     /// Generate editor-specific LSP configuration for Nushell
     Lsp {
-        /// Editors to configure (helix, zed). If omitted, shows an interactive picker.
+        /// Editors to configure (helix, vscode, zed). If omitted, shows an interactive picker.
         #[arg(long)]
         editor: Vec<String>,
     },
@@ -231,7 +231,7 @@ pub fn parse() -> Cli {
         let qvx = QvxCli::parse_from(args);
         return Cli {
             version: qvx.version,
-            command: Commands::Qvx {
+            command: Some(Commands::Qvx {
                 tag: qvx.tag,
                 rev: qvx.rev,
                 branch: qvx.branch,
@@ -239,7 +239,7 @@ pub fn parse() -> Cli {
                 source: qvx.source,
                 command: qvx.command,
                 args: qvx.args,
-            },
+            }),
         };
     }
     Cli::parse_from(args)
@@ -259,7 +259,7 @@ mod tests {
     #[test]
     fn remove_alias_parses() {
         let cli = Cli::try_parse_from(["quiver", "rm", "nu-utils"]).unwrap();
-        match cli.command {
+        match cli.command.unwrap() {
             Commands::Remove { global, name } => {
                 assert!(!global);
                 assert_eq!(name, "nu-utils");
@@ -271,19 +271,25 @@ mod tests {
     #[test]
     fn list_alias_parses() {
         let cli = Cli::try_parse_from(["quiver", "ls"]).unwrap();
-        assert!(matches!(cli.command, Commands::List));
+        assert!(matches!(cli.command, Some(Commands::List)));
     }
 
     #[test]
     fn version_subcommand_parses() {
         let cli = Cli::try_parse_from(["quiver", "version"]).unwrap();
-        assert!(matches!(cli.command, Commands::Version));
+        assert!(matches!(cli.command, Some(Commands::Version)));
+    }
+
+    #[test]
+    fn no_subcommand_parses_for_tui() {
+        let cli = Cli::try_parse_from(["quiver"]).unwrap();
+        assert!(cli.command.is_none());
     }
 
     #[test]
     fn run_subcommand_parses_with_multiple_args() {
         let cli = Cli::try_parse_from(["quiver", "run", "nu", "script.nu", "--flag"]).unwrap();
-        match cli.command {
+        match cli.command.unwrap() {
             Commands::Run { command } => {
                 assert_eq!(command, vec!["nu", "script.nu", "--flag"]);
             }
@@ -302,7 +308,7 @@ mod tests {
             ".",
         ])
         .unwrap();
-        match cli.command {
+        match cli.command.unwrap() {
             Commands::Qvx {
                 tag,
                 rev,
@@ -337,7 +343,7 @@ mod tests {
             "plain",
         ])
         .unwrap();
-        match cli.command {
+        match cli.command.unwrap() {
             Commands::Qvx {
                 branch,
                 source,
@@ -365,7 +371,7 @@ mod tests {
             "generate-doc-site",
         ])
         .unwrap();
-        match cli.command {
+        match cli.command.unwrap() {
             Commands::Qvx {
                 nu_version,
                 source,
@@ -405,7 +411,7 @@ mod tests {
             "nu_plugin_inc",
         ])
         .unwrap();
-        match cli.command {
+        match cli.command.unwrap() {
             Commands::AddPlugin {
                 global,
                 url,
@@ -428,7 +434,7 @@ mod tests {
     #[test]
     fn init_parses_with_nu_version() {
         let cli = Cli::try_parse_from(["quiver", "init", "--nu-version", "0.109.0"]).unwrap();
-        match cli.command {
+        match cli.command.unwrap() {
             Commands::Init {
                 name,
                 version,
@@ -453,7 +459,7 @@ mod tests {
             "--no-build-fallback",
         ])
         .unwrap();
-        match cli.command {
+        match cli.command.unwrap() {
             Commands::Install {
                 global,
                 frozen,

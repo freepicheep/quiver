@@ -24,6 +24,7 @@ tar = "0.4"
 xz2 = "0.1"
 ratatui = "0.30"
 crossterm = "0.29"
+tui-markdown = "0.3"
 
 [dependencies.clap]
 version = "4"
