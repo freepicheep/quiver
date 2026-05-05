@@ -4,6 +4,10 @@
 
 **quiver** is a module manager for [Nushell](https://www.nushell.sh/), written in Rust. It handles dependency resolution, fetching, and lockfile management for Nushell modules distributed as git repositories. Think of it as a minimal package manager (similar in spirit to `uv` or `cargo`) for the Nushell ecosystem.
 
+## Supported Platforms
+
+Quiver should run on macOS, Linux, and Windows.
+
 ## Architecture
 
 The codebase is a single-crate Rust CLI application. All source lives in `src/` with one file per responsibility:
