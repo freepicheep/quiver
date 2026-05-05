@@ -1106,7 +1106,7 @@ fn cmd_version() -> Result<()> {
 }
 
 fn cmd_lsp(cwd: &Path, editors: Vec<String>) -> Result<()> {
-    let all_editors = ["helix", "zed"];
+    let all_editors = ["helix", "vscode", "zed"];
 
     let selected: Vec<String> = if editors.is_empty() {
         // Interactive picker
@@ -1134,6 +1134,7 @@ fn cmd_lsp(cwd: &Path, editors: Vec<String>) -> Result<()> {
     for editor in &selected {
         match editor.as_str() {
             "helix" => write_helix_lsp_config(cwd)?,
+            "vscode" => write_vscode_lsp_config(cwd)?,
             "zed" => write_zed_lsp_config(cwd)?,
             _ => {}
         }
@@ -1295,6 +1296,46 @@ args = [
 
     std::fs::write(&config_path, config)?;
     eprintln!("Generated .helix/languages.toml");
+    Ok(())
+}
+
+fn write_vscode_lsp_config(project_dir: &Path) -> Result<()> {
+    let vscode_dir = project_dir.join(".vscode");
+    std::fs::create_dir_all(&vscode_dir)?;
+
+    let config_path = vscode_dir.join("settings.json");
+    let nu_bin_path = project_dir
+        .join(".nu-env")
+        .join("bin")
+        .join(installer::nu_env_binary_name());
+
+    let nu_bin_path_str = nu_bin_path.to_string_lossy().into_owned();
+
+    let mut settings = serde_json::json!({});
+    if config_path.exists() {
+        if let Ok(content) = std::fs::read_to_string(&config_path) {
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&content) {
+                if parsed.is_object() {
+                    settings = parsed;
+                }
+            }
+        }
+    }
+
+    if let Some(obj) = settings.as_object_mut() {
+        obj.insert(
+            "nushellLanguageServer.includeDirs".to_string(),
+            serde_json::json!([".nu-env/modules/"]),
+        );
+        obj.insert(
+            "nushellLanguageServer.nushellExecutablePath".to_string(),
+            serde_json::json!(nu_bin_path_str),
+        );
+    }
+
+    let config = serde_json::to_string_pretty(&settings).unwrap_or_default() + "\n";
+    std::fs::write(&config_path, config)?;
+    eprintln!("Generated .vscode/settings.json");
     Ok(())
 }
 
@@ -2430,9 +2471,18 @@ sha256 = "bbb"
     fn cmd_lsp_with_explicit_editors_generates_configs() {
         let project_dir = make_temp_dir("lsp_explicit");
 
-        cmd_lsp(&project_dir, vec!["helix".to_string(), "zed".to_string()]).unwrap();
+        cmd_lsp(
+            &project_dir,
+            vec![
+                "helix".to_string(),
+                "vscode".to_string(),
+                "zed".to_string(),
+            ],
+        )
+        .unwrap();
 
         assert!(project_dir.join(".helix").join("languages.toml").exists());
+        assert!(project_dir.join(".vscode").join("settings.json").exists());
         assert!(project_dir.join(".zed").join("settings.json").exists());
 
         let _ = std::fs::remove_dir_all(project_dir);

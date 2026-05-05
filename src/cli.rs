@@ -183,7 +183,7 @@ pub enum Commands {
 
     /// Generate editor-specific LSP configuration for Nushell
     Lsp {
-        /// Editors to configure (helix, zed). If omitted, shows an interactive picker.
+        /// Editors to configure (helix, vscode, zed). If omitted, shows an interactive picker.
         #[arg(long)]
         editor: Vec<String>,
     },
