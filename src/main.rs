@@ -125,32 +125,32 @@ fn run(command: Option<Commands>) -> Result<()> {
 }
 
 fn cmd_tui(cwd: &Path) -> Result<()> {
-    let Some(action) = tui::run(cwd)? else {
-        return Ok(());
-    };
-
-    match action {
-        tui::TuiAction::Install => {
-            let project_dir = require_project_dir(cwd)?;
-            cmd_install(&project_dir, false, false, false)
-        }
-        tui::TuiAction::Update => {
-            let project_dir = require_project_dir(cwd)?;
-            cmd_update(&project_dir)
-        }
-        tui::TuiAction::Remove { name } => {
-            let project_dir = require_project_dir(cwd)?;
-            cmd_remove(&project_dir, name)
-        }
-        tui::TuiAction::AddModule { url } => {
-            let project_dir = require_project_dir(cwd)?;
-            cmd_add(&project_dir, url, None, None, None)
-        }
-        tui::TuiAction::AddPlugin { url } => {
-            let project_dir = require_project_dir(cwd)?;
-            cmd_add_plugin(&project_dir, url, None, None, None, None)
-        }
-    }
+    let cwd = cwd.to_path_buf();
+    let tui_cwd = cwd.clone();
+    tui::run(&tui_cwd, move |action, emit| {
+        ui::capture_logs_stream(emit, || match action {
+            tui::TuiAction::Install => {
+                let project_dir = require_project_dir(&cwd)?;
+                cmd_install(&project_dir, false, false, false)
+            }
+            tui::TuiAction::Update => {
+                let project_dir = require_project_dir(&cwd)?;
+                cmd_update(&project_dir)
+            }
+            tui::TuiAction::Remove { name } => {
+                let project_dir = require_project_dir(&cwd)?;
+                cmd_remove(&project_dir, name)
+            }
+            tui::TuiAction::AddModule { url } => {
+                let project_dir = require_project_dir(&cwd)?;
+                cmd_add(&project_dir, url, None, None, None)
+            }
+            tui::TuiAction::AddPlugin { url } => {
+                let project_dir = require_project_dir(&cwd)?;
+                cmd_add_plugin(&project_dir, url, None, None, None, None)
+            }
+        })
+    })
 }
 
 fn require_project_dir(start: &Path) -> Result<PathBuf> {
@@ -613,16 +613,16 @@ fn cmd_remove(dir: &Path, name: String) -> Result<()> {
         // Write updated manifest
         let content = manifest.to_toml_string()?;
         std::fs::write(dir.join("nupackage.toml"), content)?;
-        eprintln!("Removed module '{name}' from nupackage.toml");
+        ui::success(format!("Removed module '{name}' from nupackage.toml"));
 
         // Remove from .nu-env/modules/
         let module_dir = dir.join(".nu-env").join("modules").join(&name);
         if module_dir.exists() {
             std::fs::remove_dir_all(&module_dir)?;
-            eprintln!("Removed .nu-env/modules/{name}/");
+            ui::success(format!("Removed .nu-env/modules/{name}/"));
         }
         for removed in remove_module_dist_info_dirs(&dir.join(".nu-env").join("modules"), &name)? {
-            eprintln!("Removed .nu-env/modules/{removed}/");
+            ui::success(format!("Removed .nu-env/modules/{removed}/"));
         }
 
         // Update lockfile: remove the module package entry
@@ -633,13 +633,13 @@ fn cmd_remove(dir: &Path, name: String) -> Result<()> {
                 .packages
                 .retain(|p| !(p.name == name && p.kind == lockfile::LockedPackageKind::Module));
             lockfile.write_to(&lock_path)?;
-            eprintln!("Updated quiver.lock");
+            ui::success("Updated quiver.lock");
         }
     } else if let Some(plugin_spec) = manifest.dependencies.plugins.remove(&name) {
         // Removing a plugin dependency
         let content = manifest.to_toml_string()?;
         std::fs::write(dir.join("nupackage.toml"), content)?;
-        eprintln!("Removed plugin '{name}' from nupackage.toml");
+        ui::success(format!("Removed plugin '{name}' from nupackage.toml"));
 
         // Remove plugin binary symlink from .nu-env/bin/
         let bin_name = plugin_spec.bin.as_deref().unwrap_or(&name);
@@ -652,7 +652,7 @@ fn cmd_remove(dir: &Path, name: String) -> Result<()> {
         let plugin_link = dir.join(".nu-env").join("bin").join(&binary_filename);
         if plugin_link.exists() || plugin_link.symlink_metadata().is_ok() {
             std::fs::remove_file(&plugin_link)?;
-            eprintln!("Removed .nu-env/bin/{binary_filename}");
+            ui::success(format!("Removed .nu-env/bin/{binary_filename}"));
         }
 
         // Update lockfile: remove the plugin package entry
@@ -663,7 +663,7 @@ fn cmd_remove(dir: &Path, name: String) -> Result<()> {
                 .packages
                 .retain(|p| !(p.name == name && p.kind == lockfile::LockedPackageKind::Plugin));
             lockfile.write_to(&lock_path)?;
-            eprintln!("Updated quiver.lock");
+            ui::success("Updated quiver.lock");
         }
     } else {
         return Err(error::QuiverError::Manifest(format!(
@@ -672,7 +672,7 @@ fn cmd_remove(dir: &Path, name: String) -> Result<()> {
     }
 
     // Regenerate activate.nu from the updated manifest and lockfile state.
-    eprintln!("Regenerating activate.nu...");
+    ui::info("Regenerating activate.nu...");
     installer::install_with_options(dir, false, false, false, false)?;
 
     Ok(())

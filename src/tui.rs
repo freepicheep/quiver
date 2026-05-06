@@ -2,11 +2,14 @@ use std::collections::{HashMap, HashSet};
 use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Arc, mpsc};
+use std::thread;
+use std::time::Duration;
 
 use crossterm::{
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
-        MouseEventKind,
+        MouseButton, MouseEvent, MouseEventKind,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -26,6 +29,7 @@ use ratatui::{
 use crate::error::{QuiverError, Result};
 use crate::lockfile::{LockedPackageKind, Lockfile};
 use crate::manifest::Manifest;
+use crate::ui::{CapturedLog, LogKind};
 
 const BUILTIN_PLUGINS: &[&str] = &[
     "nu_plugin_custom_values",
@@ -79,6 +83,32 @@ struct DependencyRow {
     checksum: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LogLine {
+    Plain(String),
+    Command(String),
+    Captured(CapturedLog),
+}
+
+enum TuiCommandEvent {
+    Log(CapturedLog),
+    Finished(std::result::Result<(), String>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FocusRegion {
+    Header,
+    DependencyList,
+    DependencyDetails,
+    DependencyReadme,
+    Graph,
+    SearchUrl,
+    SearchReadme,
+    BuiltinPlugins,
+    CommandLog,
+    Footer,
+}
+
 struct App {
     project_dir: Option<PathBuf>,
     package_name: String,
@@ -98,10 +128,24 @@ struct App {
     readme: String,
     input_mode: InputMode,
     action: Option<TuiAction>,
+    logs: Vec<LogLine>,
+    log_scroll: u16,
+    follow_log: bool,
+    command_rx: Option<mpsc::Receiver<TuiCommandEvent>>,
+    command_running: bool,
+    pending_reload: bool,
+    focus: FocusRegion,
+    regions: Vec<(FocusRegion, Rect)>,
     quit: bool,
 }
 
-pub fn run(cwd: &Path) -> Result<Option<TuiAction>> {
+pub fn run(
+    cwd: &Path,
+    run_action: impl Fn(TuiAction, Box<dyn FnMut(CapturedLog) + Send>) -> Result<()>
+    + Send
+    + Sync
+    + 'static,
+) -> Result<()> {
     if !io::stderr().is_terminal() {
         return Err(QuiverError::Other(
             "qv without a subcommand opens the TUI; run it in an interactive terminal".to_string(),
@@ -109,6 +153,7 @@ pub fn run(cwd: &Path) -> Result<Option<TuiAction>> {
     }
 
     let mut app = App::load(cwd)?;
+    let run_action = Arc::new(run_action);
 
     enable_raw_mode()?;
     let mut stderr = io::stderr();
@@ -116,46 +161,32 @@ pub fn run(cwd: &Path) -> Result<Option<TuiAction>> {
     let backend = CrosstermBackend::new(stderr);
     let mut terminal = Terminal::new(backend)?;
 
-    let tui_result = (|| -> Result<Option<TuiAction>> {
+    let tui_result = (|| -> Result<()> {
         loop {
+            drain_command_events(&mut app)?;
             terminal.draw(|frame| render(frame, &mut app))?;
 
-            match event::read()? {
-                Event::Key(key) => {
-                    if key.kind != KeyEventKind::Press {
-                        continue;
+            if event::poll(Duration::from_millis(100))? {
+                match event::read()? {
+                    Event::Key(key) => {
+                        if key.kind != KeyEventKind::Press {
+                            continue;
+                        }
+                        handle_key(&mut app, key.code, key.modifiers);
                     }
-                    handle_key(&mut app, key.code, key.modifiers);
-                }
-                Event::Mouse(mouse) => match mouse.kind {
-                    MouseEventKind::ScrollDown if app.tab == Tab::Dependencies => {
-                        app.detail_readme_scroll = app.detail_readme_scroll.saturating_add(3);
-                    }
-                    MouseEventKind::ScrollUp if app.tab == Tab::Dependencies => {
-                        app.detail_readme_scroll = app.detail_readme_scroll.saturating_sub(3);
-                    }
-                    MouseEventKind::ScrollDown if app.tab == Tab::Search => {
-                        app.readme_scroll = app.readme_scroll.saturating_add(3);
-                    }
-                    MouseEventKind::ScrollUp if app.tab == Tab::Search => {
-                        app.readme_scroll = app.readme_scroll.saturating_sub(3);
-                    }
-                    MouseEventKind::ScrollDown if app.tab == Tab::Graph => {
-                        app.graph_scroll = app.graph_scroll.saturating_add(3);
-                    }
-                    MouseEventKind::ScrollUp if app.tab == Tab::Graph => {
-                        app.graph_scroll = app.graph_scroll.saturating_sub(3);
-                    }
+                    Event::Mouse(mouse) => handle_mouse(&mut app, mouse),
                     _ => {}
-                },
-                _ => continue,
+                }
             }
-            if app.quit || app.action.is_some() {
+            if let Some(action) = app.action.take() {
+                start_tui_action(&mut app, action, Arc::clone(&run_action));
+            }
+            if app.quit {
                 break;
             }
         }
 
-        Ok(app.action.take())
+        Ok(())
     })();
 
     let cleanup_result = (|| -> io::Result<()> {
@@ -170,9 +201,9 @@ pub fn run(cwd: &Path) -> Result<Option<TuiAction>> {
     })();
 
     match (tui_result, cleanup_result) {
-        (Ok(value), Ok(())) => Ok(value),
+        (Ok(()), Ok(())) => Ok(()),
         (Err(err), Ok(())) => Err(err),
-        (Ok(_), Err(err)) | (Err(_), Err(err)) => Err(err.into()),
+        (Ok(()), Err(err)) | (Err(_), Err(err)) => Err(err.into()),
     }
 }
 
@@ -198,6 +229,16 @@ impl App {
                 readme: "No nupackage.toml was found in this directory or its parents.".to_string(),
                 input_mode: InputMode::Normal,
                 action: None,
+                logs: vec![LogLine::Plain(
+                    "Open a quiver project to run commands here.".to_string(),
+                )],
+                log_scroll: 0,
+                follow_log: true,
+                command_rx: None,
+                command_running: false,
+                pending_reload: false,
+                focus: FocusRegion::DependencyList,
+                regions: Vec::new(),
                 quit: false,
             });
         };
@@ -237,6 +278,14 @@ impl App {
                 .to_string(),
             input_mode: InputMode::Normal,
             action: None,
+            logs: vec![LogLine::Plain("Logs will show here".to_string())],
+            log_scroll: 0,
+            follow_log: true,
+            command_rx: None,
+            command_running: false,
+            pending_reload: false,
+            focus: FocusRegion::DependencyList,
+            regions: Vec::new(),
             quit: false,
         })
     }
@@ -247,6 +296,50 @@ impl App {
 
     fn can_manage(&self) -> bool {
         self.project_dir.is_some()
+    }
+
+    fn reload(&mut self) -> Result<()> {
+        let Some(project_dir) = self.project_dir.clone() else {
+            return Ok(());
+        };
+        let manifest = Manifest::from_dir(&project_dir)?;
+        let lockfile = read_lockfile(&project_dir)?;
+        self.rows = dependency_rows(&manifest, lockfile.as_ref());
+        self.package_name = manifest.package.name;
+        self.package_version = manifest.package.version;
+        if self.selected >= self.rows.len() {
+            self.selected = self.rows.len().saturating_sub(1);
+        }
+        reload_selected_dist_info(self);
+        Ok(())
+    }
+
+    fn push_log(&mut self, line: LogLine) {
+        self.logs.push(line);
+        if self.follow_log {
+            self.scroll_log_to_bottom();
+        }
+    }
+
+    fn scroll_log_to_bottom(&mut self) {
+        let visible_tail = 6usize;
+        self.log_scroll = self.logs.len().saturating_sub(visible_tail) as u16;
+        self.follow_log = true;
+    }
+
+    fn scroll_log_down(&mut self, amount: u16) {
+        let max_scroll = self.logs.len().saturating_sub(1) as u16;
+        self.log_scroll = self.log_scroll.saturating_add(amount).min(max_scroll);
+        self.follow_log = self.log_scroll >= self.logs.len().saturating_sub(6) as u16;
+    }
+
+    fn scroll_log_up(&mut self, amount: u16) {
+        self.log_scroll = self.log_scroll.saturating_sub(amount);
+        self.follow_log = false;
+    }
+
+    fn register_region(&mut self, region: FocusRegion, area: Rect) {
+        self.regions.push((region, area));
     }
 }
 
@@ -345,23 +438,32 @@ fn requested_ref(tag: &Option<String>, rev: &Option<String>, branch: &Option<Str
 }
 
 fn render(frame: &mut ratatui::Frame<'_>, app: &mut App) {
+    app.regions.clear();
     let area = frame.area();
     let shell = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
             Constraint::Min(8),
+            Constraint::Length(8),
             Constraint::Length(3),
         ])
         .split(area);
 
     render_header(frame, app, shell[0]);
+    app.register_region(FocusRegion::Header, shell[0]);
     match app.tab {
         Tab::Dependencies => render_dependencies(frame, app, shell[1]),
-        Tab::Graph => render_graph(frame, app, shell[1]),
+        Tab::Graph => {
+            app.register_region(FocusRegion::Graph, shell[1]);
+            render_graph(frame, app, shell[1]);
+        }
         Tab::Search => render_search(frame, app, shell[1]),
     }
-    render_footer(frame, app, shell[2]);
+    render_log(frame, app, shell[2]);
+    app.register_region(FocusRegion::CommandLog, shell[2]);
+    render_footer(frame, app, shell[3]);
+    app.register_region(FocusRegion::Footer, shell[3]);
 
     match &app.input_mode {
         InputMode::AddUrl => render_input(frame, app, "Paste GitHub repository URL"),
@@ -369,6 +471,237 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut App) {
             render_confirm(frame, &format!("Remove '{name}' from nupackage.toml? y/N"))
         }
         InputMode::Normal => {}
+    }
+}
+
+fn drain_command_events(app: &mut App) -> Result<()> {
+    let Some(rx) = app.command_rx.take() else {
+        return Ok(());
+    };
+    let mut keep_rx = true;
+
+    while let Ok(event) = rx.try_recv() {
+        match event {
+            TuiCommandEvent::Log(log) => app.push_log(LogLine::Captured(log)),
+            TuiCommandEvent::Finished(result) => {
+                app.command_running = false;
+                keep_rx = false;
+                match result {
+                    Ok(()) => {
+                        app.push_log(LogLine::Captured(CapturedLog {
+                            kind: LogKind::Success,
+                            message: "command completed".to_string(),
+                        }));
+                        app.status = "Command completed.".to_string();
+                        app.pending_reload = true;
+                    }
+                    Err(err) => {
+                        app.push_log(LogLine::Captured(CapturedLog {
+                            kind: LogKind::Error,
+                            message: err,
+                        }));
+                        app.status = "Command failed.".to_string();
+                    }
+                }
+            }
+        }
+    }
+
+    if keep_rx {
+        app.command_rx = Some(rx);
+    }
+
+    if app.pending_reload && !app.command_running {
+        app.pending_reload = false;
+        if let Err(err) = app.reload() {
+            app.push_log(LogLine::Captured(CapturedLog {
+                kind: LogKind::Error,
+                message: format!("failed to reload project: {err}"),
+            }));
+            app.status = "Command completed, but project reload failed.".to_string();
+        }
+    }
+
+    Ok(())
+}
+
+fn handle_mouse(app: &mut App, mouse: MouseEvent) {
+    if let Some(region) = region_at(app, mouse.column, mouse.row) {
+        app.focus = region;
+        match (mouse.kind, region) {
+            (MouseEventKind::Down(MouseButton::Left), FocusRegion::Header) => {
+                focus_tab_at(app, mouse.column);
+            }
+            (MouseEventKind::Down(MouseButton::Left), FocusRegion::DependencyList) => {
+                select_dependency_at(app, mouse.row);
+            }
+            (MouseEventKind::Down(MouseButton::Left), FocusRegion::BuiltinPlugins) => {
+                select_builtin_plugin_at(app, mouse.row);
+            }
+            (MouseEventKind::ScrollDown, _) => scroll_focused(app, 3),
+            (MouseEventKind::ScrollUp, _) => scroll_focused(app, -3),
+            _ => {}
+        }
+    } else {
+        match mouse.kind {
+            MouseEventKind::ScrollDown => scroll_focused(app, 3),
+            MouseEventKind::ScrollUp => scroll_focused(app, -3),
+            _ => {}
+        }
+    }
+}
+
+fn start_tui_action(
+    app: &mut App,
+    action: TuiAction,
+    run_action: Arc<
+        impl Fn(TuiAction, Box<dyn FnMut(CapturedLog) + Send>) -> Result<()> + Send + Sync + 'static,
+    >,
+) {
+    if app.command_running {
+        app.status = "A command is already running.".to_string();
+        return;
+    }
+
+    let label = action.label();
+    app.input_mode = InputMode::Normal;
+    app.push_log(LogLine::Command(format!("qv {label}")));
+    app.status = format!("Running {label}...");
+    app.command_running = true;
+
+    let (tx, rx) = mpsc::channel();
+    app.command_rx = Some(rx);
+
+    thread::spawn(move || {
+        let log_tx = tx.clone();
+        let emit = move |log| {
+            let _ = log_tx.send(TuiCommandEvent::Log(log));
+        };
+        let result = run_action(action, Box::new(emit)).map_err(|err| err.to_string());
+        let _ = tx.send(TuiCommandEvent::Finished(result));
+    });
+}
+
+impl TuiAction {
+    fn label(&self) -> String {
+        match self {
+            TuiAction::Install => "install".to_string(),
+            TuiAction::Update => "update".to_string(),
+            TuiAction::Remove { name } => format!("remove {name}"),
+            TuiAction::AddModule { url } => format!("add {url}"),
+            TuiAction::AddPlugin { url } => format!("add-plugin {url}"),
+        }
+    }
+}
+
+fn focused_block<'a>(app: &App, region: FocusRegion, title: impl Into<Line<'a>>) -> Block<'a> {
+    let block = Block::default().borders(Borders::ALL).title(title);
+    if app.focus == region {
+        block.border_style(Style::default().fg(focus_color()))
+    } else {
+        block
+    }
+}
+
+fn focus_color() -> Color {
+    Color::Green
+}
+
+fn region_at(app: &App, x: u16, y: u16) -> Option<FocusRegion> {
+    app.regions
+        .iter()
+        .rev()
+        .find_map(|(region, area)| point_in_rect(*area, x, y).then_some(*region))
+}
+
+fn point_in_rect(area: Rect, x: u16, y: u16) -> bool {
+    x >= area.x
+        && x < area.x.saturating_add(area.width)
+        && y >= area.y
+        && y < area.y.saturating_add(area.height)
+}
+
+fn region_rect(app: &App, region: FocusRegion) -> Option<Rect> {
+    app.regions
+        .iter()
+        .find_map(|(candidate, area)| (*candidate == region).then_some(*area))
+}
+
+fn scroll_focused(app: &mut App, amount: i16) {
+    match app.focus {
+        FocusRegion::DependencyReadme => {
+            app.detail_readme_scroll = offset_scroll(app.detail_readme_scroll, amount);
+        }
+        FocusRegion::Graph => {
+            app.graph_scroll = offset_scroll(app.graph_scroll, amount);
+        }
+        FocusRegion::SearchReadme => {
+            app.readme_scroll = offset_scroll(app.readme_scroll, amount);
+        }
+        FocusRegion::CommandLog => {
+            if amount >= 0 {
+                app.scroll_log_down(amount as u16);
+            } else {
+                app.scroll_log_up(amount.unsigned_abs());
+            }
+        }
+        _ => {}
+    }
+}
+
+fn offset_scroll(current: u16, amount: i16) -> u16 {
+    if amount >= 0 {
+        current.saturating_add(amount as u16)
+    } else {
+        current.saturating_sub(amount.unsigned_abs())
+    }
+}
+
+fn focus_tab_at(app: &mut App, x: u16) {
+    let Some(area) = region_rect(app, FocusRegion::Header) else {
+        return;
+    };
+    let inner_x = x.saturating_sub(area.x.saturating_add(1));
+    let inner_width = area.width.saturating_sub(2).max(1);
+    let tab_width = (inner_width / 3).max(1);
+    let tab = match (inner_x / tab_width).min(2) {
+        0 => Tab::Dependencies,
+        1 => Tab::Graph,
+        _ => Tab::Search,
+    };
+    set_tab(app, tab);
+}
+
+fn set_tab(app: &mut App, tab: Tab) {
+    app.tab = tab;
+    app.focus = match tab {
+        Tab::Dependencies => FocusRegion::DependencyList,
+        Tab::Graph => FocusRegion::Graph,
+        Tab::Search => FocusRegion::BuiltinPlugins,
+    };
+}
+
+fn select_dependency_at(app: &mut App, y: u16) {
+    if app.rows.is_empty() {
+        return;
+    }
+    let Some(area) = region_rect(app, FocusRegion::DependencyList) else {
+        return;
+    };
+    let index = y.saturating_sub(area.y.saturating_add(1)) as usize;
+    if index < app.rows.len() {
+        app.selected = index;
+        reload_selected_dist_info(app);
+    }
+}
+
+fn select_builtin_plugin_at(app: &mut App, y: u16) {
+    let Some(area) = region_rect(app, FocusRegion::BuiltinPlugins) else {
+        return;
+    };
+    let index = y.saturating_sub(area.y.saturating_add(1)) as usize;
+    if index < BUILTIN_PLUGINS.len() {
+        app.search_selected = index;
     }
 }
 
@@ -389,7 +722,7 @@ fn render_header(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
     };
     let tabs = Tabs::new(titles)
         .select(selected)
-        .block(Block::default().title(title).borders(Borders::ALL))
+        .block(focused_block(app, FocusRegion::Header, title))
         .highlight_style(
             Style::default()
                 .fg(Color::Yellow)
@@ -403,6 +736,7 @@ fn render_dependencies(frame: &mut ratatui::Frame<'_>, app: &mut App, area: Rect
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
         .split(area);
+    app.register_region(FocusRegion::DependencyList, chunks[0]);
 
     let items = if app.rows.is_empty() {
         vec![ListItem::new("No dependencies")]
@@ -425,7 +759,11 @@ fn render_dependencies(frame: &mut ratatui::Frame<'_>, app: &mut App, area: Rect
             .collect()
     };
     let list = List::new(items)
-        .block(Block::default().title("Dependencies").borders(Borders::ALL))
+        .block(focused_block(
+            app,
+            FocusRegion::DependencyList,
+            "Dependencies",
+        ))
         .highlight_symbol("> ")
         .highlight_style(
             Style::default()
@@ -443,11 +781,17 @@ fn render_dependencies(frame: &mut ratatui::Frame<'_>, app: &mut App, area: Rect
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(9), Constraint::Min(4)])
         .split(chunks[1]);
+    app.register_region(FocusRegion::DependencyDetails, right_chunks[0]);
+    app.register_region(FocusRegion::DependencyReadme, right_chunks[1]);
 
     let detail = selected_detail(app);
     frame.render_widget(
         Paragraph::new(detail)
-            .block(Block::default().title("Details").borders(Borders::ALL))
+            .block(focused_block(
+                app,
+                FocusRegion::DependencyDetails,
+                "Details",
+            ))
             .wrap(Wrap { trim: false }),
         right_chunks[0],
     );
@@ -463,7 +807,7 @@ fn render_dependencies(frame: &mut ratatui::Frame<'_>, app: &mut App, area: Rect
     };
 
     let readme_paragraph = Paragraph::new(tui_markdown::from_str(readme_content))
-        .block(Block::default().title("README").borders(Borders::ALL))
+        .block(focused_block(app, FocusRegion::DependencyReadme, "README"))
         .scroll((app.detail_readme_scroll, 0))
         .wrap(Wrap { trim: false });
     frame.render_widget(readme_paragraph, right_chunks[1]);
@@ -706,11 +1050,7 @@ fn render_graph(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
 
     frame.render_widget(
         Paragraph::new(text)
-            .block(
-                Block::default()
-                    .title("Dependency Graph")
-                    .borders(Borders::ALL),
-            )
+            .block(focused_block(app, FocusRegion::Graph, "Dependency Graph"))
             .scroll((app.graph_scroll, 0))
             .wrap(Wrap { trim: false }),
         area,
@@ -722,11 +1062,14 @@ fn render_search(frame: &mut ratatui::Frame<'_>, app: &mut App, area: Rect) {
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(area);
+    app.register_region(FocusRegion::BuiltinPlugins, horizontal_chunks[1]);
 
     let left_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(3), Constraint::Min(5)])
         .split(horizontal_chunks[0]);
+    app.register_region(FocusRegion::SearchUrl, left_chunks[0]);
+    app.register_region(FocusRegion::SearchReadme, left_chunks[1]);
 
     let url = if app.readme_url.is_empty() {
         "No repository loaded".to_string()
@@ -734,16 +1077,16 @@ fn render_search(frame: &mut ratatui::Frame<'_>, app: &mut App, area: Rect) {
         app.readme_url.clone()
     };
     frame.render_widget(
-        Paragraph::new(url).block(
-            Block::default()
-                .title("GitHub Repository")
-                .borders(Borders::ALL),
-        ),
+        Paragraph::new(url).block(focused_block(
+            app,
+            FocusRegion::SearchUrl,
+            "GitHub Repository",
+        )),
         left_chunks[0],
     );
 
     let paragraph = Paragraph::new(tui_markdown::from_str(app.readme.as_str()))
-        .block(Block::default().title("README").borders(Borders::ALL))
+        .block(focused_block(app, FocusRegion::SearchReadme, "README"))
         .scroll((app.readme_scroll, 0))
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, left_chunks[1]);
@@ -762,11 +1105,11 @@ fn render_search(frame: &mut ratatui::Frame<'_>, app: &mut App, area: Rect) {
         .map(|p| ListItem::new(Line::from(p.to_string())))
         .collect();
     let list = List::new(items)
-        .block(
-            Block::default()
-                .title("Built-in Plugins")
-                .borders(Borders::ALL),
-        )
+        .block(focused_block(
+            app,
+            FocusRegion::BuiltinPlugins,
+            "Built-in Plugins",
+        ))
         .highlight_symbol("> ")
         .highlight_style(
             Style::default()
@@ -781,39 +1124,116 @@ fn render_search(frame: &mut ratatui::Frame<'_>, app: &mut App, area: Rect) {
 fn render_footer(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
     let keys = match app.tab {
         Tab::Dependencies => {
-            "q quit | tab switch | j/k select | PgUp/PgDn scroll | i install | u update | r remove | a add"
+            "q quit | tab switch | j/k select | PgUp/PgDn scroll | [/] log | i install | u update | r remove | a add"
         }
-        Tab::Graph => "q quit | tab switch | d dependencies | a add URL",
+        Tab::Graph => "q quit | tab switch | d dependencies | a add URL | [/] log",
         Tab::Search => {
-            "q quit | tab switch | j/k select plugin | Enter add plugin | a paste URL | m add repo module | p add repo plugin | PgUp/PgDn scroll README"
+            "q quit | tab switch | j/k select plugin | Enter add plugin | a paste URL | m add repo module | p add repo plugin | [/] log"
         }
     };
     let text = format!("{keys}\n{}", app.status);
     frame.render_widget(
         Paragraph::new(text)
-            .block(Block::default().borders(Borders::ALL))
+            .block(focused_block(app, FocusRegion::Footer, ""))
             .wrap(Wrap { trim: true }),
         area,
     );
 }
 
+fn render_log(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
+    let lines = if app.logs.is_empty() {
+        vec![Line::from("No commands run yet.")]
+    } else {
+        app.logs.iter().map(log_line).collect()
+    };
+    let title = if app.command_running {
+        "Command Log - running"
+    } else {
+        "Command Log"
+    };
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(focused_block(app, FocusRegion::CommandLog, title))
+            .scroll((app.log_scroll, 0))
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+
+    let content_height = app.logs.len().saturating_sub(1);
+    let mut scrollbar_state = ScrollbarState::new(content_height).position(app.log_scroll as usize);
+    frame.render_stateful_widget(
+        Scrollbar::new(ScrollbarOrientation::VerticalRight),
+        area,
+        &mut scrollbar_state,
+    );
+}
+
+fn log_line(line: &LogLine) -> Line<'static> {
+    match line {
+        LogLine::Plain(message) => Line::from(message.clone()),
+        LogLine::Command(command) => Line::from(vec![
+            Span::styled("$", Style::default().fg(Color::Gray)),
+            Span::raw(" "),
+            Span::styled(command.clone(), Style::default().fg(Color::Cyan)),
+        ]),
+        LogLine::Captured(log) => {
+            let (label, style) = match log.kind {
+                LogKind::Info => (
+                    "info",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                LogKind::Success => (
+                    "done",
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                LogKind::Warn => (
+                    "warn",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                LogKind::Error => (
+                    "error",
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                ),
+            };
+            Line::from(vec![
+                Span::styled(label, style),
+                Span::raw(" "),
+                Span::raw(log.message.clone()),
+            ])
+        }
+    }
+}
+
 fn render_input(frame: &mut ratatui::Frame<'_>, app: &App, title: &str) {
-    let area = centered_rect(70, 20, frame.area());
+    let area = centered_rect_max(68, 7, frame.area());
     frame.render_widget(Clear, area);
     frame.render_widget(
-        Paragraph::new(app.input.as_str())
-            .block(Block::default().title(title).borders(Borders::ALL)),
+        Paragraph::new(app.input.as_str()).block(
+            Block::default()
+                .title(title)
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(focus_color())),
+        ),
         area,
     );
 }
 
 fn render_confirm(frame: &mut ratatui::Frame<'_>, message: &str) {
-    let area = centered_rect(60, 20, frame.area());
+    let area = centered_rect_max(56, 7, frame.area());
     frame.render_widget(Clear, area);
     frame.render_widget(
-        Paragraph::new(message)
-            .alignment(Alignment::Center)
-            .block(Block::default().title("Confirm").borders(Borders::ALL)),
+        Paragraph::new(message).alignment(Alignment::Center).block(
+            Block::default()
+                .title("Confirm")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(focus_color())),
+        ),
         area,
     );
 }
@@ -830,68 +1250,62 @@ fn handle_normal_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
     match code {
         KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => app.quit = true,
         KeyCode::Char('q') | KeyCode::Esc => app.quit = true,
-        KeyCode::Tab | KeyCode::Right => app.tab = next_tab(app.tab),
-        KeyCode::BackTab | KeyCode::Left => app.tab = previous_tab(app.tab),
-        KeyCode::Char('d') => app.tab = Tab::Dependencies,
-        KeyCode::Char('g') => app.tab = Tab::Graph,
-        KeyCode::Char('s') => app.tab = Tab::Search,
+        KeyCode::Tab | KeyCode::Right => set_tab(app, next_tab(app.tab)),
+        KeyCode::BackTab | KeyCode::Left => set_tab(app, previous_tab(app.tab)),
+        KeyCode::Char('d') => set_tab(app, Tab::Dependencies),
+        KeyCode::Char('g') => set_tab(app, Tab::Graph),
+        KeyCode::Char('s') => set_tab(app, Tab::Search),
         KeyCode::Down | KeyCode::Char('j') => {
-            if app.tab == Tab::Search {
+            if app.focus == FocusRegion::BuiltinPlugins {
                 if app.search_selected + 1 < BUILTIN_PLUGINS.len() {
                     app.search_selected += 1;
                 }
-            } else if app.tab == Tab::Graph {
+            } else if app.focus == FocusRegion::Graph {
                 app.graph_scroll = app.graph_scroll.saturating_add(1);
-            } else if app.selected + 1 < app.rows.len() {
+            } else if app.focus == FocusRegion::DependencyList && app.selected + 1 < app.rows.len()
+            {
                 app.selected += 1;
                 reload_selected_dist_info(app);
             }
         }
         KeyCode::Up | KeyCode::Char('k') => {
-            if app.tab == Tab::Search {
+            if app.focus == FocusRegion::BuiltinPlugins {
                 if app.search_selected > 0 {
                     app.search_selected -= 1;
                 }
-            } else if app.tab == Tab::Graph {
+            } else if app.focus == FocusRegion::Graph {
                 app.graph_scroll = app.graph_scroll.saturating_sub(1);
-            } else if app.selected > 0 {
+            } else if app.focus == FocusRegion::DependencyList && app.selected > 0 {
                 app.selected -= 1;
                 reload_selected_dist_info(app);
             }
         }
-        KeyCode::PageDown => {
-            if app.tab == Tab::Dependencies {
-                app.detail_readme_scroll = app.detail_readme_scroll.saturating_add(10);
-            } else if app.tab == Tab::Search {
-                app.readme_scroll = app.readme_scroll.saturating_add(10);
-            } else if app.tab == Tab::Graph {
-                app.graph_scroll = app.graph_scroll.saturating_add(10);
-            }
+        KeyCode::PageDown => scroll_focused(app, 10),
+        KeyCode::PageUp => scroll_focused(app, -10),
+        KeyCode::Char(']') => {
+            app.scroll_log_down(3);
         }
-        KeyCode::PageUp => {
-            if app.tab == Tab::Dependencies {
-                app.detail_readme_scroll = app.detail_readme_scroll.saturating_sub(10);
-            } else if app.tab == Tab::Search {
-                app.readme_scroll = app.readme_scroll.saturating_sub(10);
-            } else if app.tab == Tab::Graph {
-                app.graph_scroll = app.graph_scroll.saturating_sub(10);
-            }
+        KeyCode::Char('[') => {
+            app.scroll_log_up(3);
+        }
+        KeyCode::End => {
+            app.scroll_log_to_bottom();
         }
         KeyCode::Home => {
-            if app.tab == Tab::Search {
+            if app.focus == FocusRegion::SearchReadme {
                 app.readme_scroll = 0;
-            } else if app.tab == Tab::Dependencies {
+            } else if app.focus == FocusRegion::DependencyReadme {
                 app.detail_readme_scroll = 0;
-            } else if app.tab == Tab::Graph {
+            } else if app.focus == FocusRegion::Graph {
                 app.graph_scroll = 0;
-            } else {
+            } else if app.focus == FocusRegion::DependencyList {
                 app.selected = 0;
             }
         }
         KeyCode::Char('i') if app.can_manage() => app.action = Some(TuiAction::Install),
         KeyCode::Char('u') if app.can_manage() => app.action = Some(TuiAction::Update),
         KeyCode::Char('a') if app.can_manage() => {
-            app.tab = Tab::Search;
+            set_tab(app, Tab::Search);
             app.input.clear();
             app.input_mode = InputMode::AddUrl;
         }
@@ -1158,24 +1572,15 @@ fn previous_tab(tab: Tab) -> Tab {
     }
 }
 
-fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
-    let vertical = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - percent_y) / 2),
-            Constraint::Percentage(percent_y),
-            Constraint::Percentage((100 - percent_y) / 2),
-        ])
-        .split(area);
-
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - percent_x) / 2),
-            Constraint::Percentage(percent_x),
-            Constraint::Percentage((100 - percent_x) / 2),
-        ])
-        .split(vertical[1])[1]
+fn centered_rect_max(max_width: u16, max_height: u16, area: Rect) -> Rect {
+    let width = max_width.min(area.width.saturating_sub(4)).max(20);
+    let height = max_height.min(area.height.saturating_sub(2)).max(5);
+    Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    }
 }
 
 #[cfg(test)]
