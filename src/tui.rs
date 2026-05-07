@@ -556,19 +556,29 @@ fn drain_command_events(app: &mut App) -> Result<()> {
 
 fn handle_mouse(app: &mut App, mouse: MouseEvent) {
     if let Some(region) = region_at(app, mouse.column, mouse.row) {
-        app.focus = region;
         match (mouse.kind, region) {
             (MouseEventKind::Down(MouseButton::Left), FocusRegion::Header) => {
                 focus_tab_at(app, mouse.column);
             }
             (MouseEventKind::Down(MouseButton::Left), FocusRegion::DependencyList) => {
+                app.focus = region;
                 select_dependency_at(app, mouse.row);
             }
             (MouseEventKind::Down(MouseButton::Left), FocusRegion::BuiltinPlugins) => {
+                app.focus = region;
                 select_builtin_plugin_at(app, mouse.row);
             }
-            (MouseEventKind::ScrollDown, _) => scroll_focused(app, 3),
-            (MouseEventKind::ScrollUp, _) => scroll_focused(app, -3),
+            (MouseEventKind::Down(MouseButton::Left), _) => {
+                app.focus = region;
+            }
+            (MouseEventKind::ScrollDown, _) => {
+                app.focus = region;
+                scroll_focused(app, 3);
+            }
+            (MouseEventKind::ScrollUp, _) => {
+                app.focus = region;
+                scroll_focused(app, -3);
+            }
             _ => {}
         }
     } else {
@@ -1793,6 +1803,59 @@ license = "Apache-2.0"
         assert_eq!(header_tab_at(area, 17), Some(Tab::Graph));
         assert_eq!(header_tab_at(area, 25), Some(Tab::Search));
         assert_eq!(header_tab_at(area, 15), None);
+    }
+
+    #[test]
+    fn tab_mouse_release_does_not_focus_header() {
+        let mut app = test_app();
+        app.regions.push((
+            FocusRegion::Header,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 40,
+                height: 3,
+            },
+        ));
+
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                column: 17,
+                row: 1,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+
+        assert_eq!(app.focus, FocusRegion::DependencyList);
+    }
+
+    #[test]
+    fn tab_mouse_down_switches_tab_without_focusing_header() {
+        let mut app = test_app();
+        app.regions.push((
+            FocusRegion::Header,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 40,
+                height: 3,
+            },
+        ));
+
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 17,
+                row: 1,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+
+        assert_eq!(app.tab, Tab::Graph);
+        assert_eq!(app.focus, FocusRegion::Graph);
     }
 
     #[test]
