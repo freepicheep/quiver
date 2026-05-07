@@ -42,6 +42,11 @@ const BUILTIN_PLUGINS: &[&str] = &[
     "nu_plugin_stress_internals",
 ];
 
+const LOG_PANEL_HEIGHT: u16 = 8;
+const HEADER_TAB_PADDING_LEFT: &str = " ";
+const HEADER_TAB_PADDING_RIGHT: &str = " ";
+const HEADER_TAB_DIVIDER: &str = "|";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TuiAction {
     Install,
@@ -57,6 +62,12 @@ enum Tab {
     Graph,
     Search,
 }
+
+const HEADER_TABS: [(Tab, &str); 3] = [
+    (Tab::Dependencies, "Dependencies"),
+    (Tab::Graph, "Graph"),
+    (Tab::Search, "Add"),
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum InputMode {
@@ -131,6 +142,7 @@ struct App {
     logs: Vec<LogLine>,
     log_scroll: u16,
     follow_log: bool,
+    log_visible: bool,
     command_rx: Option<mpsc::Receiver<TuiCommandEvent>>,
     command_running: bool,
     pending_reload: bool,
@@ -234,6 +246,7 @@ impl App {
                 )],
                 log_scroll: 0,
                 follow_log: true,
+                log_visible: false,
                 command_rx: None,
                 command_running: false,
                 pending_reload: false,
@@ -281,6 +294,7 @@ impl App {
             logs: vec![LogLine::Plain("Logs will show here".to_string())],
             log_scroll: 0,
             follow_log: true,
+            log_visible: false,
             command_rx: None,
             command_running: false,
             pending_reload: false,
@@ -340,6 +354,17 @@ impl App {
 
     fn register_region(&mut self, region: FocusRegion, area: Rect) {
         self.regions.push((region, area));
+    }
+
+    fn set_log_visible(&mut self, visible: bool) {
+        self.log_visible = visible;
+        if !visible && self.focus == FocusRegion::CommandLog {
+            self.focus = default_focus_for_tab(self.tab);
+        }
+    }
+
+    fn toggle_log_visible(&mut self) {
+        self.set_log_visible(!self.log_visible);
     }
 }
 
@@ -440,12 +465,13 @@ fn requested_ref(tag: &Option<String>, rev: &Option<String>, branch: &Option<Str
 fn render(frame: &mut ratatui::Frame<'_>, app: &mut App) {
     app.regions.clear();
     let area = frame.area();
+    let log_height = if app.log_visible { LOG_PANEL_HEIGHT } else { 0 };
     let shell = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
             Constraint::Min(8),
-            Constraint::Length(8),
+            Constraint::Length(log_height),
             Constraint::Length(3),
         ])
         .split(area);
@@ -460,16 +486,19 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut App) {
         }
         Tab::Search => render_search(frame, app, shell[1]),
     }
-    render_log(frame, app, shell[2]);
-    app.register_region(FocusRegion::CommandLog, shell[2]);
+    if app.log_visible {
+        render_log(frame, app, shell[2]);
+        app.register_region(FocusRegion::CommandLog, shell[2]);
+    }
     render_footer(frame, app, shell[3]);
     app.register_region(FocusRegion::Footer, shell[3]);
 
     match &app.input_mode {
         InputMode::AddUrl => render_input(frame, app, "Paste GitHub repository URL"),
-        InputMode::ConfirmRemove { name } => {
-            render_confirm(frame, &format!("Remove '{name}' from nupackage.toml? y/N"))
-        }
+        InputMode::ConfirmRemove { name } => render_confirm(
+            frame,
+            &format!("Remove '{name}'? Enter confirms, Esc cancels"),
+        ),
         InputMode::Normal => {}
     }
 }
@@ -565,6 +594,7 @@ fn start_tui_action(
 
     let label = action.label();
     app.input_mode = InputMode::Normal;
+    app.set_log_visible(true);
     app.push_log(LogLine::Command(format!("qv {label}")));
     app.status = format!("Running {label}...");
     app.command_running = true;
@@ -661,24 +691,60 @@ fn focus_tab_at(app: &mut App, x: u16) {
     let Some(area) = region_rect(app, FocusRegion::Header) else {
         return;
     };
-    let inner_x = x.saturating_sub(area.x.saturating_add(1));
-    let inner_width = area.width.saturating_sub(2).max(1);
-    let tab_width = (inner_width / 3).max(1);
-    let tab = match (inner_x / tab_width).min(2) {
-        0 => Tab::Dependencies,
-        1 => Tab::Graph,
-        _ => Tab::Search,
-    };
-    set_tab(app, tab);
+    if let Some(tab) = header_tab_at(area, x) {
+        set_tab(app, tab);
+    }
+}
+
+fn header_tab_at(area: Rect, x: u16) -> Option<Tab> {
+    let inner = inner_block_area(area);
+    if inner.width == 0 || inner.height == 0 {
+        return None;
+    }
+
+    let mut current_x = inner.x;
+    for (index, (tab, title)) in HEADER_TABS.iter().enumerate() {
+        let tab_start = current_x;
+        current_x = current_x.saturating_add(text_width(HEADER_TAB_PADDING_LEFT));
+        current_x = current_x.saturating_add(text_width(title));
+        current_x = current_x.saturating_add(text_width(HEADER_TAB_PADDING_RIGHT));
+
+        if x >= tab_start && x < current_x {
+            return Some(*tab);
+        }
+
+        if index + 1 < HEADER_TABS.len() {
+            current_x = current_x.saturating_add(text_width(HEADER_TAB_DIVIDER));
+        }
+    }
+
+    None
 }
 
 fn set_tab(app: &mut App, tab: Tab) {
     app.tab = tab;
-    app.focus = match tab {
+    app.focus = default_focus_for_tab(tab);
+}
+
+fn default_focus_for_tab(tab: Tab) -> FocusRegion {
+    match tab {
         Tab::Dependencies => FocusRegion::DependencyList,
         Tab::Graph => FocusRegion::Graph,
         Tab::Search => FocusRegion::BuiltinPlugins,
-    };
+    }
+}
+
+fn inner_block_area(area: Rect) -> Rect {
+    Rect {
+        x: area.x.saturating_add(1),
+        y: area.y.saturating_add(1),
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(2),
+    }
+}
+
+fn text_width(text: &str) -> u16 {
+    text.chars().count() as u16
 }
 
 fn select_dependency_at(app: &mut App, y: u16) {
@@ -706,9 +772,9 @@ fn select_builtin_plugin_at(app: &mut App, y: u16) {
 }
 
 fn render_header(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
-    let titles = ["Dependencies", "Graph", "Add"]
+    let titles = HEADER_TABS
         .iter()
-        .map(|title| Line::from(Span::styled(*title, Style::default().fg(Color::Cyan))))
+        .map(|(_, title)| Line::from(Span::styled(*title, Style::default().fg(Color::Cyan))))
         .collect::<Vec<_>>();
     let selected = match app.tab {
         Tab::Dependencies => 0,
@@ -723,6 +789,8 @@ fn render_header(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
     let tabs = Tabs::new(titles)
         .select(selected)
         .block(focused_block(app, FocusRegion::Header, title))
+        .divider(HEADER_TAB_DIVIDER)
+        .padding(HEADER_TAB_PADDING_LEFT, HEADER_TAB_PADDING_RIGHT)
         .highlight_style(
             Style::default()
                 .fg(Color::Yellow)
@@ -1122,13 +1190,22 @@ fn render_search(frame: &mut ratatui::Frame<'_>, app: &mut App, area: Rect) {
 }
 
 fn render_footer(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
+    let log_hint = if app.log_visible {
+        "/ hide log"
+    } else {
+        "/ show log"
+    };
     let keys = match app.tab {
         Tab::Dependencies => {
-            "q quit | tab switch | j/k select | PgUp/PgDn scroll | [/] log | i install | u update | r remove | a add"
+            format!(
+                "q quit | tab switch | j/k select | PgUp/PgDn scroll | {log_hint} | i install | u update | r remove | a add"
+            )
         }
-        Tab::Graph => "q quit | tab switch | d dependencies | a add URL | [/] log",
+        Tab::Graph => format!("q quit | tab switch | d dependencies | a add URL | {log_hint}"),
         Tab::Search => {
-            "q quit | tab switch | j/k select plugin | Enter add plugin | a paste URL | m add repo module | p add repo plugin | [/] log"
+            format!(
+                "q quit | tab switch | j/k select plugin | Enter add plugin | a paste URL | m add repo module | p add repo plugin | {log_hint}"
+            )
         }
     };
     let text = format!("{keys}\n{}", app.status);
@@ -1211,7 +1288,7 @@ fn log_line(line: &LogLine) -> Line<'static> {
 }
 
 fn render_input(frame: &mut ratatui::Frame<'_>, app: &App, title: &str) {
-    let area = centered_rect_max(68, 7, frame.area());
+    let area = centered_rect_max(68, 3, frame.area());
     frame.render_widget(Clear, area);
     frame.render_widget(
         Paragraph::new(app.input.as_str()).block(
@@ -1225,7 +1302,7 @@ fn render_input(frame: &mut ratatui::Frame<'_>, app: &App, title: &str) {
 }
 
 fn render_confirm(frame: &mut ratatui::Frame<'_>, message: &str) {
-    let area = centered_rect_max(56, 7, frame.area());
+    let area = centered_rect_max(56, 3, frame.area());
     frame.render_widget(Clear, area);
     frame.render_widget(
         Paragraph::new(message).alignment(Alignment::Center).block(
@@ -1282,6 +1359,7 @@ fn handle_normal_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
         }
         KeyCode::PageDown => scroll_focused(app, 10),
         KeyCode::PageUp => scroll_focused(app, -10),
+        KeyCode::Char('/') => app.toggle_log_visible(),
         KeyCode::Char(']') => {
             app.scroll_log_down(3);
         }
@@ -1375,8 +1453,13 @@ fn handle_url_key(app: &mut App, code: KeyCode) {
 
 fn handle_remove_confirm_key(app: &mut App, code: KeyCode, name: String) {
     match code {
-        KeyCode::Char('y') | KeyCode::Char('Y') => app.action = Some(TuiAction::Remove { name }),
-        _ => app.input_mode = InputMode::Normal,
+        KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+            app.action = Some(TuiAction::Remove { name });
+        }
+        KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+            app.input_mode = InputMode::Normal;
+        }
+        _ => {}
     }
 }
 
@@ -1573,8 +1656,8 @@ fn previous_tab(tab: Tab) -> Tab {
 }
 
 fn centered_rect_max(max_width: u16, max_height: u16, area: Rect) -> Rect {
-    let width = max_width.min(area.width.saturating_sub(4)).max(20);
-    let height = max_height.min(area.height.saturating_sub(2)).max(5);
+    let width = max_width.min(area.width.saturating_sub(4).max(1));
+    let height = max_height.min(area.height.saturating_sub(2).max(1));
     Rect {
         x: area.x + area.width.saturating_sub(width) / 2,
         y: area.y + area.height.saturating_sub(height) / 2,
@@ -1586,6 +1669,39 @@ fn centered_rect_max(max_width: u16, max_height: u16, area: Rect) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_app() -> App {
+        App {
+            project_dir: Some(PathBuf::from("/project")),
+            package_name: "test".to_string(),
+            package_version: "0.1.0".to_string(),
+            rows: Vec::new(),
+            tab: Tab::Dependencies,
+            selected: 0,
+            search_selected: 0,
+            readme_scroll: 0,
+            detail_readme_scroll: 0,
+            graph_scroll: 0,
+            local_readme: String::new(),
+            local_license: String::new(),
+            status: String::new(),
+            input: String::new(),
+            readme_url: String::new(),
+            readme: String::new(),
+            input_mode: InputMode::Normal,
+            action: None,
+            logs: Vec::new(),
+            log_scroll: 0,
+            follow_log: true,
+            log_visible: false,
+            command_rx: None,
+            command_running: false,
+            pending_reload: false,
+            focus: FocusRegion::DependencyList,
+            regions: Vec::new(),
+            quit: false,
+        }
+    }
 
     #[test]
     fn parse_github_url() {
@@ -1662,5 +1778,54 @@ license = "Apache-2.0"
         assert_eq!(read_local_license(&temp_dir), "Apache-2.0");
 
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn header_tab_at_matches_rendered_titles() {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 3,
+        };
+
+        assert_eq!(header_tab_at(area, 1), Some(Tab::Dependencies));
+        assert_eq!(header_tab_at(area, 17), Some(Tab::Graph));
+        assert_eq!(header_tab_at(area, 25), Some(Tab::Search));
+        assert_eq!(header_tab_at(area, 15), None);
+    }
+
+    #[test]
+    fn start_tui_action_reveals_log() {
+        let mut app = test_app();
+
+        start_tui_action(&mut app, TuiAction::Install, Arc::new(|_, _| Ok(())));
+
+        assert!(app.log_visible);
+    }
+
+    #[test]
+    fn remove_confirm_enter_submits_action() {
+        let mut app = test_app();
+
+        handle_remove_confirm_key(&mut app, KeyCode::Enter, "demo".to_string());
+
+        assert_eq!(
+            app.action,
+            Some(TuiAction::Remove {
+                name: "demo".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn hiding_log_moves_focus_back_to_current_tab() {
+        let mut app = test_app();
+        app.focus = FocusRegion::CommandLog;
+        app.log_visible = true;
+
+        app.set_log_visible(false);
+
+        assert_eq!(app.focus, FocusRegion::DependencyList);
     }
 }
