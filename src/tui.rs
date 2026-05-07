@@ -1010,28 +1010,42 @@ fn render_dependencies(frame: &mut ratatui::Frame<'_>, app: &mut App, area: Rect
     );
 }
 
-fn selected_detail(app: &App) -> String {
+fn selected_detail(app: &App) -> Vec<Line<'static>> {
     let Some(row) = app.selected_row() else {
-        return "Press a to paste a GitHub repository URL and preview its README.".to_string();
+        return vec![Line::from(
+            "Press a to paste a GitHub repository URL and preview its README.",
+        )];
     };
 
-    let mut detail = String::new();
-    detail.push_str(&format!("name: {}\n", row.name));
-    detail.push_str(&format!("kind: {}\n", kind_label(&row.kind)));
+    let mut detail = Vec::new();
+    detail.push(detail_line("name", &row.name));
+    detail.push(detail_line("kind", kind_label(&row.kind)));
     if !app.local_license.is_empty() {
-        detail.push_str(&format!("license: {}\n", app.local_license));
+        detail.push(detail_line("license", &app.local_license));
     }
-    detail.push_str(&format!("source: {}\n", row.git));
-    detail.push_str(&format!("requested: {}\n", row.requested));
+    detail.push(detail_line("source", &row.git));
+    detail.push(detail_line("requested", &row.requested));
     if let Some(rev) = &row.locked_rev {
-        detail.push_str(&format!("locked rev: {}\n", rev));
+        detail.push(detail_line("locked rev", rev));
     } else {
-        detail.push_str("locked rev: not installed\n");
+        detail.push(detail_line("locked rev", "not installed"));
     }
     if let Some(checksum) = &row.checksum {
-        detail.push_str(&format!("sha256: {}\n", checksum));
+        detail.push(detail_line("sha256", checksum));
     }
     detail
+}
+
+fn detail_line(key: &str, value: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            format!("{key}:"),
+            Style::default()
+                .fg(Color::Blue)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(format!(" {value}")),
+    ])
 }
 
 struct Canvas {
