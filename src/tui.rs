@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, LazyLock, mpsc};
 use std::thread;
 use std::time::Duration;
 
@@ -14,6 +14,8 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
+use leaves::theme::TERMINAL;
+use leaves::{MarkdownTheme, parse_markdown_with_width};
 use ratatui::{
     Terminal,
     backend::CrosstermBackend,
@@ -25,6 +27,7 @@ use ratatui::{
         ScrollbarOrientation, ScrollbarState, Tabs, Wrap,
     },
 };
+use syntect::{highlighting::ThemeSet, parsing::SyntaxSet};
 
 use crate::error::{QuiverError, Result};
 use crate::lockfile::{LockedPackageKind, Lockfile};
@@ -46,6 +49,10 @@ const LOG_PANEL_HEIGHT: u16 = 8;
 const HEADER_TAB_PADDING_LEFT: &str = " ";
 const HEADER_TAB_PADDING_RIGHT: &str = " ";
 const HEADER_TAB_DIVIDER: &str = "|";
+
+static MARKDOWN_SYNTAX_SET: LazyLock<SyntaxSet> = LazyLock::new(SyntaxSet::load_defaults_newlines);
+static MARKDOWN_THEME_SET: LazyLock<ThemeSet> = LazyLock::new(ThemeSet::load_defaults);
+static MARKDOWN_THEME: LazyLock<MarkdownTheme> = LazyLock::new(|| TERMINAL);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TuiAction {
@@ -643,6 +650,23 @@ fn focused_block<'a>(app: &App, region: FocusRegion, title: impl Into<Line<'a>>)
     }
 }
 
+fn markdown_lines(content: &str, width: u16) -> Vec<Line<'static>> {
+    let render_width = usize::from(width.saturating_sub(2)).max(20);
+    let syntect_theme = MARKDOWN_THEME_SET
+        .themes
+        .get("base16-ocean.dark")
+        .or_else(|| MARKDOWN_THEME_SET.themes.values().next())
+        .expect("syntect default theme set should not be empty");
+    let (lines, _) = parse_markdown_with_width(
+        content,
+        &MARKDOWN_SYNTAX_SET,
+        syntect_theme,
+        render_width,
+        &MARKDOWN_THEME,
+    );
+    lines
+}
+
 fn focus_color() -> Color {
     Color::Green
 }
@@ -884,13 +908,14 @@ fn render_dependencies(frame: &mut ratatui::Frame<'_>, app: &mut App, area: Rect
         app.local_readme.as_str()
     };
 
-    let readme_paragraph = Paragraph::new(tui_markdown::from_str(readme_content))
+    let readme_lines = markdown_lines(readme_content, right_chunks[1].width);
+    let content_height = readme_lines.len().saturating_sub(1) as u16;
+    let readme_paragraph = Paragraph::new(readme_lines)
         .block(focused_block(app, FocusRegion::DependencyReadme, "README"))
         .scroll((app.detail_readme_scroll, 0))
         .wrap(Wrap { trim: false });
     frame.render_widget(readme_paragraph, right_chunks[1]);
 
-    let content_height = app.local_readme.lines().count().saturating_sub(1) as u16;
     let mut scrollbar_state =
         ScrollbarState::new(content_height as usize).position(app.detail_readme_scroll as usize);
     frame.render_stateful_widget(
@@ -1163,13 +1188,14 @@ fn render_search(frame: &mut ratatui::Frame<'_>, app: &mut App, area: Rect) {
         left_chunks[0],
     );
 
-    let paragraph = Paragraph::new(tui_markdown::from_str(app.readme.as_str()))
+    let readme_lines = markdown_lines(app.readme.as_str(), left_chunks[1].width);
+    let content_height = readme_lines.len().saturating_sub(1) as u16;
+    let paragraph = Paragraph::new(readme_lines)
         .block(focused_block(app, FocusRegion::SearchReadme, "README"))
         .scroll((app.readme_scroll, 0))
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, left_chunks[1]);
 
-    let content_height = app.readme.lines().count().saturating_sub(1) as u16;
     let mut scrollbar_state =
         ScrollbarState::new(content_height as usize).position(app.readme_scroll as usize);
     frame.render_stateful_widget(
