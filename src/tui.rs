@@ -23,7 +23,7 @@ use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{
-        Block, Borders, Clear, List, ListItem, ListState, Paragraph, Scrollbar,
+        Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Scrollbar,
         ScrollbarOrientation, ScrollbarState, Tabs, Wrap,
     },
 };
@@ -724,7 +724,10 @@ fn ref_label(tag: &Option<String>, rev: &Option<String>, branch: &Option<String>
 }
 
 fn focused_block<'a>(app: &App, region: FocusRegion, title: impl Into<Line<'a>>) -> Block<'a> {
-    let block = Block::default().borders(Borders::ALL).title(title);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .title(title);
     if app.focus == region {
         block.border_style(Style::default().fg(focus_color()))
     } else {
@@ -1387,6 +1390,7 @@ fn render_input(frame: &mut ratatui::Frame<'_>, app: &App, title: &str) {
             Block::default()
                 .title(title)
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(focus_color())),
         ),
         area,
@@ -1401,6 +1405,7 @@ fn render_confirm(frame: &mut ratatui::Frame<'_>, message: &str) {
             Block::default()
                 .title("Confirm")
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(focus_color())),
         ),
         area,
@@ -1419,6 +1424,7 @@ fn render_builtin_plugins_dialog(frame: &mut ratatui::Frame<'_>, app: &App) {
             Block::default()
                 .title("Built-in Plugins - Enter adds, Esc cancels")
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(focus_color())),
         )
         .highlight_symbol("> ")
@@ -1448,6 +1454,7 @@ fn render_ref_choice(frame: &mut ratatui::Frame<'_>, app: &App, target: &AddTarg
             Block::default()
                 .title(title)
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(focus_color())),
         )
         .highlight_symbol("> ")
