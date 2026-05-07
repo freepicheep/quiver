@@ -58,9 +58,22 @@ static MARKDOWN_THEME: LazyLock<MarkdownTheme> = LazyLock::new(|| TERMINAL);
 pub enum TuiAction {
     Install,
     Update,
-    Remove { name: String },
-    AddModule { url: String },
-    AddPlugin { url: String },
+    Remove {
+        name: String,
+    },
+    AddModule {
+        url: String,
+        tag: Option<String>,
+        rev: Option<String>,
+        branch: Option<String>,
+    },
+    AddPlugin {
+        url: String,
+        tag: Option<String>,
+        rev: Option<String>,
+        branch: Option<String>,
+        bin: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,8 +93,46 @@ const HEADER_TABS: [(Tab, &str); 3] = [
 enum InputMode {
     Normal,
     AddUrl,
-    ConfirmRemove { name: String },
+    BuiltinPlugins,
+    ChooseRef {
+        target: AddTarget,
+    },
+    AddRefValue {
+        target: AddTarget,
+        ref_kind: RefInputKind,
+    },
+    ConfirmRemove {
+        name: String,
+    },
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AddTarget {
+    Module { url: String },
+    Plugin { url: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RefInputKind {
+    Tag,
+    Rev,
+    Branch,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RefChoice {
+    Auto,
+    Tag,
+    Branch,
+    Rev,
+}
+
+const REF_CHOICES: [RefChoice; 4] = [
+    RefChoice::Auto,
+    RefChoice::Tag,
+    RefChoice::Branch,
+    RefChoice::Rev,
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum DependencyKind {
@@ -135,6 +186,7 @@ struct App {
     tab: Tab,
     selected: usize,
     search_selected: usize,
+    ref_choice_selected: usize,
     readme_scroll: u16,
     detail_readme_scroll: u16,
     graph_scroll: u16,
@@ -237,6 +289,7 @@ impl App {
                 tab: Tab::Dependencies,
                 selected: 0,
                 search_selected: 0,
+                ref_choice_selected: 0,
                 readme_scroll: 0,
                 detail_readme_scroll: 0,
                 graph_scroll: 0,
@@ -286,6 +339,7 @@ impl App {
             tab: Tab::Dependencies,
             selected: 0,
             search_selected: 0,
+            ref_choice_selected: 0,
             readme_scroll: 0,
             detail_readme_scroll: 0,
             graph_scroll: 0,
@@ -502,6 +556,11 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut App) {
 
     match &app.input_mode {
         InputMode::AddUrl => render_input(frame, app, "Paste GitHub repository URL"),
+        InputMode::BuiltinPlugins => render_builtin_plugins_dialog(frame, app),
+        InputMode::ChooseRef { target } => render_ref_choice(frame, app, target),
+        InputMode::AddRefValue { ref_kind, .. } => {
+            render_input(frame, app, ref_input_title(*ref_kind))
+        }
         InputMode::ConfirmRemove { name } => render_confirm(
             frame,
             &format!("Remove '{name}'? Enter confirms, Esc cancels"),
@@ -635,9 +694,32 @@ impl TuiAction {
             TuiAction::Install => "install".to_string(),
             TuiAction::Update => "update".to_string(),
             TuiAction::Remove { name } => format!("remove {name}"),
-            TuiAction::AddModule { url } => format!("add {url}"),
-            TuiAction::AddPlugin { url } => format!("add-plugin {url}"),
+            TuiAction::AddModule {
+                url,
+                tag,
+                rev,
+                branch,
+            } => format!("add {}{}", url, ref_label(tag, rev, branch)),
+            TuiAction::AddPlugin {
+                url,
+                tag,
+                rev,
+                branch,
+                ..
+            } => format!("add-plugin {}{}", url, ref_label(tag, rev, branch)),
         }
+    }
+}
+
+fn ref_label(tag: &Option<String>, rev: &Option<String>, branch: &Option<String>) -> String {
+    if let Some(tag) = tag {
+        format!(" --tag {tag}")
+    } else if let Some(rev) = rev {
+        format!(" --rev {}", short_rev(rev))
+    } else if let Some(branch) = branch {
+        format!(" --branch {branch}")
+    } else {
+        String::new()
     }
 }
 
@@ -764,7 +846,7 @@ fn default_focus_for_tab(tab: Tab) -> FocusRegion {
     match tab {
         Tab::Dependencies => FocusRegion::DependencyList,
         Tab::Graph => FocusRegion::Graph,
-        Tab::Search => FocusRegion::BuiltinPlugins,
+        Tab::Search => FocusRegion::SearchReadme,
     }
 }
 
@@ -1161,18 +1243,12 @@ fn render_graph(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
 }
 
 fn render_search(frame: &mut ratatui::Frame<'_>, app: &mut App, area: Rect) {
-    let horizontal_chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(area);
-    app.register_region(FocusRegion::BuiltinPlugins, horizontal_chunks[1]);
-
-    let left_chunks = Layout::default()
+    let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(3), Constraint::Min(5)])
-        .split(horizontal_chunks[0]);
-    app.register_region(FocusRegion::SearchUrl, left_chunks[0]);
-    app.register_region(FocusRegion::SearchReadme, left_chunks[1]);
+        .split(area);
+    app.register_region(FocusRegion::SearchUrl, chunks[0]);
+    app.register_region(FocusRegion::SearchReadme, chunks[1]);
 
     let url = if app.readme_url.is_empty() {
         "No repository loaded".to_string()
@@ -1185,44 +1261,24 @@ fn render_search(frame: &mut ratatui::Frame<'_>, app: &mut App, area: Rect) {
             FocusRegion::SearchUrl,
             "GitHub Repository",
         )),
-        left_chunks[0],
+        chunks[0],
     );
 
-    let readme_lines = markdown_lines(app.readme.as_str(), left_chunks[1].width);
+    let readme_lines = markdown_lines(app.readme.as_str(), chunks[1].width);
     let content_height = readme_lines.len().saturating_sub(1) as u16;
     let paragraph = Paragraph::new(readme_lines)
         .block(focused_block(app, FocusRegion::SearchReadme, "README"))
         .scroll((app.readme_scroll, 0))
         .wrap(Wrap { trim: false });
-    frame.render_widget(paragraph, left_chunks[1]);
+    frame.render_widget(paragraph, chunks[1]);
 
     let mut scrollbar_state =
         ScrollbarState::new(content_height as usize).position(app.readme_scroll as usize);
     frame.render_stateful_widget(
         Scrollbar::new(ScrollbarOrientation::VerticalRight),
-        left_chunks[1],
+        chunks[1],
         &mut scrollbar_state,
     );
-
-    let items: Vec<ListItem> = BUILTIN_PLUGINS
-        .iter()
-        .map(|p| ListItem::new(Line::from(p.to_string())))
-        .collect();
-    let list = List::new(items)
-        .block(focused_block(
-            app,
-            FocusRegion::BuiltinPlugins,
-            "Built-in Plugins",
-        ))
-        .highlight_symbol("> ")
-        .highlight_style(
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        );
-    let mut list_state = ListState::default();
-    list_state.select(Some(app.search_selected));
-    frame.render_stateful_widget(list, horizontal_chunks[1], &mut list_state);
 }
 
 fn render_footer(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
@@ -1240,7 +1296,7 @@ fn render_footer(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
         Tab::Graph => format!("q quit | tab switch | d dependencies | a add URL | {log_hint}"),
         Tab::Search => {
             format!(
-                "q quit | tab switch | j/k select plugin | Enter add plugin | a paste URL | m add repo module | p add repo plugin | {log_hint}"
+                "q quit | tab switch | a paste URL | b built-ins | m add repo module | p add repo plugin | {log_hint}"
             )
         }
     };
@@ -1351,10 +1407,86 @@ fn render_confirm(frame: &mut ratatui::Frame<'_>, message: &str) {
     );
 }
 
+fn render_builtin_plugins_dialog(frame: &mut ratatui::Frame<'_>, app: &App) {
+    let area = centered_rect_max(44, 12, frame.area());
+    frame.render_widget(Clear, area);
+    let items: Vec<ListItem> = BUILTIN_PLUGINS
+        .iter()
+        .map(|p| ListItem::new(Line::from(p.to_string())))
+        .collect();
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .title("Built-in Plugins - Enter adds, Esc cancels")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(focus_color())),
+        )
+        .highlight_symbol("> ")
+        .highlight_style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        );
+    let mut list_state = ListState::default();
+    list_state.select(Some(app.search_selected));
+    frame.render_stateful_widget(list, area, &mut list_state);
+}
+
+fn render_ref_choice(frame: &mut ratatui::Frame<'_>, app: &App, target: &AddTarget) {
+    let title = match target {
+        AddTarget::Module { .. } => "Add Module Ref",
+        AddTarget::Plugin { .. } => "Add Plugin Ref",
+    };
+    let area = centered_rect_max(62, 8, frame.area());
+    frame.render_widget(Clear, area);
+    let items: Vec<ListItem> = REF_CHOICES
+        .iter()
+        .map(|choice| ListItem::new(Line::from(ref_choice_label(*choice))))
+        .collect();
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .title(title)
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(focus_color())),
+        )
+        .highlight_symbol("> ")
+        .highlight_style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        );
+    let mut list_state = ListState::default();
+    list_state.select(Some(app.ref_choice_selected));
+    frame.render_stateful_widget(list, area, &mut list_state);
+}
+
+fn ref_input_title(ref_kind: RefInputKind) -> &'static str {
+    match ref_kind {
+        RefInputKind::Tag => "Version tag",
+        RefInputKind::Rev => "Revision",
+        RefInputKind::Branch => "Branch",
+    }
+}
+
+fn ref_choice_label(choice: RefChoice) -> &'static str {
+    match choice {
+        RefChoice::Auto => "auto-detect latest tag/default branch (a)",
+        RefChoice::Tag => "version tag (v)",
+        RefChoice::Branch => "branch (b)",
+        RefChoice::Rev => "revision (r)",
+    }
+}
+
 fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
     match app.input_mode.clone() {
         InputMode::Normal => handle_normal_key(app, code, modifiers),
         InputMode::AddUrl => handle_url_key(app, code),
+        InputMode::BuiltinPlugins => handle_builtin_plugins_key(app, code),
+        InputMode::ChooseRef { target } => handle_ref_choice_key(app, code, target),
+        InputMode::AddRefValue { target, ref_kind } => {
+            handle_ref_value_key(app, code, target, ref_kind)
+        }
         InputMode::ConfirmRemove { name } => handle_remove_confirm_key(app, code, name),
     }
 }
@@ -1423,6 +1555,10 @@ fn handle_normal_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
             app.input.clear();
             app.input_mode = InputMode::AddUrl;
         }
+        KeyCode::Char('b') if app.can_manage() && app.tab == Tab::Search => {
+            app.input_mode = InputMode::BuiltinPlugins;
+            app.status = "Choose a built-in plugin.".to_string();
+        }
         KeyCode::Char('r') if app.can_manage() => {
             if let Some(row) = app.selected_row()
                 && !matches!(row.kind, DependencyKind::Transitive)
@@ -1433,23 +1569,141 @@ fn handle_normal_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
             }
         }
         KeyCode::Char('m') if app.can_manage() && !app.readme_url.is_empty() => {
-            app.action = Some(TuiAction::AddModule {
-                url: app.readme_url.clone(),
-            });
+            app.ref_choice_selected = 0;
+            app.input_mode = InputMode::ChooseRef {
+                target: AddTarget::Module {
+                    url: app.readme_url.clone(),
+                },
+            };
+            app.status = "Choose how to pin the module.".to_string();
         }
         KeyCode::Char('p') if app.can_manage() && !app.readme_url.is_empty() => {
-            app.action = Some(TuiAction::AddPlugin {
-                url: app.readme_url.clone(),
-            });
-        }
-        KeyCode::Enter => {
-            if app.tab == Tab::Search && app.can_manage() {
-                app.action = Some(TuiAction::AddPlugin {
-                    url: BUILTIN_PLUGINS[app.search_selected].to_string(),
-                });
-            }
+            app.ref_choice_selected = 0;
+            app.input_mode = InputMode::ChooseRef {
+                target: AddTarget::Plugin {
+                    url: app.readme_url.clone(),
+                },
+            };
+            app.status = "Choose how to pin the plugin.".to_string();
         }
         _ => {}
+    }
+}
+
+fn handle_builtin_plugins_key(app: &mut App, code: KeyCode) {
+    match code {
+        KeyCode::Esc => app.input_mode = InputMode::Normal,
+        KeyCode::Down | KeyCode::Char('j') => {
+            if app.search_selected + 1 < BUILTIN_PLUGINS.len() {
+                app.search_selected += 1;
+            }
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            if app.search_selected > 0 {
+                app.search_selected -= 1;
+            }
+        }
+        KeyCode::Enter => {
+            app.action = Some(TuiAction::AddPlugin {
+                url: BUILTIN_PLUGINS[app.search_selected].to_string(),
+                tag: None,
+                rev: None,
+                branch: None,
+                bin: None,
+            });
+            app.input_mode = InputMode::Normal;
+        }
+        _ => {}
+    }
+}
+
+fn handle_ref_choice_key(app: &mut App, code: KeyCode, target: AddTarget) {
+    match code {
+        KeyCode::Esc => app.input_mode = InputMode::Normal,
+        KeyCode::Down | KeyCode::Char('j') => {
+            if app.ref_choice_selected + 1 < REF_CHOICES.len() {
+                app.ref_choice_selected += 1;
+            }
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            if app.ref_choice_selected > 0 {
+                app.ref_choice_selected -= 1;
+            }
+        }
+        KeyCode::Enter => submit_ref_choice(app, target, REF_CHOICES[app.ref_choice_selected]),
+        KeyCode::Char('a') => submit_ref_choice(app, target, RefChoice::Auto),
+        KeyCode::Char('v') | KeyCode::Char('t') => submit_ref_choice(app, target, RefChoice::Tag),
+        KeyCode::Char('r') => submit_ref_choice(app, target, RefChoice::Rev),
+        KeyCode::Char('b') => submit_ref_choice(app, target, RefChoice::Branch),
+        _ => {}
+    }
+}
+
+fn submit_ref_choice(app: &mut App, target: AddTarget, choice: RefChoice) {
+    match choice {
+        RefChoice::Auto => {
+            app.action = Some(action_for_target(target, None, None, None));
+            app.input_mode = InputMode::Normal;
+        }
+        RefChoice::Tag => start_ref_value_input(app, target, RefInputKind::Tag),
+        RefChoice::Rev => start_ref_value_input(app, target, RefInputKind::Rev),
+        RefChoice::Branch => start_ref_value_input(app, target, RefInputKind::Branch),
+    }
+}
+
+fn start_ref_value_input(app: &mut App, target: AddTarget, ref_kind: RefInputKind) {
+    app.input.clear();
+    app.input_mode = InputMode::AddRefValue { target, ref_kind };
+}
+
+fn handle_ref_value_key(app: &mut App, code: KeyCode, target: AddTarget, ref_kind: RefInputKind) {
+    match code {
+        KeyCode::Enter => {
+            let value = app.input.trim().to_string();
+            if value.is_empty() {
+                app.status = format!(
+                    "Enter a {} first.",
+                    ref_input_title(ref_kind).to_lowercase()
+                );
+                return;
+            }
+            let (tag, rev, branch) = match ref_kind {
+                RefInputKind::Tag => (Some(value), None, None),
+                RefInputKind::Rev => (None, Some(value), None),
+                RefInputKind::Branch => (None, None, Some(value)),
+            };
+            app.action = Some(action_for_target(target, tag, rev, branch));
+            app.input_mode = InputMode::Normal;
+        }
+        KeyCode::Esc => app.input_mode = InputMode::Normal,
+        KeyCode::Backspace => {
+            app.input.pop();
+        }
+        KeyCode::Char(c) => app.input.push(c),
+        _ => {}
+    }
+}
+
+fn action_for_target(
+    target: AddTarget,
+    tag: Option<String>,
+    rev: Option<String>,
+    branch: Option<String>,
+) -> TuiAction {
+    match target {
+        AddTarget::Module { url } => TuiAction::AddModule {
+            url,
+            tag,
+            rev,
+            branch,
+        },
+        AddTarget::Plugin { url } => TuiAction::AddPlugin {
+            url,
+            tag,
+            rev,
+            branch,
+            bin: None,
+        },
     }
 }
 
@@ -1715,6 +1969,7 @@ mod tests {
             tab: Tab::Dependencies,
             selected: 0,
             search_selected: 0,
+            ref_choice_selected: 0,
             readme_scroll: 0,
             detail_readme_scroll: 0,
             graph_scroll: 0,
@@ -1916,5 +2171,107 @@ license = "Apache-2.0"
         app.set_log_visible(false);
 
         assert_eq!(app.focus, FocusRegion::DependencyList);
+    }
+
+    #[test]
+    fn add_tab_b_opens_builtin_plugin_dialog() {
+        let mut app = test_app();
+        app.tab = Tab::Search;
+
+        handle_normal_key(&mut app, KeyCode::Char('b'), KeyModifiers::NONE);
+
+        assert_eq!(app.input_mode, InputMode::BuiltinPlugins);
+    }
+
+    #[test]
+    fn builtin_plugin_dialog_enter_adds_selected_core_plugin() {
+        let mut app = test_app();
+        app.search_selected = 2;
+        app.input_mode = InputMode::BuiltinPlugins;
+
+        handle_builtin_plugins_key(&mut app, KeyCode::Enter);
+
+        assert_eq!(
+            app.action,
+            Some(TuiAction::AddPlugin {
+                url: BUILTIN_PLUGINS[2].to_string(),
+                tag: None,
+                rev: None,
+                branch: None,
+                bin: None,
+            })
+        );
+    }
+
+    #[test]
+    fn repo_add_can_choose_branch_before_submitting() {
+        let mut app = test_app();
+        app.readme_url = "https://github.com/nushell/nu_scripts".to_string();
+
+        handle_normal_key(&mut app, KeyCode::Char('m'), KeyModifiers::NONE);
+        assert_eq!(
+            app.input_mode,
+            InputMode::ChooseRef {
+                target: AddTarget::Module {
+                    url: "https://github.com/nushell/nu_scripts".to_string()
+                }
+            }
+        );
+
+        handle_ref_choice_key(
+            &mut app,
+            KeyCode::Char('b'),
+            AddTarget::Module {
+                url: "https://github.com/nushell/nu_scripts".to_string(),
+            },
+        );
+        app.input = "main".to_string();
+        handle_ref_value_key(
+            &mut app,
+            KeyCode::Enter,
+            AddTarget::Module {
+                url: "https://github.com/nushell/nu_scripts".to_string(),
+            },
+            RefInputKind::Branch,
+        );
+
+        assert_eq!(
+            app.action,
+            Some(TuiAction::AddModule {
+                url: "https://github.com/nushell/nu_scripts".to_string(),
+                tag: None,
+                rev: None,
+                branch: Some("main".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn ref_choice_dialog_supports_jk_navigation_and_enter() {
+        let mut app = test_app();
+        let target = AddTarget::Plugin {
+            url: "https://github.com/nushell/nu_plugin_inc".to_string(),
+        };
+
+        handle_ref_choice_key(&mut app, KeyCode::Char('j'), target.clone());
+        handle_ref_choice_key(&mut app, KeyCode::Char('j'), target.clone());
+
+        assert_eq!(app.ref_choice_selected, 2);
+
+        handle_ref_choice_key(&mut app, KeyCode::Char('k'), target.clone());
+
+        assert_eq!(app.ref_choice_selected, 1);
+
+        handle_ref_choice_key(&mut app, KeyCode::Enter, target);
+
+        assert_eq!(
+            app.input_mode,
+            InputMode::AddRefValue {
+                target: AddTarget::Plugin {
+                    url: "https://github.com/nushell/nu_plugin_inc".to_string(),
+                },
+                ref_kind: RefInputKind::Tag,
+            }
+        );
     }
 }
