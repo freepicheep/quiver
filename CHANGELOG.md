@@ -1,5 +1,7 @@
 # Unreleased
 
+# Version 0.6.1 (2026-05-08)
+
 ## Added
 
 - You can now run commands from within the TUI and the results will be shown in the log at the bottom (previously running a command like adding a dep would close the TUI). The command log is hidden by default, can be toggled with `/`, and is shown automatically while TUI-triggered commands run.
