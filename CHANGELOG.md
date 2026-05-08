@@ -1,5 +1,20 @@
 # Unreleased
 
+## Added
+
+- You can now run commands from within the TUI and the results will be shown in the log at the bottom (previously running a command like adding a dep would close the TUI). The command log is hidden by default, can be toggled with `/`, and is shown automatically while TUI-triggered commands run.
+- The TUI Add flow now lets repository modules and plugins choose how to pin the dependency before adding it: auto-detect, tag, branch, or revision.
+- The TUI now supports clickable header tabs for switching between Dependencies, Graph, and Add.
+
+## Changed
+
+- TUI README rendering now uses `leaves` for true Markdown rendering and syntax highlighting for code blocks.
+- TUI panes and dialogs now use rounded borders, and dependency detail labels are styled for easier scanning.
+- The TUI Add page now gives the repository README preview the main pane instead of splitting it with the built-in plugin list.
+- The TUI Add tab now opens built-in plugin selection in a focused dialog via `b`.
+- TUI remove confirmation now accepts Enter to confirm and Esc to cancel.
+- TUI mouse movement and button release no longer steal focus; focus changes on click or scroll instead.
+
 # Version 0.6.0 (2026-05-05)
 
 ## Added
