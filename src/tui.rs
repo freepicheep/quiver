@@ -15,7 +15,10 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use leaves::theme::TERMINAL;
-use leaves::{MarkdownTheme, parse_markdown_with_width};
+use leaves::{
+    MarkdownTheme, parse_markdown_with_width, syntax_set_with_bundled_syntaxes,
+    theme_set_with_bundled_themes,
+};
 use ratatui::{
     Terminal,
     backend::CrosstermBackend,
@@ -50,8 +53,18 @@ const HEADER_TAB_PADDING_LEFT: &str = " ";
 const HEADER_TAB_PADDING_RIGHT: &str = " ";
 const HEADER_TAB_DIVIDER: &str = "|";
 
-static MARKDOWN_SYNTAX_SET: LazyLock<SyntaxSet> = LazyLock::new(SyntaxSet::load_defaults_newlines);
-static MARKDOWN_THEME_SET: LazyLock<ThemeSet> = LazyLock::new(ThemeSet::load_defaults);
+static MARKDOWN_SYNTAX_SET: LazyLock<SyntaxSet> = LazyLock::new(|| {
+    syntax_set_with_bundled_syntaxes().unwrap_or_else(|err| {
+        eprintln!("warning: failed to load bundled markdown syntaxes: {err}");
+        SyntaxSet::load_defaults_newlines()
+    })
+});
+static MARKDOWN_THEME_SET: LazyLock<ThemeSet> = LazyLock::new(|| {
+    theme_set_with_bundled_themes().unwrap_or_else(|err| {
+        eprintln!("warning: failed to load bundled markdown themes: {err}");
+        ThemeSet::load_defaults()
+    })
+});
 static MARKDOWN_THEME: LazyLock<MarkdownTheme> = LazyLock::new(|| TERMINAL);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -739,7 +752,7 @@ fn markdown_lines(content: &str, width: u16) -> Vec<Line<'static>> {
     let render_width = usize::from(width.saturating_sub(2)).max(20);
     let syntect_theme = MARKDOWN_THEME_SET
         .themes
-        .get("base16-ocean.dark")
+        .get("ansi")
         .or_else(|| MARKDOWN_THEME_SET.themes.values().next())
         .expect("syntect default theme set should not be empty");
     let (lines, _) = parse_markdown_with_width(

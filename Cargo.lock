@@ -776,8 +776,8 @@ checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
 
 [[package]]
 name = "leaves"
-version = "0.1.0"
-source = "git+https://github.com/freepicheep/leaves.git?branch=main#e2011771332425dbfb7154d034f83ff2f334d86c"
+version = "0.1.1"
+source = "git+https://github.com/freepicheep/leaves.git?branch=main#79c8a9803c8a91c7c0b0c99665eb195c926c0b54"
 dependencies = [
  "mmdflux",
  "pulldown-cmark",
