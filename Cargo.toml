@@ -21,9 +21,10 @@ console = "0.16.2"
 flate2 = "1"
 tar = "0.4"
 xz2 = "0.1"
-ratatui = "0.30"
+ratatui = "0.29"
 crossterm = "0.29"
-tui-markdown = "0.3"
+leaves = { git = "https://github.com/freepicheep/leaves.git", branch = "main" }
+syntect = "5.2"
 
 [dependencies.git2]
 version = "0.20"

@@ -141,13 +141,24 @@ fn cmd_tui(cwd: &Path) -> Result<()> {
                 let project_dir = require_project_dir(&cwd)?;
                 cmd_remove(&project_dir, name)
             }
-            tui::TuiAction::AddModule { url } => {
+            tui::TuiAction::AddModule {
+                url,
+                tag,
+                rev,
+                branch,
+            } => {
                 let project_dir = require_project_dir(&cwd)?;
-                cmd_add(&project_dir, url, None, None, None)
+                cmd_add(&project_dir, url, tag, rev, branch)
             }
-            tui::TuiAction::AddPlugin { url } => {
+            tui::TuiAction::AddPlugin {
+                url,
+                tag,
+                rev,
+                branch,
+                bin,
+            } => {
                 let project_dir = require_project_dir(&cwd)?;
-                cmd_add_plugin(&project_dir, url, None, None, None, None)
+                cmd_add_plugin(&project_dir, url, tag, rev, branch, bin)
             }
         })
     })

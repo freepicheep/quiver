@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, LazyLock, mpsc};
 use std::thread;
 use std::time::Duration;
 
@@ -14,6 +14,11 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
+use leaves::theme::TERMINAL;
+use leaves::{
+    MarkdownTheme, parse_markdown_with_width, syntax_set_with_bundled_syntaxes,
+    theme_set_with_bundled_themes,
+};
 use ratatui::{
     Terminal,
     backend::CrosstermBackend,
@@ -21,10 +26,11 @@ use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{
-        Block, Borders, Clear, List, ListItem, ListState, Paragraph, Scrollbar,
+        Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Scrollbar,
         ScrollbarOrientation, ScrollbarState, Tabs, Wrap,
     },
 };
+use syntect::{highlighting::ThemeSet, parsing::SyntaxSet};
 
 use crate::error::{QuiverError, Result};
 use crate::lockfile::{LockedPackageKind, Lockfile};
@@ -42,13 +48,45 @@ const BUILTIN_PLUGINS: &[&str] = &[
     "nu_plugin_stress_internals",
 ];
 
+const LOG_PANEL_HEIGHT: u16 = 8;
+const HEADER_TAB_PADDING_LEFT: &str = " ";
+const HEADER_TAB_PADDING_RIGHT: &str = " ";
+const HEADER_TAB_DIVIDER: &str = "|";
+
+static MARKDOWN_SYNTAX_SET: LazyLock<SyntaxSet> = LazyLock::new(|| {
+    syntax_set_with_bundled_syntaxes().unwrap_or_else(|err| {
+        eprintln!("warning: failed to load bundled markdown syntaxes: {err}");
+        SyntaxSet::load_defaults_newlines()
+    })
+});
+static MARKDOWN_THEME_SET: LazyLock<ThemeSet> = LazyLock::new(|| {
+    theme_set_with_bundled_themes().unwrap_or_else(|err| {
+        eprintln!("warning: failed to load bundled markdown themes: {err}");
+        ThemeSet::load_defaults()
+    })
+});
+static MARKDOWN_THEME: LazyLock<MarkdownTheme> = LazyLock::new(|| TERMINAL);
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TuiAction {
     Install,
     Update,
-    Remove { name: String },
-    AddModule { url: String },
-    AddPlugin { url: String },
+    Remove {
+        name: String,
+    },
+    AddModule {
+        url: String,
+        tag: Option<String>,
+        rev: Option<String>,
+        branch: Option<String>,
+    },
+    AddPlugin {
+        url: String,
+        tag: Option<String>,
+        rev: Option<String>,
+        branch: Option<String>,
+        bin: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,12 +96,56 @@ enum Tab {
     Search,
 }
 
+const HEADER_TABS: [(Tab, &str); 3] = [
+    (Tab::Dependencies, "Dependencies"),
+    (Tab::Graph, "Graph"),
+    (Tab::Search, "Add"),
+];
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum InputMode {
     Normal,
     AddUrl,
-    ConfirmRemove { name: String },
+    BuiltinPlugins,
+    ChooseRef {
+        target: AddTarget,
+    },
+    AddRefValue {
+        target: AddTarget,
+        ref_kind: RefInputKind,
+    },
+    ConfirmRemove {
+        name: String,
+    },
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AddTarget {
+    Module { url: String },
+    Plugin { url: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RefInputKind {
+    Tag,
+    Rev,
+    Branch,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RefChoice {
+    Auto,
+    Tag,
+    Branch,
+    Rev,
+}
+
+const REF_CHOICES: [RefChoice; 4] = [
+    RefChoice::Auto,
+    RefChoice::Tag,
+    RefChoice::Branch,
+    RefChoice::Rev,
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum DependencyKind {
@@ -117,6 +199,7 @@ struct App {
     tab: Tab,
     selected: usize,
     search_selected: usize,
+    ref_choice_selected: usize,
     readme_scroll: u16,
     detail_readme_scroll: u16,
     graph_scroll: u16,
@@ -131,6 +214,7 @@ struct App {
     logs: Vec<LogLine>,
     log_scroll: u16,
     follow_log: bool,
+    log_visible: bool,
     command_rx: Option<mpsc::Receiver<TuiCommandEvent>>,
     command_running: bool,
     pending_reload: bool,
@@ -218,6 +302,7 @@ impl App {
                 tab: Tab::Dependencies,
                 selected: 0,
                 search_selected: 0,
+                ref_choice_selected: 0,
                 readme_scroll: 0,
                 detail_readme_scroll: 0,
                 graph_scroll: 0,
@@ -234,6 +319,7 @@ impl App {
                 )],
                 log_scroll: 0,
                 follow_log: true,
+                log_visible: false,
                 command_rx: None,
                 command_running: false,
                 pending_reload: false,
@@ -266,6 +352,7 @@ impl App {
             tab: Tab::Dependencies,
             selected: 0,
             search_selected: 0,
+            ref_choice_selected: 0,
             readme_scroll: 0,
             detail_readme_scroll: 0,
             graph_scroll: 0,
@@ -281,6 +368,7 @@ impl App {
             logs: vec![LogLine::Plain("Logs will show here".to_string())],
             log_scroll: 0,
             follow_log: true,
+            log_visible: false,
             command_rx: None,
             command_running: false,
             pending_reload: false,
@@ -340,6 +428,17 @@ impl App {
 
     fn register_region(&mut self, region: FocusRegion, area: Rect) {
         self.regions.push((region, area));
+    }
+
+    fn set_log_visible(&mut self, visible: bool) {
+        self.log_visible = visible;
+        if !visible && self.focus == FocusRegion::CommandLog {
+            self.focus = default_focus_for_tab(self.tab);
+        }
+    }
+
+    fn toggle_log_visible(&mut self) {
+        self.set_log_visible(!self.log_visible);
     }
 }
 
@@ -440,12 +539,13 @@ fn requested_ref(tag: &Option<String>, rev: &Option<String>, branch: &Option<Str
 fn render(frame: &mut ratatui::Frame<'_>, app: &mut App) {
     app.regions.clear();
     let area = frame.area();
+    let log_height = if app.log_visible { LOG_PANEL_HEIGHT } else { 0 };
     let shell = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
             Constraint::Min(8),
-            Constraint::Length(8),
+            Constraint::Length(log_height),
             Constraint::Length(3),
         ])
         .split(area);
@@ -460,16 +560,24 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut App) {
         }
         Tab::Search => render_search(frame, app, shell[1]),
     }
-    render_log(frame, app, shell[2]);
-    app.register_region(FocusRegion::CommandLog, shell[2]);
+    if app.log_visible {
+        render_log(frame, app, shell[2]);
+        app.register_region(FocusRegion::CommandLog, shell[2]);
+    }
     render_footer(frame, app, shell[3]);
     app.register_region(FocusRegion::Footer, shell[3]);
 
     match &app.input_mode {
         InputMode::AddUrl => render_input(frame, app, "Paste GitHub repository URL"),
-        InputMode::ConfirmRemove { name } => {
-            render_confirm(frame, &format!("Remove '{name}' from nupackage.toml? y/N"))
+        InputMode::BuiltinPlugins => render_builtin_plugins_dialog(frame, app),
+        InputMode::ChooseRef { target } => render_ref_choice(frame, app, target),
+        InputMode::AddRefValue { ref_kind, .. } => {
+            render_input(frame, app, ref_input_title(*ref_kind))
         }
+        InputMode::ConfirmRemove { name } => render_confirm(
+            frame,
+            &format!("Remove '{name}'? Enter confirms, Esc cancels"),
+        ),
         InputMode::Normal => {}
     }
 }
@@ -527,19 +635,29 @@ fn drain_command_events(app: &mut App) -> Result<()> {
 
 fn handle_mouse(app: &mut App, mouse: MouseEvent) {
     if let Some(region) = region_at(app, mouse.column, mouse.row) {
-        app.focus = region;
         match (mouse.kind, region) {
             (MouseEventKind::Down(MouseButton::Left), FocusRegion::Header) => {
                 focus_tab_at(app, mouse.column);
             }
             (MouseEventKind::Down(MouseButton::Left), FocusRegion::DependencyList) => {
+                app.focus = region;
                 select_dependency_at(app, mouse.row);
             }
             (MouseEventKind::Down(MouseButton::Left), FocusRegion::BuiltinPlugins) => {
+                app.focus = region;
                 select_builtin_plugin_at(app, mouse.row);
             }
-            (MouseEventKind::ScrollDown, _) => scroll_focused(app, 3),
-            (MouseEventKind::ScrollUp, _) => scroll_focused(app, -3),
+            (MouseEventKind::Down(MouseButton::Left), _) => {
+                app.focus = region;
+            }
+            (MouseEventKind::ScrollDown, _) => {
+                app.focus = region;
+                scroll_focused(app, 3);
+            }
+            (MouseEventKind::ScrollUp, _) => {
+                app.focus = region;
+                scroll_focused(app, -3);
+            }
             _ => {}
         }
     } else {
@@ -565,6 +683,7 @@ fn start_tui_action(
 
     let label = action.label();
     app.input_mode = InputMode::Normal;
+    app.set_log_visible(true);
     app.push_log(LogLine::Command(format!("qv {label}")));
     app.status = format!("Running {label}...");
     app.command_running = true;
@@ -588,19 +707,62 @@ impl TuiAction {
             TuiAction::Install => "install".to_string(),
             TuiAction::Update => "update".to_string(),
             TuiAction::Remove { name } => format!("remove {name}"),
-            TuiAction::AddModule { url } => format!("add {url}"),
-            TuiAction::AddPlugin { url } => format!("add-plugin {url}"),
+            TuiAction::AddModule {
+                url,
+                tag,
+                rev,
+                branch,
+            } => format!("add {}{}", url, ref_label(tag, rev, branch)),
+            TuiAction::AddPlugin {
+                url,
+                tag,
+                rev,
+                branch,
+                ..
+            } => format!("add-plugin {}{}", url, ref_label(tag, rev, branch)),
         }
     }
 }
 
+fn ref_label(tag: &Option<String>, rev: &Option<String>, branch: &Option<String>) -> String {
+    if let Some(tag) = tag {
+        format!(" --tag {tag}")
+    } else if let Some(rev) = rev {
+        format!(" --rev {}", short_rev(rev))
+    } else if let Some(branch) = branch {
+        format!(" --branch {branch}")
+    } else {
+        String::new()
+    }
+}
+
 fn focused_block<'a>(app: &App, region: FocusRegion, title: impl Into<Line<'a>>) -> Block<'a> {
-    let block = Block::default().borders(Borders::ALL).title(title);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .title(title);
     if app.focus == region {
         block.border_style(Style::default().fg(focus_color()))
     } else {
         block
     }
+}
+
+fn markdown_lines(content: &str, width: u16) -> Vec<Line<'static>> {
+    let render_width = usize::from(width.saturating_sub(2)).max(20);
+    let syntect_theme = MARKDOWN_THEME_SET
+        .themes
+        .get("ansi")
+        .or_else(|| MARKDOWN_THEME_SET.themes.values().next())
+        .expect("syntect default theme set should not be empty");
+    let (lines, _) = parse_markdown_with_width(
+        content,
+        &MARKDOWN_SYNTAX_SET,
+        syntect_theme,
+        render_width,
+        &MARKDOWN_THEME,
+    );
+    lines
 }
 
 fn focus_color() -> Color {
@@ -661,24 +823,60 @@ fn focus_tab_at(app: &mut App, x: u16) {
     let Some(area) = region_rect(app, FocusRegion::Header) else {
         return;
     };
-    let inner_x = x.saturating_sub(area.x.saturating_add(1));
-    let inner_width = area.width.saturating_sub(2).max(1);
-    let tab_width = (inner_width / 3).max(1);
-    let tab = match (inner_x / tab_width).min(2) {
-        0 => Tab::Dependencies,
-        1 => Tab::Graph,
-        _ => Tab::Search,
-    };
-    set_tab(app, tab);
+    if let Some(tab) = header_tab_at(area, x) {
+        set_tab(app, tab);
+    }
+}
+
+fn header_tab_at(area: Rect, x: u16) -> Option<Tab> {
+    let inner = inner_block_area(area);
+    if inner.width == 0 || inner.height == 0 {
+        return None;
+    }
+
+    let mut current_x = inner.x;
+    for (index, (tab, title)) in HEADER_TABS.iter().enumerate() {
+        let tab_start = current_x;
+        current_x = current_x.saturating_add(text_width(HEADER_TAB_PADDING_LEFT));
+        current_x = current_x.saturating_add(text_width(title));
+        current_x = current_x.saturating_add(text_width(HEADER_TAB_PADDING_RIGHT));
+
+        if x >= tab_start && x < current_x {
+            return Some(*tab);
+        }
+
+        if index + 1 < HEADER_TABS.len() {
+            current_x = current_x.saturating_add(text_width(HEADER_TAB_DIVIDER));
+        }
+    }
+
+    None
 }
 
 fn set_tab(app: &mut App, tab: Tab) {
     app.tab = tab;
-    app.focus = match tab {
+    app.focus = default_focus_for_tab(tab);
+}
+
+fn default_focus_for_tab(tab: Tab) -> FocusRegion {
+    match tab {
         Tab::Dependencies => FocusRegion::DependencyList,
         Tab::Graph => FocusRegion::Graph,
-        Tab::Search => FocusRegion::BuiltinPlugins,
-    };
+        Tab::Search => FocusRegion::SearchReadme,
+    }
+}
+
+fn inner_block_area(area: Rect) -> Rect {
+    Rect {
+        x: area.x.saturating_add(1),
+        y: area.y.saturating_add(1),
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(2),
+    }
+}
+
+fn text_width(text: &str) -> u16 {
+    text.chars().count() as u16
 }
 
 fn select_dependency_at(app: &mut App, y: u16) {
@@ -706,9 +904,9 @@ fn select_builtin_plugin_at(app: &mut App, y: u16) {
 }
 
 fn render_header(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
-    let titles = ["Dependencies", "Graph", "Add"]
+    let titles = HEADER_TABS
         .iter()
-        .map(|title| Line::from(Span::styled(*title, Style::default().fg(Color::Cyan))))
+        .map(|(_, title)| Line::from(Span::styled(*title, Style::default().fg(Color::Cyan))))
         .collect::<Vec<_>>();
     let selected = match app.tab {
         Tab::Dependencies => 0,
@@ -723,6 +921,8 @@ fn render_header(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
     let tabs = Tabs::new(titles)
         .select(selected)
         .block(focused_block(app, FocusRegion::Header, title))
+        .divider(HEADER_TAB_DIVIDER)
+        .padding(HEADER_TAB_PADDING_LEFT, HEADER_TAB_PADDING_RIGHT)
         .highlight_style(
             Style::default()
                 .fg(Color::Yellow)
@@ -806,13 +1006,14 @@ fn render_dependencies(frame: &mut ratatui::Frame<'_>, app: &mut App, area: Rect
         app.local_readme.as_str()
     };
 
-    let readme_paragraph = Paragraph::new(tui_markdown::from_str(readme_content))
+    let readme_lines = markdown_lines(readme_content, right_chunks[1].width);
+    let content_height = readme_lines.len().saturating_sub(1) as u16;
+    let readme_paragraph = Paragraph::new(readme_lines)
         .block(focused_block(app, FocusRegion::DependencyReadme, "README"))
         .scroll((app.detail_readme_scroll, 0))
         .wrap(Wrap { trim: false });
     frame.render_widget(readme_paragraph, right_chunks[1]);
 
-    let content_height = app.local_readme.lines().count().saturating_sub(1) as u16;
     let mut scrollbar_state =
         ScrollbarState::new(content_height as usize).position(app.detail_readme_scroll as usize);
     frame.render_stateful_widget(
@@ -822,28 +1023,42 @@ fn render_dependencies(frame: &mut ratatui::Frame<'_>, app: &mut App, area: Rect
     );
 }
 
-fn selected_detail(app: &App) -> String {
+fn selected_detail(app: &App) -> Vec<Line<'static>> {
     let Some(row) = app.selected_row() else {
-        return "Press a to paste a GitHub repository URL and preview its README.".to_string();
+        return vec![Line::from(
+            "Press a to paste a GitHub repository URL and preview its README.",
+        )];
     };
 
-    let mut detail = String::new();
-    detail.push_str(&format!("name: {}\n", row.name));
-    detail.push_str(&format!("kind: {}\n", kind_label(&row.kind)));
+    let mut detail = Vec::new();
+    detail.push(detail_line("name", &row.name));
+    detail.push(detail_line("kind", kind_label(&row.kind)));
     if !app.local_license.is_empty() {
-        detail.push_str(&format!("license: {}\n", app.local_license));
+        detail.push(detail_line("license", &app.local_license));
     }
-    detail.push_str(&format!("source: {}\n", row.git));
-    detail.push_str(&format!("requested: {}\n", row.requested));
+    detail.push(detail_line("source", &row.git));
+    detail.push(detail_line("requested", &row.requested));
     if let Some(rev) = &row.locked_rev {
-        detail.push_str(&format!("locked rev: {}\n", rev));
+        detail.push(detail_line("locked rev", rev));
     } else {
-        detail.push_str("locked rev: not installed\n");
+        detail.push(detail_line("locked rev", "not installed"));
     }
     if let Some(checksum) = &row.checksum {
-        detail.push_str(&format!("sha256: {}\n", checksum));
+        detail.push(detail_line("sha256", checksum));
     }
     detail
+}
+
+fn detail_line(key: &str, value: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            format!("{key}:"),
+            Style::default()
+                .fg(Color::Blue)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(format!(" {value}")),
+    ])
 }
 
 struct Canvas {
@@ -1058,18 +1273,12 @@ fn render_graph(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
 }
 
 fn render_search(frame: &mut ratatui::Frame<'_>, app: &mut App, area: Rect) {
-    let horizontal_chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(area);
-    app.register_region(FocusRegion::BuiltinPlugins, horizontal_chunks[1]);
-
-    let left_chunks = Layout::default()
+    let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(3), Constraint::Min(5)])
-        .split(horizontal_chunks[0]);
-    app.register_region(FocusRegion::SearchUrl, left_chunks[0]);
-    app.register_region(FocusRegion::SearchReadme, left_chunks[1]);
+        .split(area);
+    app.register_region(FocusRegion::SearchUrl, chunks[0]);
+    app.register_region(FocusRegion::SearchReadme, chunks[1]);
 
     let url = if app.readme_url.is_empty() {
         "No repository loaded".to_string()
@@ -1082,53 +1291,43 @@ fn render_search(frame: &mut ratatui::Frame<'_>, app: &mut App, area: Rect) {
             FocusRegion::SearchUrl,
             "GitHub Repository",
         )),
-        left_chunks[0],
+        chunks[0],
     );
 
-    let paragraph = Paragraph::new(tui_markdown::from_str(app.readme.as_str()))
+    let readme_lines = markdown_lines(app.readme.as_str(), chunks[1].width);
+    let content_height = readme_lines.len().saturating_sub(1) as u16;
+    let paragraph = Paragraph::new(readme_lines)
         .block(focused_block(app, FocusRegion::SearchReadme, "README"))
         .scroll((app.readme_scroll, 0))
         .wrap(Wrap { trim: false });
-    frame.render_widget(paragraph, left_chunks[1]);
+    frame.render_widget(paragraph, chunks[1]);
 
-    let content_height = app.readme.lines().count().saturating_sub(1) as u16;
     let mut scrollbar_state =
         ScrollbarState::new(content_height as usize).position(app.readme_scroll as usize);
     frame.render_stateful_widget(
         Scrollbar::new(ScrollbarOrientation::VerticalRight),
-        left_chunks[1],
+        chunks[1],
         &mut scrollbar_state,
     );
-
-    let items: Vec<ListItem> = BUILTIN_PLUGINS
-        .iter()
-        .map(|p| ListItem::new(Line::from(p.to_string())))
-        .collect();
-    let list = List::new(items)
-        .block(focused_block(
-            app,
-            FocusRegion::BuiltinPlugins,
-            "Built-in Plugins",
-        ))
-        .highlight_symbol("> ")
-        .highlight_style(
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        );
-    let mut list_state = ListState::default();
-    list_state.select(Some(app.search_selected));
-    frame.render_stateful_widget(list, horizontal_chunks[1], &mut list_state);
 }
 
 fn render_footer(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
+    let log_hint = if app.log_visible {
+        "/ hide log"
+    } else {
+        "/ show log"
+    };
     let keys = match app.tab {
         Tab::Dependencies => {
-            "q quit | tab switch | j/k select | PgUp/PgDn scroll | [/] log | i install | u update | r remove | a add"
+            format!(
+                "q quit | tab switch | j/k select | PgUp/PgDn scroll | {log_hint} | i install | u update | r remove | a add"
+            )
         }
-        Tab::Graph => "q quit | tab switch | d dependencies | a add URL | [/] log",
+        Tab::Graph => format!("q quit | tab switch | d dependencies | a add URL | {log_hint}"),
         Tab::Search => {
-            "q quit | tab switch | j/k select plugin | Enter add plugin | a paste URL | m add repo module | p add repo plugin | [/] log"
+            format!(
+                "q quit | tab switch | a paste URL | b built-ins | m add repo module | p add repo plugin | {log_hint}"
+            )
         }
     };
     let text = format!("{keys}\n{}", app.status);
@@ -1211,13 +1410,14 @@ fn log_line(line: &LogLine) -> Line<'static> {
 }
 
 fn render_input(frame: &mut ratatui::Frame<'_>, app: &App, title: &str) {
-    let area = centered_rect_max(68, 7, frame.area());
+    let area = centered_rect_max(68, 3, frame.area());
     frame.render_widget(Clear, area);
     frame.render_widget(
         Paragraph::new(app.input.as_str()).block(
             Block::default()
                 .title(title)
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(focus_color())),
         ),
         area,
@@ -1225,23 +1425,102 @@ fn render_input(frame: &mut ratatui::Frame<'_>, app: &App, title: &str) {
 }
 
 fn render_confirm(frame: &mut ratatui::Frame<'_>, message: &str) {
-    let area = centered_rect_max(56, 7, frame.area());
+    let area = centered_rect_max(56, 3, frame.area());
     frame.render_widget(Clear, area);
     frame.render_widget(
         Paragraph::new(message).alignment(Alignment::Center).block(
             Block::default()
                 .title("Confirm")
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(focus_color())),
         ),
         area,
     );
 }
 
+fn render_builtin_plugins_dialog(frame: &mut ratatui::Frame<'_>, app: &App) {
+    let area = centered_rect_max(44, 12, frame.area());
+    frame.render_widget(Clear, area);
+    let items: Vec<ListItem> = BUILTIN_PLUGINS
+        .iter()
+        .map(|p| ListItem::new(Line::from(p.to_string())))
+        .collect();
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .title("Built-in Plugins - Enter adds, Esc cancels")
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(focus_color())),
+        )
+        .highlight_symbol("> ")
+        .highlight_style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        );
+    let mut list_state = ListState::default();
+    list_state.select(Some(app.search_selected));
+    frame.render_stateful_widget(list, area, &mut list_state);
+}
+
+fn render_ref_choice(frame: &mut ratatui::Frame<'_>, app: &App, target: &AddTarget) {
+    let title = match target {
+        AddTarget::Module { .. } => "Add Module Ref",
+        AddTarget::Plugin { .. } => "Add Plugin Ref",
+    };
+    let area = centered_rect_max(62, 8, frame.area());
+    frame.render_widget(Clear, area);
+    let items: Vec<ListItem> = REF_CHOICES
+        .iter()
+        .map(|choice| ListItem::new(Line::from(ref_choice_label(*choice))))
+        .collect();
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .title(title)
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(focus_color())),
+        )
+        .highlight_symbol("> ")
+        .highlight_style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        );
+    let mut list_state = ListState::default();
+    list_state.select(Some(app.ref_choice_selected));
+    frame.render_stateful_widget(list, area, &mut list_state);
+}
+
+fn ref_input_title(ref_kind: RefInputKind) -> &'static str {
+    match ref_kind {
+        RefInputKind::Tag => "Version tag",
+        RefInputKind::Rev => "Revision",
+        RefInputKind::Branch => "Branch",
+    }
+}
+
+fn ref_choice_label(choice: RefChoice) -> &'static str {
+    match choice {
+        RefChoice::Auto => "auto-detect latest tag/default branch (a)",
+        RefChoice::Tag => "version tag (v)",
+        RefChoice::Branch => "branch (b)",
+        RefChoice::Rev => "revision (r)",
+    }
+}
+
 fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
     match app.input_mode.clone() {
         InputMode::Normal => handle_normal_key(app, code, modifiers),
         InputMode::AddUrl => handle_url_key(app, code),
+        InputMode::BuiltinPlugins => handle_builtin_plugins_key(app, code),
+        InputMode::ChooseRef { target } => handle_ref_choice_key(app, code, target),
+        InputMode::AddRefValue { target, ref_kind } => {
+            handle_ref_value_key(app, code, target, ref_kind)
+        }
         InputMode::ConfirmRemove { name } => handle_remove_confirm_key(app, code, name),
     }
 }
@@ -1282,6 +1561,7 @@ fn handle_normal_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
         }
         KeyCode::PageDown => scroll_focused(app, 10),
         KeyCode::PageUp => scroll_focused(app, -10),
+        KeyCode::Char('/') => app.toggle_log_visible(),
         KeyCode::Char(']') => {
             app.scroll_log_down(3);
         }
@@ -1309,6 +1589,10 @@ fn handle_normal_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
             app.input.clear();
             app.input_mode = InputMode::AddUrl;
         }
+        KeyCode::Char('b') if app.can_manage() && app.tab == Tab::Search => {
+            app.input_mode = InputMode::BuiltinPlugins;
+            app.status = "Choose a built-in plugin.".to_string();
+        }
         KeyCode::Char('r') if app.can_manage() => {
             if let Some(row) = app.selected_row()
                 && !matches!(row.kind, DependencyKind::Transitive)
@@ -1319,23 +1603,141 @@ fn handle_normal_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
             }
         }
         KeyCode::Char('m') if app.can_manage() && !app.readme_url.is_empty() => {
-            app.action = Some(TuiAction::AddModule {
-                url: app.readme_url.clone(),
-            });
+            app.ref_choice_selected = 0;
+            app.input_mode = InputMode::ChooseRef {
+                target: AddTarget::Module {
+                    url: app.readme_url.clone(),
+                },
+            };
+            app.status = "Choose how to pin the module.".to_string();
         }
         KeyCode::Char('p') if app.can_manage() && !app.readme_url.is_empty() => {
-            app.action = Some(TuiAction::AddPlugin {
-                url: app.readme_url.clone(),
-            });
-        }
-        KeyCode::Enter => {
-            if app.tab == Tab::Search && app.can_manage() {
-                app.action = Some(TuiAction::AddPlugin {
-                    url: BUILTIN_PLUGINS[app.search_selected].to_string(),
-                });
-            }
+            app.ref_choice_selected = 0;
+            app.input_mode = InputMode::ChooseRef {
+                target: AddTarget::Plugin {
+                    url: app.readme_url.clone(),
+                },
+            };
+            app.status = "Choose how to pin the plugin.".to_string();
         }
         _ => {}
+    }
+}
+
+fn handle_builtin_plugins_key(app: &mut App, code: KeyCode) {
+    match code {
+        KeyCode::Esc => app.input_mode = InputMode::Normal,
+        KeyCode::Down | KeyCode::Char('j') => {
+            if app.search_selected + 1 < BUILTIN_PLUGINS.len() {
+                app.search_selected += 1;
+            }
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            if app.search_selected > 0 {
+                app.search_selected -= 1;
+            }
+        }
+        KeyCode::Enter => {
+            app.action = Some(TuiAction::AddPlugin {
+                url: BUILTIN_PLUGINS[app.search_selected].to_string(),
+                tag: None,
+                rev: None,
+                branch: None,
+                bin: None,
+            });
+            app.input_mode = InputMode::Normal;
+        }
+        _ => {}
+    }
+}
+
+fn handle_ref_choice_key(app: &mut App, code: KeyCode, target: AddTarget) {
+    match code {
+        KeyCode::Esc => app.input_mode = InputMode::Normal,
+        KeyCode::Down | KeyCode::Char('j') => {
+            if app.ref_choice_selected + 1 < REF_CHOICES.len() {
+                app.ref_choice_selected += 1;
+            }
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            if app.ref_choice_selected > 0 {
+                app.ref_choice_selected -= 1;
+            }
+        }
+        KeyCode::Enter => submit_ref_choice(app, target, REF_CHOICES[app.ref_choice_selected]),
+        KeyCode::Char('a') => submit_ref_choice(app, target, RefChoice::Auto),
+        KeyCode::Char('v') | KeyCode::Char('t') => submit_ref_choice(app, target, RefChoice::Tag),
+        KeyCode::Char('r') => submit_ref_choice(app, target, RefChoice::Rev),
+        KeyCode::Char('b') => submit_ref_choice(app, target, RefChoice::Branch),
+        _ => {}
+    }
+}
+
+fn submit_ref_choice(app: &mut App, target: AddTarget, choice: RefChoice) {
+    match choice {
+        RefChoice::Auto => {
+            app.action = Some(action_for_target(target, None, None, None));
+            app.input_mode = InputMode::Normal;
+        }
+        RefChoice::Tag => start_ref_value_input(app, target, RefInputKind::Tag),
+        RefChoice::Rev => start_ref_value_input(app, target, RefInputKind::Rev),
+        RefChoice::Branch => start_ref_value_input(app, target, RefInputKind::Branch),
+    }
+}
+
+fn start_ref_value_input(app: &mut App, target: AddTarget, ref_kind: RefInputKind) {
+    app.input.clear();
+    app.input_mode = InputMode::AddRefValue { target, ref_kind };
+}
+
+fn handle_ref_value_key(app: &mut App, code: KeyCode, target: AddTarget, ref_kind: RefInputKind) {
+    match code {
+        KeyCode::Enter => {
+            let value = app.input.trim().to_string();
+            if value.is_empty() {
+                app.status = format!(
+                    "Enter a {} first.",
+                    ref_input_title(ref_kind).to_lowercase()
+                );
+                return;
+            }
+            let (tag, rev, branch) = match ref_kind {
+                RefInputKind::Tag => (Some(value), None, None),
+                RefInputKind::Rev => (None, Some(value), None),
+                RefInputKind::Branch => (None, None, Some(value)),
+            };
+            app.action = Some(action_for_target(target, tag, rev, branch));
+            app.input_mode = InputMode::Normal;
+        }
+        KeyCode::Esc => app.input_mode = InputMode::Normal,
+        KeyCode::Backspace => {
+            app.input.pop();
+        }
+        KeyCode::Char(c) => app.input.push(c),
+        _ => {}
+    }
+}
+
+fn action_for_target(
+    target: AddTarget,
+    tag: Option<String>,
+    rev: Option<String>,
+    branch: Option<String>,
+) -> TuiAction {
+    match target {
+        AddTarget::Module { url } => TuiAction::AddModule {
+            url,
+            tag,
+            rev,
+            branch,
+        },
+        AddTarget::Plugin { url } => TuiAction::AddPlugin {
+            url,
+            tag,
+            rev,
+            branch,
+            bin: None,
+        },
     }
 }
 
@@ -1375,8 +1777,13 @@ fn handle_url_key(app: &mut App, code: KeyCode) {
 
 fn handle_remove_confirm_key(app: &mut App, code: KeyCode, name: String) {
     match code {
-        KeyCode::Char('y') | KeyCode::Char('Y') => app.action = Some(TuiAction::Remove { name }),
-        _ => app.input_mode = InputMode::Normal,
+        KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+            app.action = Some(TuiAction::Remove { name });
+        }
+        KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+            app.input_mode = InputMode::Normal;
+        }
+        _ => {}
     }
 }
 
@@ -1573,8 +1980,8 @@ fn previous_tab(tab: Tab) -> Tab {
 }
 
 fn centered_rect_max(max_width: u16, max_height: u16, area: Rect) -> Rect {
-    let width = max_width.min(area.width.saturating_sub(4)).max(20);
-    let height = max_height.min(area.height.saturating_sub(2)).max(5);
+    let width = max_width.min(area.width.saturating_sub(4).max(1));
+    let height = max_height.min(area.height.saturating_sub(2).max(1));
     Rect {
         x: area.x + area.width.saturating_sub(width) / 2,
         y: area.y + area.height.saturating_sub(height) / 2,
@@ -1586,6 +1993,40 @@ fn centered_rect_max(max_width: u16, max_height: u16, area: Rect) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_app() -> App {
+        App {
+            project_dir: Some(PathBuf::from("/project")),
+            package_name: "test".to_string(),
+            package_version: "0.1.0".to_string(),
+            rows: Vec::new(),
+            tab: Tab::Dependencies,
+            selected: 0,
+            search_selected: 0,
+            ref_choice_selected: 0,
+            readme_scroll: 0,
+            detail_readme_scroll: 0,
+            graph_scroll: 0,
+            local_readme: String::new(),
+            local_license: String::new(),
+            status: String::new(),
+            input: String::new(),
+            readme_url: String::new(),
+            readme: String::new(),
+            input_mode: InputMode::Normal,
+            action: None,
+            logs: Vec::new(),
+            log_scroll: 0,
+            follow_log: true,
+            log_visible: false,
+            command_rx: None,
+            command_running: false,
+            pending_reload: false,
+            focus: FocusRegion::DependencyList,
+            regions: Vec::new(),
+            quit: false,
+        }
+    }
 
     #[test]
     fn parse_github_url() {
@@ -1662,5 +2103,209 @@ license = "Apache-2.0"
         assert_eq!(read_local_license(&temp_dir), "Apache-2.0");
 
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn header_tab_at_matches_rendered_titles() {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 3,
+        };
+
+        assert_eq!(header_tab_at(area, 1), Some(Tab::Dependencies));
+        assert_eq!(header_tab_at(area, 17), Some(Tab::Graph));
+        assert_eq!(header_tab_at(area, 25), Some(Tab::Search));
+        assert_eq!(header_tab_at(area, 15), None);
+    }
+
+    #[test]
+    fn tab_mouse_release_does_not_focus_header() {
+        let mut app = test_app();
+        app.regions.push((
+            FocusRegion::Header,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 40,
+                height: 3,
+            },
+        ));
+
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                column: 17,
+                row: 1,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+
+        assert_eq!(app.focus, FocusRegion::DependencyList);
+    }
+
+    #[test]
+    fn tab_mouse_down_switches_tab_without_focusing_header() {
+        let mut app = test_app();
+        app.regions.push((
+            FocusRegion::Header,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 40,
+                height: 3,
+            },
+        ));
+
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 17,
+                row: 1,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+
+        assert_eq!(app.tab, Tab::Graph);
+        assert_eq!(app.focus, FocusRegion::Graph);
+    }
+
+    #[test]
+    fn start_tui_action_reveals_log() {
+        let mut app = test_app();
+
+        start_tui_action(&mut app, TuiAction::Install, Arc::new(|_, _| Ok(())));
+
+        assert!(app.log_visible);
+    }
+
+    #[test]
+    fn remove_confirm_enter_submits_action() {
+        let mut app = test_app();
+
+        handle_remove_confirm_key(&mut app, KeyCode::Enter, "demo".to_string());
+
+        assert_eq!(
+            app.action,
+            Some(TuiAction::Remove {
+                name: "demo".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn hiding_log_moves_focus_back_to_current_tab() {
+        let mut app = test_app();
+        app.focus = FocusRegion::CommandLog;
+        app.log_visible = true;
+
+        app.set_log_visible(false);
+
+        assert_eq!(app.focus, FocusRegion::DependencyList);
+    }
+
+    #[test]
+    fn add_tab_b_opens_builtin_plugin_dialog() {
+        let mut app = test_app();
+        app.tab = Tab::Search;
+
+        handle_normal_key(&mut app, KeyCode::Char('b'), KeyModifiers::NONE);
+
+        assert_eq!(app.input_mode, InputMode::BuiltinPlugins);
+    }
+
+    #[test]
+    fn builtin_plugin_dialog_enter_adds_selected_core_plugin() {
+        let mut app = test_app();
+        app.search_selected = 2;
+        app.input_mode = InputMode::BuiltinPlugins;
+
+        handle_builtin_plugins_key(&mut app, KeyCode::Enter);
+
+        assert_eq!(
+            app.action,
+            Some(TuiAction::AddPlugin {
+                url: BUILTIN_PLUGINS[2].to_string(),
+                tag: None,
+                rev: None,
+                branch: None,
+                bin: None,
+            })
+        );
+    }
+
+    #[test]
+    fn repo_add_can_choose_branch_before_submitting() {
+        let mut app = test_app();
+        app.readme_url = "https://github.com/nushell/nu_scripts".to_string();
+
+        handle_normal_key(&mut app, KeyCode::Char('m'), KeyModifiers::NONE);
+        assert_eq!(
+            app.input_mode,
+            InputMode::ChooseRef {
+                target: AddTarget::Module {
+                    url: "https://github.com/nushell/nu_scripts".to_string()
+                }
+            }
+        );
+
+        handle_ref_choice_key(
+            &mut app,
+            KeyCode::Char('b'),
+            AddTarget::Module {
+                url: "https://github.com/nushell/nu_scripts".to_string(),
+            },
+        );
+        app.input = "main".to_string();
+        handle_ref_value_key(
+            &mut app,
+            KeyCode::Enter,
+            AddTarget::Module {
+                url: "https://github.com/nushell/nu_scripts".to_string(),
+            },
+            RefInputKind::Branch,
+        );
+
+        assert_eq!(
+            app.action,
+            Some(TuiAction::AddModule {
+                url: "https://github.com/nushell/nu_scripts".to_string(),
+                tag: None,
+                rev: None,
+                branch: Some("main".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn ref_choice_dialog_supports_jk_navigation_and_enter() {
+        let mut app = test_app();
+        let target = AddTarget::Plugin {
+            url: "https://github.com/nushell/nu_plugin_inc".to_string(),
+        };
+
+        handle_ref_choice_key(&mut app, KeyCode::Char('j'), target.clone());
+        handle_ref_choice_key(&mut app, KeyCode::Char('j'), target.clone());
+
+        assert_eq!(app.ref_choice_selected, 2);
+
+        handle_ref_choice_key(&mut app, KeyCode::Char('k'), target.clone());
+
+        assert_eq!(app.ref_choice_selected, 1);
+
+        handle_ref_choice_key(&mut app, KeyCode::Enter, target);
+
+        assert_eq!(
+            app.input_mode,
+            InputMode::AddRefValue {
+                target: AddTarget::Plugin {
+                    url: "https://github.com/nushell/nu_plugin_inc".to_string(),
+                },
+                ref_kind: RefInputKind::Tag,
+            }
+        );
     }
 }
