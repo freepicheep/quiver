@@ -176,10 +176,10 @@ fn cmd_init(
     nu_version: Option<String>,
     description: Option<String>,
 ) -> Result<()> {
-    let nupackage_toml = dir.join("nupackage.toml");
-    if nupackage_toml.exists() {
+    let manifest_path = dir.join("nupackage.nuon");
+    if manifest_path.exists() {
         return Err(error::QuiverError::Manifest(
-            "nupackage.toml already exists in this directory".to_string(),
+            "nupackage.nuon already exists in this directory".to_string(),
         ));
     }
 
@@ -210,9 +210,9 @@ fn cmd_init(
         dependencies: Default::default(),
     };
 
-    let content = manifest.to_toml_string()?;
-    std::fs::write(&nupackage_toml, content)?;
-    eprintln!("Created nupackage.toml for '{pkg_name}'");
+    let content = manifest.to_nuon_string();
+    std::fs::write(&manifest_path, content)?;
+    eprintln!("Created nupackage.nuon for '{pkg_name}'");
 
     // Create <current-dir-name>/mod.nu if it doesn't exist.
     let module_dir_name = dir
@@ -320,7 +320,7 @@ fn cmd_add(
     // Check if already added
     if manifest.dependencies.modules.contains_key(&pkg_name) {
         return Err(error::QuiverError::Manifest(format!(
-            "dependency '{pkg_name}' already exists in nupackage.toml"
+            "dependency '{pkg_name}' already exists in nupackage.nuon"
         )));
     }
 
@@ -334,10 +334,10 @@ fn cmd_add(
         .dependencies
         .modules
         .insert(pkg_name.clone(), dep_spec);
-    let content = manifest.to_toml_string()?;
-    std::fs::write(dir.join("nupackage.toml"), content)?;
+    let content = manifest.to_nuon_string();
+    std::fs::write(dir.join("nupackage.nuon"), content)?;
 
-    ui::success(format!("Added module '{pkg_name}' to nupackage.toml"));
+    ui::success(format!("Added module '{pkg_name}' to nupackage.nuon"));
 
     // Run install
     installer::install_with_options(dir, false, false, false, false)
@@ -362,7 +362,7 @@ fn cmd_add_plugin(
             .contains_key(&core_plugin_name)
         {
             return Err(error::QuiverError::Manifest(format!(
-                "plugin dependency '{core_plugin_name}' already exists in nupackage.toml"
+                "plugin dependency '{core_plugin_name}' already exists in nupackage.nuon"
             )));
         }
 
@@ -379,10 +379,10 @@ fn cmd_add_plugin(
             .dependencies
             .plugins
             .insert(core_plugin_name.clone(), dep_spec);
-        let content = manifest.to_toml_string()?;
-        std::fs::write(dir.join("nupackage.toml"), content)?;
+        let content = manifest.to_nuon_string();
+        std::fs::write(dir.join("nupackage.nuon"), content)?;
         ui::success(format!(
-            "Added core plugin '{core_plugin_name}' to nupackage.toml"
+            "Added core plugin '{core_plugin_name}' to nupackage.nuon"
         ));
         return installer::install_with_options(dir, false, false, false, true);
     }
@@ -405,7 +405,7 @@ fn cmd_add_plugin(
 
     if manifest.dependencies.plugins.contains_key(&pkg_name) {
         return Err(error::QuiverError::Manifest(format!(
-            "plugin dependency '{pkg_name}' already exists in nupackage.toml"
+            "plugin dependency '{pkg_name}' already exists in nupackage.nuon"
         )));
     }
 
@@ -458,9 +458,9 @@ fn cmd_add_plugin(
         .dependencies
         .plugins
         .insert(pkg_name.clone(), dep_spec);
-    let content = manifest.to_toml_string()?;
-    std::fs::write(dir.join("nupackage.toml"), content)?;
-    ui::success(format!("Added plugin '{pkg_name}' to nupackage.toml"));
+    let content = manifest.to_nuon_string();
+    std::fs::write(dir.join("nupackage.nuon"), content)?;
+    ui::success(format!("Added plugin '{pkg_name}' to nupackage.nuon"));
 
     installer::install_with_options(dir, false, false, false, true)
 }
@@ -622,9 +622,9 @@ fn cmd_remove(dir: &Path, name: String) -> Result<()> {
     // Try removing as a module first
     if manifest.dependencies.modules.remove(&name).is_some() {
         // Write updated manifest
-        let content = manifest.to_toml_string()?;
-        std::fs::write(dir.join("nupackage.toml"), content)?;
-        ui::success(format!("Removed module '{name}' from nupackage.toml"));
+        let content = manifest.to_nuon_string();
+        std::fs::write(dir.join("nupackage.nuon"), content)?;
+        ui::success(format!("Removed module '{name}' from nupackage.nuon"));
 
         // Remove from .nu-env/modules/
         let module_dir = dir.join(".nu-env").join("modules").join(&name);
@@ -648,9 +648,9 @@ fn cmd_remove(dir: &Path, name: String) -> Result<()> {
         }
     } else if let Some(plugin_spec) = manifest.dependencies.plugins.remove(&name) {
         // Removing a plugin dependency
-        let content = manifest.to_toml_string()?;
-        std::fs::write(dir.join("nupackage.toml"), content)?;
-        ui::success(format!("Removed plugin '{name}' from nupackage.toml"));
+        let content = manifest.to_nuon_string();
+        std::fs::write(dir.join("nupackage.nuon"), content)?;
+        ui::success(format!("Removed plugin '{name}' from nupackage.nuon"));
 
         // Remove plugin binary symlink from .nu-env/bin/
         let bin_name = plugin_spec.bin.as_deref().unwrap_or(&name);
@@ -678,7 +678,7 @@ fn cmd_remove(dir: &Path, name: String) -> Result<()> {
         }
     } else {
         return Err(error::QuiverError::Manifest(format!(
-            "dependency '{name}' not found in nupackage.toml"
+            "dependency '{name}' not found in nupackage.nuon"
         )));
     }
 
@@ -906,8 +906,8 @@ fn write_qvx_manifest(
             plugins: HashMap::new(),
         },
     };
-    let content = manifest.to_toml_string()?;
-    let path = env_dir.join("nupackage.toml");
+    let content = manifest.to_nuon_string();
+    let path = env_dir.join("nupackage.nuon");
     let should_write = std::fs::read_to_string(&path)
         .map(|existing| existing != content)
         .unwrap_or(true);
@@ -1094,12 +1094,12 @@ $env.config.hooks.env_change.PWD = (
         let after = ($after | default "")
 
         # Remove previous directory's modules if it was a quiver project
-        if ($before | is-not-empty) and ($before | path join "nupackage.toml" | path exists) {
+        if ($before | is-not-empty) and ($before | path join "nupackage.nuon" | path exists) {
             let old_modules = ($before | path join ".nu-env" "modules")
             $env.NU_LIB_DIRS = ($env.NU_LIB_DIRS | default [] | where {|it| $it != $old_modules })
         }
         # Add new directory's modules if it is a quiver project
-        if ($after | is-not-empty) and ($after | path join "nupackage.toml" | path exists) {
+        if ($after | is-not-empty) and ($after | path join "nupackage.nuon" | path exists) {
             let new_modules = ($after | path join ".nu-env" "modules")
             if ($new_modules | path exists) and ($new_modules not-in ($env.NU_LIB_DIRS | default [])) {
                 $env.NU_LIB_DIRS = ($env.NU_LIB_DIRS | default [] | append $new_modules)
@@ -2230,8 +2230,8 @@ sha256 = "bbb"
         let nested = root.join("examples").join("demo");
         std::fs::create_dir_all(&nested).unwrap();
         std::fs::write(
-            root.join("nupackage.toml"),
-            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+            root.join("nupackage.nuon"),
+            r#"{ package: { name: "demo", version: "0.1.0" } }"#,
         )
         .unwrap();
         std::fs::create_dir_all(root.join(".nu-env")).unwrap();
@@ -2260,7 +2260,7 @@ sha256 = "bbb"
             .and_then(|n| n.to_str())
             .unwrap()
             .to_string();
-        assert!(project_dir.join("nupackage.toml").exists());
+        assert!(project_dir.join("nupackage.nuon").exists());
         assert!(project_dir.join(&dir_name).join("mod.nu").exists());
         assert!(!project_dir.join("mod.nu").exists());
 
@@ -2293,13 +2293,13 @@ sha256 = "bbb"
 
         cmd_init(&project_dir, None, "0.1.0".to_string(), None, None).unwrap();
 
-        let manifest_text = std::fs::read_to_string(project_dir.join("nupackage.toml")).unwrap();
+        let manifest_text = std::fs::read_to_string(project_dir.join("nupackage.nuon")).unwrap();
         let manifest = Manifest::from_str(&manifest_text).unwrap();
         assert_eq!(
             manifest.package.authors,
             Some(vec!["Alice Example".to_string()])
         );
-        assert!(manifest_text.contains("authors = [\"Alice Example\"]"));
+        assert!(manifest_text.contains("authors: [\"Alice Example\"]"));
 
         let _ = std::fs::remove_dir_all(project_dir);
         let _ = std::fs::remove_dir_all(git_dir);
@@ -2312,10 +2312,10 @@ sha256 = "bbb"
 
         cmd_init(&project_dir, None, "0.1.0".to_string(), None, None).unwrap();
 
-        let manifest_text = std::fs::read_to_string(project_dir.join("nupackage.toml")).unwrap();
+        let manifest_text = std::fs::read_to_string(project_dir.join("nupackage.nuon")).unwrap();
         let manifest = Manifest::from_str(&manifest_text).unwrap();
         assert_eq!(manifest.package.authors, None);
-        assert!(!manifest_text.contains("authors ="));
+        assert!(!manifest_text.contains("authors:"));
 
         let _ = std::fs::remove_dir_all(project_dir);
         let _ = std::fs::remove_dir_all(git_dir);
@@ -2335,7 +2335,7 @@ sha256 = "bbb"
         )
         .unwrap();
 
-        let manifest_text = std::fs::read_to_string(project_dir.join("nupackage.toml")).unwrap();
+        let manifest_text = std::fs::read_to_string(project_dir.join("nupackage.nuon")).unwrap();
         let manifest = Manifest::from_str(&manifest_text).unwrap();
         assert_eq!(manifest.package.name, "custom-module-name");
 
@@ -2372,7 +2372,7 @@ sha256 = "bbb"
         )
         .unwrap();
 
-        let manifest_text = std::fs::read_to_string(project_dir.join("nupackage.toml")).unwrap();
+        let manifest_text = std::fs::read_to_string(project_dir.join("nupackage.nuon")).unwrap();
         let manifest = Manifest::from_str(&manifest_text).unwrap();
         assert_eq!(
             manifest.package.nu_version.as_deref(),

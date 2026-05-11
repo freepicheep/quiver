@@ -308,10 +308,10 @@ impl App {
                 graph_scroll: 0,
                 local_readme: String::new(),
                 local_license: String::new(),
-                status: "Run qv init to create nupackage.toml, or q to quit.".to_string(),
+                status: "Run qv init to create nupackage.nuon, or q to quit.".to_string(),
                 input: String::new(),
                 readme_url: String::new(),
-                readme: "No nupackage.toml was found in this directory or its parents.".to_string(),
+                readme: "No nupackage.nuon was found in this directory or its parents.".to_string(),
                 input_mode: InputMode::Normal,
                 action: None,
                 logs: vec![LogLine::Plain(
@@ -1921,8 +1921,8 @@ fn read_local_readme(dist_info_dir: &Path) -> String {
 }
 
 fn read_local_license(dist_info_dir: &Path) -> String {
-    let nupackage = dist_info_dir.join("nupackage.toml");
-    if let Ok(content) = std::fs::read_to_string(&nupackage) {
+    let manifest_path = dist_info_dir.join("nupackage.nuon");
+    if let Ok(content) = std::fs::read_to_string(&manifest_path) {
         if let Ok(manifest) = crate::manifest::Manifest::from_str(&content) {
             if let Some(license) = manifest.package.license {
                 let trimmed = license.trim();
@@ -2092,12 +2092,8 @@ mod tests {
         assert_eq!(read_local_license(&temp_dir), "MIT");
 
         std::fs::write(
-            temp_dir.join("nupackage.toml"),
-            r#"[package]
-name = "test"
-version = "0.1.0"
-license = "Apache-2.0"
-"#,
+            temp_dir.join("nupackage.nuon"),
+            r#"{ package: { name: "test", version: "0.1.0", license: "Apache-2.0" } }"#,
         )
         .unwrap();
         assert_eq!(read_local_license(&temp_dir), "Apache-2.0");

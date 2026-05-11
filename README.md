@@ -49,7 +49,7 @@ cargo install --git https://github.com/freepicheep/quiver
 
 A Quiver project is a directory containing:
 
-- **`nupackage.toml`** - declares package metadata and dependencies
+- **`nupackage.nuon`** - declares package metadata and dependencies
 - **`<project-dir-name>/mod.nu`** - the Nushell module entry point
 - **`quiver.lock`** - auto-generated lockfile pinning exact commits (commit this to version control)
 
@@ -89,7 +89,7 @@ qv add-plugin fdncred/nu_plugin_file --tag v0.22.0 --bin nu_plugin_file
 # Add a Nushell core plugin dependency by alias/name
 qv add-plugin polars
 
-# Install all dependencies from nupackage.toml
+# Install all dependencies from nupackage.nuon
 qv install
 
 # Run a Nushell script with quiver's environment (including any plugins)
@@ -114,7 +114,7 @@ qv update
 # Remove a dependency
 qv remove nu-salesforce
 
-# List installed dependencies (project-local if nupackage.toml exists, otherwise global)
+# List installed dependencies (project-local if nupackage.nuon exists, otherwise global)
 qv list
 
 # Generate editor LSP configuration (for helix and zed currently)
@@ -141,7 +141,7 @@ qvx --rev a3f9c12 freepicheep/nu-doc-gen generate-doc-site nu-salesforce .
 qvx --nu-version ">=0.109,<0.111" freepicheep/nu-doc-gen generate-doc-site nu-salesforce .
 ```
 
-The first argument is the module source (`owner/repo` shorthand or a git URL). The second argument is the command exported by that module. Everything after the command is passed through to the command. If `--nu-version` is supplied, qvx uses that Nushell version requirement for the ephemeral environment. Otherwise, if the remote module has a `nupackage.toml` with `package.nu-version`, qvx reuses that requirement. Internally, Quiver creates a cached ephemeral environment, installs the module there, starts the environment's Nu binary with that environment, and runs a generated wrapper equivalent to:
+The first argument is the module source (`owner/repo` shorthand or a git URL). The second argument is the command exported by that module. Everything after the command is passed through to the command. If `--nu-version` is supplied, qvx uses that Nushell version requirement for the ephemeral environment. Otherwise, if the remote module has a `nupackage.nuon` with `package.nu-version`, qvx reuses that requirement. Internally, Quiver creates a cached ephemeral environment, installs the module there, starts the environment's Nu binary with that environment, and runs a generated wrapper equivalent to:
 
 ```nushell
 use nu-doc-gen *
@@ -191,22 +191,27 @@ This generates:
 - **Helix**: `.helix/languages.toml` with a `nu-lsp` language server entry
 - **Zed**: `.zed/settings.json` with a `nu` language server binary config
 
-## nupackage.toml
+## nupackage.nuon
 
-```toml
-[package]
-name = "my-module"
-version = "0.1.0"
-description = "a wonderful nu module anyone can use"
-
-[dependencies.modules]
-nu-utils = { git = "https://github.com/user/nu-utils", tag = "v1.0.0" }
-other-lib = { git = "https://github.com/user/other-lib", branch = "main" }
-pinned = { git = "https://github.com/user/pinned", rev = "a3f9c12" }
-
-[dependencies.plugins]
-nu_plugin_inc = { git = "https://github.com/nushell/nu_plugin_inc", tag = "v0.91.0", bin = "nu_plugin_inc" }
-nu_plugin_polars = { source = "nu-core", bin = "nu_plugin_polars" }
+```nuon
+{
+  package: {
+    name: "my-module",
+    version: "0.1.0",
+    description: "a wonderful nu module anyone can use",
+  },
+  dependencies: {
+    modules: {
+      nu-utils: { git: "https://github.com/user/nu-utils", tag: "v1.0.0" },
+      other-lib: { git: "https://github.com/user/other-lib", branch: "main" },
+      pinned: { git: "https://github.com/user/pinned", rev: "a3f9c12" },
+    },
+    plugins: {
+      nu_plugin_inc: { git: "https://github.com/nushell/nu_plugin_inc", tag: "v0.91.0", bin: "nu_plugin_inc" },
+      nu_plugin_polars: { source: "nu-core", bin: "nu_plugin_polars" },
+    },
+  },
+}
 ```
 
 Module dependencies must specify exactly one of `tag`, `branch`, or `rev`.
@@ -218,10 +223,10 @@ Plugin dependencies support either:
 
 | Command | Description |
 |---------|-------------|
-| `qv init` | Create a new `nupackage.toml`, scaffold `<project-dir-name>/mod.nu`, and set up `.nu-env/` (supports `--nu-version`) |
+| `qv init` | Create a new `nupackage.nuon`, scaffold `<project-dir-name>/mod.nu`, and set up `.nu-env/` (supports `--nu-version`) |
 | `qv add <source>` | Add a module dependency from a URL or owner/repo shorthand (auto-detects latest tag) |
 | `qv add-plugin <source>` | Add a plugin dependency from git or Nushell core plugin alias/name |
-| `qv install` | Install dependencies from `nupackage.toml` and generate `.nu-env/` virtual environment |
+| `qv install` | Install dependencies from `nupackage.nuon` and generate `.nu-env/` virtual environment |
 | `qv install -g` | Install global dependencies from `~/.config/quiver/config.toml` |
 | `qv install --frozen` | Install from lockfile only (CI-friendly) |
 | `qv update` | Re-resolve all dependencies |

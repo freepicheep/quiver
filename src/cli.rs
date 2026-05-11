@@ -71,7 +71,7 @@ struct QvxCli {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
-    /// Create a new nupackage.toml in the current directory
+    /// Create a new nupackage.nuon in the current directory
     Init {
         /// Package name (defaults to current directory name)
         #[arg(long)]
@@ -90,7 +90,7 @@ pub enum Commands {
         description: Option<String>,
     },
 
-    /// Resolve and install dependencies from nupackage.toml
+    /// Resolve and install dependencies from nupackage.nuon
     Install {
         /// Install global modules (from ~/.config/quiver/config.toml)
         #[arg(short = 'g', long)]
@@ -114,7 +114,7 @@ pub enum Commands {
 
     /// Add a module dependency from a git URL or owner/repo shorthand
     Add {
-        /// Add to global config instead of local nupackage.toml
+        /// Add to global config instead of local nupackage.nuon
         #[arg(short = 'g', long)]
         global: bool,
 
@@ -136,7 +136,7 @@ pub enum Commands {
 
     /// Add a plugin dependency from a git URL or owner/repo shorthand
     AddPlugin {
-        /// Add to global config instead of local nupackage.toml
+        /// Add to global config instead of local nupackage.nuon
         #[arg(short = 'g', long)]
         global: bool,
 
@@ -160,10 +160,10 @@ pub enum Commands {
         bin: Option<String>,
     },
 
-    /// Remove a module dependency from nupackage.toml and .nu_modules/
+    /// Remove a module dependency from nupackage.nuon and .nu_modules/
     #[command(visible_alias = "rm")]
     Remove {
-        /// Remove from global config instead of local nupackage.toml
+        /// Remove from global config instead of local nupackage.nuon
         #[arg(short = 'g', long)]
         global: bool,
 
@@ -171,7 +171,7 @@ pub enum Commands {
         name: String,
     },
 
-    /// List installed dependencies (project-local if nupackage.toml exists, otherwise global modules)
+    /// List installed dependencies (project-local if nupackage.nuon exists, otherwise global modules)
     #[command(visible_alias = "ls")]
     List,
 
