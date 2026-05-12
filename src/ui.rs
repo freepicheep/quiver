@@ -45,7 +45,7 @@ fn capture_line(kind: LogKind, message: String) -> bool {
     })
 }
 
-fn is_capturing() -> bool {
+pub fn is_capturing() -> bool {
     LOG_CAPTURE.with(|capture| capture.borrow().is_some())
 }
 

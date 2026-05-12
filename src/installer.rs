@@ -2279,6 +2279,12 @@ fn install_plugin(
                 ));
             }
             ensure_cargo_available(&plugin.name)?;
+            if ui::is_capturing() {
+                return Err(crate::error::QuiverError::Other(format!(
+                    "release install for plugin '{}' failed; run `qv install` outside the TUI to approve a cargo build fallback",
+                    plugin.name
+                )));
+            }
             if !prompt_for_cargo_fallback_approval(plugin, &err)? {
                 return Err(crate::error::QuiverError::Other(format!(
                     "release install for plugin '{}' failed and cargo fallback build was denied by user",

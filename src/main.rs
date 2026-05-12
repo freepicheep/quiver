@@ -247,7 +247,7 @@ fn cmd_init(
 
     let content = manifest.to_nuon_string();
     std::fs::write(&manifest_path, content)?;
-    eprintln!("Created nupackage.nuon for '{pkg_name}'");
+    ui::success(format!("Created nupackage.nuon for '{pkg_name}'"));
 
     // Create <current-dir-name>/mod.nu if it doesn't exist.
     let module_dir_name = dir
@@ -267,7 +267,7 @@ fn cmd_init(
 # Set up your lsp with `qv lsp`
 "#,
         )?;
-        eprintln!("Created {}", mod_nu.display());
+        ui::success(format!("Created {}", mod_nu.display()));
     }
 
     // Generate .nu-env/ with activate.nu, config.nu, and bin/nu symlink
@@ -288,7 +288,7 @@ fn ensure_gitignore_ignores_nu_env(dir: &Path) -> Result<()> {
 
     if !gitignore_path.exists() {
         std::fs::write(&gitignore_path, format!("{ignore_entry}\n"))?;
-        eprintln!("Created .gitignore");
+        ui::success("Created .gitignore");
         return Ok(());
     }
 
@@ -307,7 +307,7 @@ fn ensure_gitignore_ignores_nu_env(dir: &Path) -> Result<()> {
     updated.push_str(ignore_entry);
     updated.push('\n');
     std::fs::write(&gitignore_path, updated)?;
-    eprintln!("Updated .gitignore with .nu-env/");
+    ui::success("Updated .gitignore with .nu-env/");
 
     Ok(())
 }
