@@ -259,16 +259,17 @@ fn warn_if_legacy_toml_config(nuon_path: &Path) {
     let toml_path = nuon_path.with_extension("toml");
     if toml_path.exists() {
         ui::warn("config.toml detected but quiver now requires config.nuon. Migrate with:");
-        eprintln!();
-        eprintln!(
+        ui::plain(format!(
             "  open {} | to nuon --indent 2 | save -f {}",
             toml_path.display(),
             nuon_path.display()
-        );
-        eprintln!("  rm {}", toml_path.display());
-        eprintln!("  rm {}", nuon_path.with_file_name("config.lock").display());
-        eprintln!("  qv install -g");
-        eprintln!();
+        ));
+        ui::plain(format!("  rm {}", toml_path.display()));
+        ui::plain(format!(
+            "  rm {}",
+            nuon_path.with_file_name("config.lock").display()
+        ));
+        ui::plain("  qv install -g");
     }
 }
 

@@ -191,8 +191,17 @@ fn cmd_tui(cwd: &Path, global: bool) -> Result<()> {
 }
 
 fn require_project_dir(start: &Path) -> Result<PathBuf> {
-    Manifest::find_project_dir(start)
-        .ok_or_else(|| error::QuiverError::NoManifest(start.to_path_buf()))
+    if let Some(dir) = Manifest::find_project_dir(start) {
+        return Ok(dir);
+    }
+    if let Some(dir) = start
+        .ancestors()
+        .find(|d| d.join("nupackage.toml").exists())
+    {
+        manifest::warn_if_legacy_toml_manifest(dir);
+        return Err(error::QuiverError::NoManifest(dir.to_path_buf()));
+    }
+    Err(error::QuiverError::NoManifest(start.to_path_buf()))
 }
 
 fn cmd_init(

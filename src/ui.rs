@@ -49,6 +49,13 @@ fn is_capturing() -> bool {
     LOG_CAPTURE.with(|capture| capture.borrow().is_some())
 }
 
+pub fn plain(message: impl AsRef<str>) {
+    let message = message.as_ref();
+    if !capture_line(LogKind::Info, message.to_string()) {
+        eprintln!("{}", message);
+    }
+}
+
 pub fn info(message: impl AsRef<str>) {
     let message = message.as_ref();
     if !capture_line(LogKind::Info, message.to_string()) {

@@ -200,6 +200,16 @@ impl PluginDependencySpec {
     }
 }
 
+pub(crate) fn warn_if_legacy_toml_manifest(dir: &Path) {
+    if dir.join("nupackage.toml").exists() {
+        ui::warn("nupackage.toml detected but quiver now requires nupackage.nuon. Migrate with:");
+        ui::plain("  open nupackage.toml | to nuon --indent 2 | save -f nupackage.nuon");
+        ui::plain("  rm nupackage.toml");
+        ui::plain("  rm quiver.lock");
+        ui::plain("  qv install");
+    }
+}
+
 fn validate_ref_fields(
     name: &str,
     kind: &str,
@@ -235,17 +245,7 @@ impl Manifest {
     pub fn from_dir(dir: &Path) -> Result<Self> {
         let path = dir.join(MANIFEST_FILE_NAME);
         if !path.exists() {
-            if dir.join("nupackage.toml").exists() {
-                ui::warn(
-                    "nupackage.toml detected but quiver now requires nupackage.nuon. Migrate with:",
-                );
-                eprintln!();
-                eprintln!("  open nupackage.toml | to nuon --indent 2 | save -f nupackage.nuon");
-                eprintln!("  rm nupackage.toml");
-                eprintln!("  rm quiver.lock");
-                eprintln!("  qv install");
-                eprintln!();
-            }
+            warn_if_legacy_toml_manifest(dir);
             return Err(QuiverError::NoManifest(dir.to_path_buf()));
         }
         let content = std::fs::read_to_string(&path)?;
