@@ -69,6 +69,7 @@ static MARKDOWN_THEME: LazyLock<MarkdownTheme> = LazyLock::new(|| TERMINAL);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TuiAction {
+    Init,
     Install,
     Update,
     Remove {
@@ -105,6 +106,7 @@ const HEADER_TABS: [(Tab, &str); 3] = [
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum InputMode {
     Normal,
+    ConfirmInit,
     AddUrl,
     BuiltinPlugins,
     ChooseRef {
@@ -192,6 +194,7 @@ enum FocusRegion {
 }
 
 struct App {
+    cwd: PathBuf,
     project_dir: Option<PathBuf>,
     package_name: String,
     package_version: String,
@@ -295,6 +298,7 @@ impl App {
     fn load(cwd: &Path) -> Result<Self> {
         let Some(project_dir) = Manifest::find_project_dir(cwd) else {
             return Ok(Self {
+                cwd: cwd.to_path_buf(),
                 project_dir: None,
                 package_name: "No quiver project".to_string(),
                 package_version: String::new(),
@@ -308,11 +312,11 @@ impl App {
                 graph_scroll: 0,
                 local_readme: String::new(),
                 local_license: String::new(),
-                status: "Run qv init to create nupackage.nuon, or q to quit.".to_string(),
+                status: "No quiver project here. Enter creates one, Esc quits.".to_string(),
                 input: String::new(),
                 readme_url: String::new(),
                 readme: "No nupackage.nuon was found in this directory or its parents.".to_string(),
-                input_mode: InputMode::Normal,
+                input_mode: InputMode::ConfirmInit,
                 action: None,
                 logs: vec![LogLine::Plain(
                     "Open a quiver project to run commands here.".to_string(),
@@ -345,6 +349,7 @@ impl App {
             .unwrap_or_default();
 
         Ok(Self {
+            cwd: cwd.to_path_buf(),
             project_dir: Some(project_dir),
             package_name: manifest.package.name,
             package_version: manifest.package.version,
@@ -387,6 +392,10 @@ impl App {
     }
 
     fn reload(&mut self) -> Result<()> {
+        let just_initialized = self.project_dir.is_none();
+        if just_initialized {
+            self.project_dir = Manifest::find_project_dir(&self.cwd);
+        }
         let Some(project_dir) = self.project_dir.clone() else {
             return Ok(());
         };
@@ -399,6 +408,11 @@ impl App {
             self.selected = self.rows.len().saturating_sub(1);
         }
         reload_selected_dist_info(self);
+        if just_initialized {
+            self.readme =
+                "Paste a GitHub repository URL, then press Enter to preview its README."
+                    .to_string();
+        }
         Ok(())
     }
 
@@ -568,6 +582,7 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut App) {
     app.register_region(FocusRegion::Footer, shell[3]);
 
     match &app.input_mode {
+        InputMode::ConfirmInit => render_init_confirm(frame, app),
         InputMode::AddUrl => render_input(frame, app, "Paste GitHub repository URL"),
         InputMode::BuiltinPlugins => render_builtin_plugins_dialog(frame, app),
         InputMode::ChooseRef { target } => render_ref_choice(frame, app, target),
@@ -704,6 +719,7 @@ fn start_tui_action(
 impl TuiAction {
     fn label(&self) -> String {
         match self {
+            TuiAction::Init => "init".to_string(),
             TuiAction::Install => "install".to_string(),
             TuiAction::Update => "update".to_string(),
             TuiAction::Remove { name } => format!("remove {name}"),
@@ -1439,6 +1455,34 @@ fn render_confirm(frame: &mut ratatui::Frame<'_>, message: &str) {
     );
 }
 
+fn render_init_confirm(frame: &mut ratatui::Frame<'_>, app: &App) {
+    let dir = app.cwd.display().to_string();
+    let lines = vec![
+        Line::from("No quiver project found here."),
+        Line::from(Span::styled(
+            format!("Create one in {dir}?"),
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from("Enter — create    Esc — cancel"),
+    ];
+    let area = centered_rect_max(72, 6, frame.area());
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: false })
+            .block(
+                Block::default()
+                    .title("New quiver project")
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(focus_color())),
+            ),
+        area,
+    );
+}
+
 fn render_builtin_plugins_dialog(frame: &mut ratatui::Frame<'_>, app: &App) {
     let area = centered_rect_max(44, 12, frame.area());
     frame.render_widget(Clear, area);
@@ -1515,6 +1559,7 @@ fn ref_choice_label(choice: RefChoice) -> &'static str {
 fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
     match app.input_mode.clone() {
         InputMode::Normal => handle_normal_key(app, code, modifiers),
+        InputMode::ConfirmInit => handle_init_confirm_key(app, code),
         InputMode::AddUrl => handle_url_key(app, code),
         InputMode::BuiltinPlugins => handle_builtin_plugins_key(app, code),
         InputMode::ChooseRef { target } => handle_ref_choice_key(app, code, target),
@@ -1522,6 +1567,16 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
             handle_ref_value_key(app, code, target, ref_kind)
         }
         InputMode::ConfirmRemove { name } => handle_remove_confirm_key(app, code, name),
+    }
+}
+
+fn handle_init_confirm_key(app: &mut App, code: KeyCode) {
+    match code {
+        KeyCode::Enter => {
+            app.action = Some(TuiAction::Init);
+        }
+        KeyCode::Esc => app.quit = true,
+        _ => {}
     }
 }
 
@@ -1996,6 +2051,7 @@ mod tests {
 
     fn test_app() -> App {
         App {
+            cwd: PathBuf::from("/project"),
             project_dir: Some(PathBuf::from("/project")),
             package_name: "test".to_string(),
             package_version: "0.1.0".to_string(),
@@ -2274,6 +2330,44 @@ mod tests {
                 branch: Some("main".to_string()),
             })
         );
+    }
+
+    #[test]
+    fn load_without_project_opens_init_confirm_dialog() {
+        let temp = std::env::temp_dir().join("quiver_test_no_project_tui");
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+
+        let app = App::load(&temp).unwrap();
+
+        assert!(app.project_dir.is_none());
+        assert_eq!(app.input_mode, InputMode::ConfirmInit);
+
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn init_confirm_enter_submits_init_action() {
+        let mut app = test_app();
+        app.project_dir = None;
+        app.input_mode = InputMode::ConfirmInit;
+
+        handle_init_confirm_key(&mut app, KeyCode::Enter);
+
+        assert_eq!(app.action, Some(TuiAction::Init));
+        assert!(!app.quit);
+    }
+
+    #[test]
+    fn init_confirm_esc_quits_tui() {
+        let mut app = test_app();
+        app.project_dir = None;
+        app.input_mode = InputMode::ConfirmInit;
+
+        handle_init_confirm_key(&mut app, KeyCode::Esc);
+
+        assert!(app.quit);
+        assert!(app.action.is_none());
     }
 
     #[test]

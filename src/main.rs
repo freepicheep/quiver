@@ -129,6 +129,7 @@ fn cmd_tui(cwd: &Path) -> Result<()> {
     let tui_cwd = cwd.clone();
     tui::run(&tui_cwd, move |action, emit| {
         ui::capture_logs_stream(emit, || match action {
+            tui::TuiAction::Init => cmd_init(&cwd, None, "0.1.0".to_string(), None, None),
             tui::TuiAction::Install => {
                 let project_dir = require_project_dir(&cwd)?;
                 cmd_install(&project_dir, false, false, false)
