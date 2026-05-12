@@ -518,7 +518,7 @@ fn install_resolved_global(
             "To load quiver autoload files from {}, add this to config.nu:",
             global_autoload_dir_expression()
         ));
-        eprintln!("  {}", global_autoload_config_hint());
+        ui::info(format!("  {}", global_autoload_config_hint()));
     }
 
     Ok(())
