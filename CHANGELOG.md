@@ -1,5 +1,23 @@
 # Unreleased
 
+## Changed
+
+- **BREAKING**: The package manifest is now `nupackage.nuon` instead of `nupackage.toml`. The lockfile is also in `nuon` format. Existing projects must migrate:
+  ```nushell
+  open nupackage.toml | to nuon --indent 2 | save -f nupackage.nuon
+  rm nupackage.toml
+  rm quiver.lock
+  qv install
+  ```
+- **BREAKING**: The global Quiver config is now `config.nuon`. Navigate to your global quiver config dir and run the following to migrate:
+  ```nushell
+    open config.toml | to nuon --indent 2 | save -f config.nuon
+    rm config.toml
+    rm quiver.lock
+    qv install -g
+  ```
+- Quiver will warn users with migration instructions when a legacy `nupackage.toml` or `config.toml` is detected.
+
 # Version 0.6.1 (2026-05-08)
 
 ## Added
