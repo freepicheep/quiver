@@ -88,7 +88,11 @@ impl Lockfile {
             }
             out.push_str(&format!("      rev: {},\n", nuon_string(&pkg.rev)));
             if let Some(path) = &pkg.path {
-                out.push_str(&format!("      {}: {},\n", nuon_key("path"), nuon_string(path)));
+                out.push_str(&format!(
+                    "      {}: {},\n",
+                    nuon_key("path"),
+                    nuon_string(path)
+                ));
             }
             out.push_str(&format!("      sha256: {},\n", nuon_string(&pkg.sha256)));
             if let Some(asset_sha256) = &pkg.asset_sha256 {
