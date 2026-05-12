@@ -2015,7 +2015,9 @@ fn reload_selected_dist_info(app: &mut App) {
             .ok()
             .and_then(|cfg| cfg.modules_dir().ok())
     } else {
-        app.project_dir.clone()
+        app.project_dir
+            .as_deref()
+            .map(|dir| dir.join(".nu-env").join("modules"))
     };
     if let (Some(base_dir), Some(row)) = (base_dir, app.selected_row()) {
         let (readme, license) = load_dist_info_at(&base_dir, row);
