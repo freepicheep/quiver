@@ -1,8 +1,11 @@
 # Unreleased
 
+# Version 0.7.0 (2026-05-12)
+
 ## Added
 
 - Running `qv` in a non-project directory will open the TUI and offer to create a new quiver project. Previously it just showed the TUI without any helpful information.
+- Run `qv -g` to edit your global quiver dependencies in the TUI.
 
 ## Changed
 
@@ -21,6 +24,7 @@
     qv install -g
   ```
 - Quiver will warn users with migration instructions when a legacy `nupackage.toml` or `config.toml` is detected.
+- Updated the `Cargo.lock`. Among other things, this includes the most recent commits to [leaves](https://github.com/freepicheep/leaves) so Nu syntax highlighting in the TUI is better than ever.
 
 # Version 0.6.1 (2026-05-08)
 
