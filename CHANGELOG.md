@@ -1,5 +1,12 @@
 # Unreleased
 
+# Version 0.7.1 (2026-05-12)
+
+## Fixed
+
+- TUI was getting messed up with the log since I was using `eprintln!` instead of UI elements.
+- Fixed an issue where it wouldn't warn the user if a `nupackage.toml` was present.
+
 # Version 0.7.0 (2026-05-12)
 
 ## Added
