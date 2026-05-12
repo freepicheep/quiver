@@ -1,13 +1,13 @@
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-use crate::error::Result;
+use crate::error::{QuiverError, Result};
+use crate::manifest::{nu_value_to_json, nuon_key, nuon_string};
 
 /// The `quiver.lock` lockfile.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Lockfile {
     pub version: u32,
-    #[serde(rename = "package")]
     pub packages: Vec<LockedPackage>,
 }
 
@@ -56,22 +56,64 @@ impl Lockfile {
         Self::from_str(&content)
     }
 
-    /// Parse a lockfile from a TOML string.
+    /// Parse a lockfile from a NUON string.
     pub fn from_str(s: &str) -> Result<Self> {
-        Ok(toml::from_str(s)?)
+        let value = nuon::from_nuon(s, None)?;
+        let json = nu_value_to_json(value)?;
+        serde_json::from_value(json)
+            .map_err(|e| QuiverError::Lockfile(format!("invalid lockfile schema: {e}")))
     }
 
-    /// Serialize the lockfile to a TOML string with the header comment.
-    pub fn to_toml_string(&self) -> Result<String> {
-        let body = toml::to_string_pretty(self)?;
-        Ok(format!(
-            "# This file is generated automatically. Do not edit.\n{body}"
-        ))
+    /// Serialize the lockfile to a NUON string with the header comment.
+    pub fn to_nuon_string(&self) -> String {
+        let mut out = String::new();
+        out.push_str("# This file is generated automatically. Do not edit.\n");
+        out.push_str("{\n");
+        out.push_str(&format!("  version: {},\n", self.version));
+        out.push_str("  packages: [\n");
+        for pkg in &self.packages {
+            out.push_str("    {\n");
+            out.push_str(&format!("      name: {},\n", nuon_string(&pkg.name)));
+            if !LockedPackageKind::is_module(&pkg.kind) {
+                let kind_str = match pkg.kind {
+                    LockedPackageKind::Plugin => "plugin",
+                    LockedPackageKind::Other => "other",
+                    LockedPackageKind::Module => unreachable!(),
+                };
+                out.push_str(&format!("      kind: {},\n", nuon_string(kind_str)));
+            }
+            out.push_str(&format!("      git: {},\n", nuon_string(&pkg.git)));
+            if let Some(tag) = &pkg.tag {
+                out.push_str(&format!("      tag: {},\n", nuon_string(tag)));
+            }
+            out.push_str(&format!("      rev: {},\n", nuon_string(&pkg.rev)));
+            if let Some(path) = &pkg.path {
+                out.push_str(&format!(
+                    "      {}: {},\n",
+                    nuon_key("path"),
+                    nuon_string(path)
+                ));
+            }
+            out.push_str(&format!("      sha256: {},\n", nuon_string(&pkg.sha256)));
+            if let Some(asset_sha256) = &pkg.asset_sha256 {
+                out.push_str(&format!(
+                    "      asset_sha256: {},\n",
+                    nuon_string(asset_sha256)
+                ));
+            }
+            if let Some(asset_url) = &pkg.asset_url {
+                out.push_str(&format!("      asset_url: {},\n", nuon_string(asset_url)));
+            }
+            out.push_str("    },\n");
+        }
+        out.push_str("  ],\n");
+        out.push_str("}\n");
+        out
     }
 
     /// Write the lockfile to disk.
     pub fn write_to(&self, path: &Path) -> Result<()> {
-        let content = self.to_toml_string()?;
+        let content = self.to_nuon_string();
         std::fs::write(path, content)?;
         Ok(())
     }
@@ -137,9 +179,7 @@ mod tests {
     #[test]
     fn round_trip() {
         let lock = sample_lockfile();
-        let serialized = lock.to_toml_string().unwrap();
-
-        // The header comment is not part of the TOML data, strip it for parsing
+        let serialized = lock.to_nuon_string();
         let parsed = Lockfile::from_str(&serialized).unwrap();
         assert_eq!(lock, parsed);
     }
@@ -162,18 +202,22 @@ mod tests {
 
     #[test]
     fn parse_spec_format() {
-        let toml = r#"
+        let nuon = r#"
 # This file is generated automatically. Do not edit.
-version = 1
-
-[[package]]
-name = "nu-git-utils"
-git = "https://github.com/someuser/nu-git-utils"
-tag = "v0.2.0"
-rev = "d4e8f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8"
-sha256 = "abc123"
+{
+  version: 1,
+  packages: [
+    {
+      name: "nu-git-utils",
+      git: "https://github.com/someuser/nu-git-utils",
+      tag: "v0.2.0",
+      rev: "d4e8f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8",
+      sha256: "abc123",
+    },
+  ],
+}
 "#;
-        let lock = Lockfile::from_str(toml).unwrap();
+        let lock = Lockfile::from_str(nuon).unwrap();
         assert_eq!(lock.version, 1);
         assert_eq!(lock.packages.len(), 1);
         assert_eq!(lock.packages[0].name, "nu-git-utils");
@@ -182,39 +226,47 @@ sha256 = "abc123"
 
     #[test]
     fn parse_plugin_kind() {
-        let toml = r#"
-version = 1
-
-[[package]]
-name = "nu_plugin_inc"
-kind = "plugin"
-git = "https://github.com/nushell/nu_plugin_inc"
-tag = "v0.91.0"
-rev = "9a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b"
-path = "nu_plugin_inc"
-sha256 = "ghi789"
+        let nuon = r#"
+{
+  version: 1,
+  packages: [
+    {
+      name: "nu_plugin_inc",
+      kind: "plugin",
+      git: "https://github.com/nushell/nu_plugin_inc",
+      tag: "v0.91.0",
+      rev: "9a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b",
+      path: "nu_plugin_inc",
+      sha256: "ghi789",
+    },
+  ],
+}
 "#;
-        let lock = Lockfile::from_str(toml).unwrap();
+        let lock = Lockfile::from_str(nuon).unwrap();
         assert_eq!(lock.packages[0].kind, LockedPackageKind::Plugin);
     }
 
     #[test]
     fn parse_optional_asset_metadata() {
-        let toml = r#"
-version = 1
-
-[[package]]
-name = "nu_plugin_inc"
-kind = "plugin"
-git = "https://github.com/nushell/nu_plugin_inc"
-tag = "v0.91.0"
-rev = "9a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b"
-path = "nu_plugin_inc"
-sha256 = "ghi789"
-asset_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-asset_url = "https://example.com/nu_plugin_inc.tar.gz"
+        let nuon = r#"
+{
+  version: 1,
+  packages: [
+    {
+      name: "nu_plugin_inc",
+      kind: "plugin",
+      git: "https://github.com/nushell/nu_plugin_inc",
+      tag: "v0.91.0",
+      rev: "9a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b",
+      path: "nu_plugin_inc",
+      sha256: "ghi789",
+      asset_sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      asset_url: "https://example.com/nu_plugin_inc.tar.gz",
+    },
+  ],
+}
 "#;
-        let lock = Lockfile::from_str(toml).unwrap();
+        let lock = Lockfile::from_str(nuon).unwrap();
         assert_eq!(
             lock.packages[0].asset_sha256.as_deref(),
             Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
@@ -227,18 +279,22 @@ asset_url = "https://example.com/nu_plugin_inc.tar.gz"
 
     #[test]
     fn parse_unknown_kind_as_other() {
-        let toml = r#"
-version = 1
-
-[[package]]
-name = "future-artifact"
-kind = "futurekind"
-git = "https://github.com/someuser/future"
-tag = "v0.5.0"
-rev = "9a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b"
-sha256 = "ghi789"
+        let nuon = r#"
+{
+  version: 1,
+  packages: [
+    {
+      name: "future-artifact",
+      kind: "futurekind",
+      git: "https://github.com/someuser/future",
+      tag: "v0.5.0",
+      rev: "9a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b",
+      sha256: "ghi789",
+    },
+  ],
+}
 "#;
-        let lock = Lockfile::from_str(toml).unwrap();
+        let lock = Lockfile::from_str(nuon).unwrap();
         assert_eq!(lock.packages[0].kind, LockedPackageKind::Other);
     }
 }

@@ -21,17 +21,14 @@ pub enum QuiverError {
     #[error("config error: {0}")]
     Config(String),
 
-    #[error("no nupackage.toml found in {0}")]
+    #[error("no nupackage.nuon found in {0}")]
     NoManifest(PathBuf),
 
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 
-    #[error("toml parse error: {0}")]
-    TomlParse(#[from] toml::de::Error),
-
-    #[error("toml serialize error: {0}")]
-    TomlSerialize(#[from] toml::ser::Error),
+    #[error("nuon parse error: {0}")]
+    NuonParse(#[from] nu_protocol::ShellError),
 
     #[error("checksum source not found for asset '{asset}': {details}")]
     ChecksumSourceNotFound { asset: String, details: String },

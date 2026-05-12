@@ -1,12 +1,16 @@
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value as JsonValue};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::error::{QuiverError, Result};
 use crate::nu;
 use crate::safety;
+use crate::ui;
 
-/// The top-level `nupackage.toml` manifest.
+pub const MANIFEST_FILE_NAME: &str = "nupackage.nuon";
+
+/// The top-level `nupackage.nuon` manifest.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Manifest {
     pub package: Package,
@@ -14,7 +18,7 @@ pub struct Manifest {
     pub dependencies: DependencyGroups,
 }
 
-/// Dependency groups declared in `nupackage.toml`.
+/// Dependency groups declared in `nupackage.nuon`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct DependencyGroups {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
@@ -29,7 +33,7 @@ impl DependencyGroups {
     }
 }
 
-/// The `[package]` section of a manifest.
+/// The `package` section of a manifest.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Package {
     pub name: String,
@@ -44,7 +48,7 @@ pub struct Package {
     pub nu_version: Option<String>,
 }
 
-/// A single module dependency specification from `[dependencies.modules]`.
+/// A single module dependency specification from `dependencies.modules`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DependencySpec {
     pub git: String,
@@ -56,7 +60,7 @@ pub struct DependencySpec {
     pub branch: Option<String>,
 }
 
-/// A single plugin dependency specification from `[dependencies.plugins]`.
+/// A single plugin dependency specification from `dependencies.plugins`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PluginDependencySpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -95,18 +99,18 @@ impl DependencySpec {
             .expect("validated: one of tag/rev/branch is set")
     }
 
-    fn to_inline_toml(&self) -> Result<String> {
-        let mut parts = vec![format!("git = {}", toml_scalar(&self.git)?)];
+    pub(crate) fn to_inline_nuon(&self) -> String {
+        let mut parts = vec![format!("git: {}", nuon_string(&self.git))];
         if let Some(tag) = &self.tag {
-            parts.push(format!("tag = {}", toml_scalar(tag)?));
+            parts.push(format!("tag: {}", nuon_string(tag)));
         }
         if let Some(rev) = &self.rev {
-            parts.push(format!("rev = {}", toml_scalar(rev)?));
+            parts.push(format!("rev: {}", nuon_string(rev)));
         }
         if let Some(branch) = &self.branch {
-            parts.push(format!("branch = {}", toml_scalar(branch)?));
+            parts.push(format!("branch: {}", nuon_string(branch)));
         }
-        Ok(parts.join(", "))
+        parts.join(", ")
     }
 }
 
@@ -171,28 +175,28 @@ impl PluginDependencySpec {
             .expect("validated: one of tag/rev/branch is set")
     }
 
-    fn to_inline_toml(&self) -> Result<String> {
+    pub(crate) fn to_inline_nuon(&self) -> String {
         let source = self.source.as_deref().unwrap_or("git");
         let mut parts = Vec::new();
         if self.source.is_some() {
-            parts.push(format!("source = {}", toml_scalar(&source)?));
+            parts.push(format!("source: {}", nuon_string(&source)));
         }
         if source != "nu-core" {
-            parts.push(format!("git = {}", toml_scalar(&self.git)?));
+            parts.push(format!("git: {}", nuon_string(&self.git)));
         }
         if let Some(tag) = &self.tag {
-            parts.push(format!("tag = {}", toml_scalar(tag)?));
+            parts.push(format!("tag: {}", nuon_string(tag)));
         }
         if let Some(rev) = &self.rev {
-            parts.push(format!("rev = {}", toml_scalar(rev)?));
+            parts.push(format!("rev: {}", nuon_string(rev)));
         }
         if let Some(branch) = &self.branch {
-            parts.push(format!("branch = {}", toml_scalar(branch)?));
+            parts.push(format!("branch: {}", nuon_string(branch)));
         }
         if let Some(bin) = &self.bin {
-            parts.push(format!("bin = {}", toml_scalar(bin)?));
+            parts.push(format!("bin: {}", nuon_string(bin)));
         }
-        Ok(parts.join(", "))
+        parts.join(", ")
     }
 }
 
@@ -219,27 +223,41 @@ fn validate_ref_fields(
 }
 
 impl Manifest {
-    /// Find the nearest ancestor directory containing `nupackage.toml`.
+    /// Find the nearest ancestor directory containing `nupackage.nuon`.
     pub fn find_project_dir(start: &Path) -> Option<PathBuf> {
         start
             .ancestors()
-            .find(|dir| dir.join("nupackage.toml").exists())
+            .find(|dir| dir.join(MANIFEST_FILE_NAME).exists())
             .map(Path::to_path_buf)
     }
 
-    /// Read and parse a `nupackage.toml` from the given directory.
+    /// Read and parse a `nupackage.nuon` from the given directory.
     pub fn from_dir(dir: &Path) -> Result<Self> {
-        let path = dir.join("nupackage.toml");
+        let path = dir.join(MANIFEST_FILE_NAME);
         if !path.exists() {
+            if dir.join("nupackage.toml").exists() {
+                ui::warn(
+                    "nupackage.toml detected but quiver now requires nupackage.nuon. Migrate with:",
+                );
+                eprintln!();
+                eprintln!("  open nupackage.toml | to nuon --indent 2 | save -f nupackage.nuon");
+                eprintln!("  rm nupackage.toml");
+                eprintln!("  rm quiver.lock");
+                eprintln!("  qv install");
+                eprintln!();
+            }
             return Err(QuiverError::NoManifest(dir.to_path_buf()));
         }
         let content = std::fs::read_to_string(&path)?;
         Self::from_str(&content)
     }
 
-    /// Parse a manifest from a TOML string.
+    /// Parse a manifest from a NUON string.
     pub fn from_str(s: &str) -> Result<Self> {
-        let manifest: Manifest = toml::from_str(s)?;
+        let value = nuon::from_nuon(s, None)?;
+        let json = nu_value_to_json(value)?;
+        let manifest: Manifest = serde_json::from_value(json)
+            .map_err(|err| QuiverError::Manifest(format!("invalid manifest schema: {err}")))?;
         manifest.validate()?;
         Ok(manifest)
     }
@@ -277,76 +295,132 @@ impl Manifest {
         Ok(())
     }
 
-    /// Serialize this manifest to a TOML string.
-    pub fn to_toml_string(&self) -> Result<String> {
+    /// Serialize this manifest to a NUON string.
+    pub fn to_nuon_string(&self) -> String {
         let mut out = String::new();
-        out.push_str("[package]\n");
-        write_toml_field(&mut out, "name", &self.package.name)?;
-        write_toml_field(&mut out, "version", &self.package.version)?;
+        out.push_str("{\n");
+        out.push_str("  package: {\n");
+        write_nuon_field(&mut out, 4, "name", &self.package.name);
+        write_nuon_field(&mut out, 4, "version", &self.package.version);
         if let Some(description) = &self.package.description {
-            write_toml_field(&mut out, "description", description)?;
+            write_nuon_field(&mut out, 4, "description", description);
         }
         if let Some(license) = &self.package.license {
-            write_toml_field(&mut out, "license", license)?;
+            write_nuon_field(&mut out, 4, "license", license);
         }
         if let Some(authors) = &self.package.authors {
-            write_toml_field(&mut out, "authors", authors)?;
+            write_nuon_list_field(&mut out, 4, "authors", authors);
         }
         if let Some(nu_version) = &self.package.nu_version {
-            write_toml_field(&mut out, "nu-version", nu_version)?;
+            write_nuon_field(&mut out, 4, "nu-version", nu_version);
+        }
+        out.push_str("  },\n");
+
+        if !self.dependencies.is_empty() {
+            out.push_str("  dependencies: {\n");
         }
 
         if !self.dependencies.modules.is_empty() {
-            out.push_str("\n[dependencies.modules]\n");
+            out.push_str("    modules: {\n");
             let mut modules: Vec<_> = self.dependencies.modules.iter().collect();
             modules.sort_by(|a, b| a.0.cmp(b.0));
             for (name, spec) in modules {
                 out.push_str(&format!(
-                    "{} = {{ {} }}\n",
-                    bare_key_or_quoted(name),
-                    spec.to_inline_toml()?
+                    "      {}: {{ {} }},\n",
+                    nuon_key(name),
+                    spec.to_inline_nuon()
                 ));
             }
+            out.push_str("    },\n");
         }
 
         if !self.dependencies.plugins.is_empty() {
-            out.push_str("\n[dependencies.plugins]\n");
+            out.push_str("    plugins: {\n");
             let mut plugins: Vec<_> = self.dependencies.plugins.iter().collect();
             plugins.sort_by(|a, b| a.0.cmp(b.0));
             for (name, spec) in plugins {
                 out.push_str(&format!(
-                    "{} = {{ {} }}\n",
-                    bare_key_or_quoted(name),
-                    spec.to_inline_toml()?
+                    "      {}: {{ {} }},\n",
+                    nuon_key(name),
+                    spec.to_inline_nuon()
                 ));
             }
+            out.push_str("    },\n");
         }
 
-        Ok(out)
+        if !self.dependencies.is_empty() {
+            out.push_str("  },\n");
+        }
+        out.push_str("}\n");
+        out
     }
 }
 
-fn write_toml_field<T: Serialize>(out: &mut String, key: &str, value: &T) -> Result<()> {
-    out.push_str(key);
-    out.push_str(" = ");
-    out.push_str(&toml_scalar(value)?);
-    out.push('\n');
-    Ok(())
+fn write_nuon_field(out: &mut String, indent: usize, key: &str, value: &str) {
+    out.push_str(&" ".repeat(indent));
+    out.push_str(&nuon_key(key));
+    out.push_str(": ");
+    out.push_str(&nuon_string(value));
+    out.push_str(",\n");
 }
 
-fn toml_scalar<T: Serialize>(value: &T) -> Result<String> {
-    let serialized = toml::Value::try_from(value)?.to_string();
-    Ok(serialized)
+fn write_nuon_list_field(out: &mut String, indent: usize, key: &str, values: &[String]) {
+    out.push_str(&" ".repeat(indent));
+    out.push_str(&nuon_key(key));
+    out.push_str(": [");
+    for (idx, value) in values.iter().enumerate() {
+        if idx > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(&nuon_string(value));
+    }
+    out.push_str("],\n");
 }
 
-fn bare_key_or_quoted(key: &str) -> String {
+pub(crate) fn nuon_key(key: &str) -> String {
     let is_bare = key
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
     if is_bare {
         key.to_string()
     } else {
-        format!("\"{}\"", key.replace('\"', "\\\""))
+        nuon_string(key)
+    }
+}
+
+pub(crate) fn nuon_string(value: &str) -> String {
+    serde_json::to_string(value).expect("serializing a string cannot fail")
+}
+
+pub(crate) fn nu_value_to_json(value: nu_protocol::Value) -> Result<JsonValue> {
+    match value {
+        nu_protocol::Value::Bool { val, .. } => Ok(JsonValue::Bool(val)),
+        nu_protocol::Value::Int { val, .. } => Ok(JsonValue::Number(val.into())),
+        nu_protocol::Value::Float { val, .. } => serde_json::Number::from_f64(val)
+            .map(JsonValue::Number)
+            .ok_or_else(|| {
+                QuiverError::Manifest("manifest contains a non-finite float".to_string())
+            }),
+        nu_protocol::Value::String { val, .. } | nu_protocol::Value::Glob { val, .. } => {
+            Ok(JsonValue::String(val))
+        }
+        nu_protocol::Value::List { vals, .. } => vals
+            .into_iter()
+            .map(nu_value_to_json)
+            .collect::<Result<Vec<_>>>()
+            .map(JsonValue::Array),
+        nu_protocol::Value::Record { val, .. } => {
+            let mut object = Map::new();
+            for (key, value) in val.into_owned().into_iter() {
+                object.insert(key, nu_value_to_json(value)?);
+            }
+            Ok(JsonValue::Object(object))
+        }
+        nu_protocol::Value::Nothing { .. } => Ok(JsonValue::Null),
+        other => Err(QuiverError::Manifest(format!(
+            "unsupported NUON value in manifest: {}",
+            other.get_type()
+        ))),
     }
 }
 
@@ -368,21 +442,26 @@ mod tests {
 
     #[test]
     fn round_trip_parse_manifest() {
-        let toml = r#"
-[package]
-name = "my-module"
-version = "0.1.0"
-description = "Useful utilities"
-
-[dependencies.modules]
-nu-utils = { git = "https://github.com/someuser/nu-utils", tag = "v1.2.3" }
-nu-http = { git = "https://github.com/someuser/nu-http", branch = "main" }
-
-[dependencies.plugins]
-nu_plugin_inc = { git = "https://github.com/someuser/nu_plugin_inc", tag = "v0.8.0", bin = "nu_plugin_inc" }
+        let nuon = r#"
+{
+  package: {
+    name: "my-module",
+    version: "0.1.0",
+    description: "Useful utilities",
+  },
+  dependencies: {
+    modules: {
+      nu-utils: { git: "https://github.com/someuser/nu-utils", tag: "v1.2.3" },
+      nu-http: { git: "https://github.com/someuser/nu-http", branch: "main" },
+    },
+    plugins: {
+      nu_plugin_inc: { git: "https://github.com/someuser/nu_plugin_inc", tag: "v0.8.0", bin: "nu_plugin_inc" },
+    },
+  },
+}
 "#;
 
-        let manifest = Manifest::from_str(toml).unwrap();
+        let manifest = Manifest::from_str(nuon).unwrap();
         assert_eq!(manifest.package.name, "my-module");
         assert_eq!(manifest.package.version, "0.1.0");
         assert_eq!(manifest.dependencies.modules.len(), 2);
@@ -394,51 +473,45 @@ nu_plugin_inc = { git = "https://github.com/someuser/nu_plugin_inc", tag = "v0.8
 
     #[test]
     fn reject_dep_with_multiple_refs() {
-        let toml = r#"
-[package]
-name = "bad"
-version = "0.1.0"
-
-[dependencies.modules]
-x = { git = "https://example.com/x", tag = "v1", branch = "main" }
+        let nuon = r#"
+{
+  package: { name: "bad", version: "0.1.0" },
+  dependencies: { modules: { x: { git: "https://example.com/x", tag: "v1", branch: "main" } } },
+}
 "#;
 
-        let err = Manifest::from_str(toml).unwrap_err();
+        let err = Manifest::from_str(nuon).unwrap_err();
         assert!(err.to_string().contains("specify only one"));
     }
 
     #[test]
     fn reject_dep_with_no_refs() {
-        let toml = r#"
-[package]
-name = "bad"
-version = "0.1.0"
-
-[dependencies.modules]
-x = { git = "https://example.com/x" }
+        let nuon = r#"
+{
+  package: { name: "bad", version: "0.1.0" },
+  dependencies: { modules: { x: { git: "https://example.com/x" } } },
+}
 "#;
 
-        let err = Manifest::from_str(toml).unwrap_err();
+        let err = Manifest::from_str(nuon).unwrap_err();
         assert!(err.to_string().contains("must specify one"));
     }
 
     #[test]
     fn reject_module_dependency_with_insecure_http_git_source() {
-        let toml = r#"
-[package]
-name = "bad"
-version = "0.1.0"
-
-[dependencies.modules]
-x = { git = "http://example.com/x", tag = "v1.0.0" }
+        let nuon = r#"
+{
+  package: { name: "bad", version: "0.1.0" },
+  dependencies: { modules: { x: { git: "http://example.com/x", tag: "v1.0.0" } } },
+}
 "#;
 
-        let err = Manifest::from_str(toml).unwrap_err();
+        let err = Manifest::from_str(nuon).unwrap_err();
         assert!(err.to_string().contains("insecure HTTP"));
     }
 
     #[test]
-    fn to_toml_string_emits_stable_sorted_dependencies() {
+    fn to_nuon_string_emits_stable_sorted_dependencies() {
         let manifest = Manifest {
             package: Package {
                 name: "my-module".to_string(),
@@ -483,33 +556,33 @@ x = { git = "http://example.com/x", tag = "v1.0.0" }
             },
         };
 
-        let toml = manifest.to_toml_string().unwrap();
+        let nuon = manifest.to_nuon_string();
 
-        assert!(toml.starts_with("[package]\n"));
-        assert!(toml.contains("name = \"my-module\"\n"));
-        assert!(toml.contains("version = \"0.1.0\"\n"));
-        assert!(toml.contains("description = \"Example module\"\n"));
-        assert!(toml.contains("license = \"MIT\"\n"));
-        assert!(toml.contains("authors = [\"Alice\", \"Bob\"]\n"));
-        assert!(toml.contains("nu-version = \"0.91.0\"\n"));
+        assert!(nuon.starts_with("{\n  package: {\n"));
+        assert!(nuon.contains("name: \"my-module\",\n"));
+        assert!(nuon.contains("version: \"0.1.0\",\n"));
+        assert!(nuon.contains("description: \"Example module\",\n"));
+        assert!(nuon.contains("license: \"MIT\",\n"));
+        assert!(nuon.contains("authors: [\"Alice\", \"Bob\"],\n"));
+        assert!(nuon.contains("nu-version: \"0.91.0\",\n"));
 
-        let idx_modules = toml.find("[dependencies.modules]\n").unwrap();
-        let idx_plugins = toml.find("[dependencies.plugins]\n").unwrap();
-        let idx_alpha = toml
-            .find("alpha = { git = \"https://github.com/user/alpha\", branch = \"main\" }")
+        let idx_modules = nuon.find("modules: {\n").unwrap();
+        let idx_plugins = nuon.find("plugins: {\n").unwrap();
+        let idx_alpha = nuon
+            .find("alpha: { git: \"https://github.com/user/alpha\", branch: \"main\" }")
             .unwrap();
-        let idx_zeta = toml
-            .find("zeta = { git = \"https://github.com/user/zeta\", tag = \"v1.0.0\" }")
+        let idx_zeta = nuon
+            .find("zeta: { git: \"https://github.com/user/zeta\", tag: \"v1.0.0\" }")
             .unwrap();
-        let idx_plugin = toml
+        let idx_plugin = nuon
             .find(
-                "nu_plugin_inc = { git = \"https://github.com/user/nu_plugin_inc\", tag = \"v0.9.0\", bin = \"nu_plugin_inc\" }",
+                "nu_plugin_inc: { git: \"https://github.com/user/nu_plugin_inc\", tag: \"v0.9.0\", bin: \"nu_plugin_inc\" }",
             )
             .unwrap();
         assert!(idx_modules < idx_alpha && idx_alpha < idx_zeta);
         assert!(idx_plugins < idx_plugin);
 
-        let parsed = Manifest::from_str(&toml).unwrap();
+        let parsed = Manifest::from_str(&nuon).unwrap();
         assert_eq!(parsed.package.name, "my-module");
         assert_eq!(parsed.dependencies.modules.len(), 2);
         assert_eq!(parsed.dependencies.plugins.len(), 1);
@@ -517,27 +590,18 @@ x = { git = "http://example.com/x", tag = "v1.0.0" }
 
     #[test]
     fn reject_invalid_nu_version_requirement() {
-        let toml = r#"
-[package]
-name = "bad"
-version = "0.1.0"
-nu-version = "not-semver"
-"#;
+        let nuon = r#"{ package: { name: "bad", version: "0.1.0", nu-version: "not-semver" } }"#;
 
-        let err = Manifest::from_str(toml).unwrap_err();
+        let err = Manifest::from_str(nuon).unwrap_err();
         assert!(err.to_string().contains("nu-version"));
     }
 
     #[test]
     fn accepts_semver_range_nu_version_requirement() {
-        let toml = r#"
-[package]
-name = "ok"
-version = "0.1.0"
-nu-version = ">=0.110.0, <0.112.0"
-"#;
+        let nuon =
+            r#"{ package: { name: "ok", version: "0.1.0", nu-version: ">=0.110.0, <0.112.0" } }"#;
 
-        let manifest = Manifest::from_str(toml).unwrap();
+        let manifest = Manifest::from_str(nuon).unwrap();
         assert_eq!(
             manifest.package.nu_version.as_deref(),
             Some(">=0.110.0, <0.112.0")
@@ -546,61 +610,53 @@ nu-version = ">=0.110.0, <0.112.0"
 
     #[test]
     fn reject_plugin_dep_with_no_refs() {
-        let toml = r#"
-[package]
-name = "bad"
-version = "0.1.0"
-
-[dependencies.plugins]
-x = { git = "https://example.com/x", bin = "x" }
+        let nuon = r#"
+{
+  package: { name: "bad", version: "0.1.0" },
+  dependencies: { plugins: { x: { git: "https://example.com/x", bin: "x" } } },
+}
 "#;
 
-        let err = Manifest::from_str(toml).unwrap_err();
+        let err = Manifest::from_str(nuon).unwrap_err();
         assert!(err.to_string().contains("must specify one"));
     }
 
     #[test]
     fn reject_plugin_dep_with_empty_bin() {
-        let toml = r#"
-[package]
-name = "bad"
-version = "0.1.0"
-
-[dependencies.plugins]
-x = { git = "https://example.com/x", tag = "v1.0.0", bin = "   " }
+        let nuon = r#"
+{
+  package: { name: "bad", version: "0.1.0" },
+  dependencies: { plugins: { x: { git: "https://example.com/x", tag: "v1.0.0", bin: "   " } } },
+}
 "#;
 
-        let err = Manifest::from_str(toml).unwrap_err();
+        let err = Manifest::from_str(nuon).unwrap_err();
         assert!(err.to_string().contains("bin cannot be empty"));
     }
 
     #[test]
     fn reject_plugin_dependency_with_insecure_http_git_source() {
-        let toml = r#"
-[package]
-name = "bad"
-version = "0.1.0"
-
-[dependencies.plugins]
-x = { git = "http://example.com/x", tag = "v1.0.0", bin = "x" }
+        let nuon = r#"
+{
+  package: { name: "bad", version: "0.1.0" },
+  dependencies: { plugins: { x: { git: "http://example.com/x", tag: "v1.0.0", bin: "x" } } },
+}
 "#;
 
-        let err = Manifest::from_str(toml).unwrap_err();
+        let err = Manifest::from_str(nuon).unwrap_err();
         assert!(err.to_string().contains("insecure HTTP"));
     }
 
     #[test]
     fn accepts_core_plugin_source_without_git_or_refs() {
-        let toml = r#"
-[package]
-name = "ok"
-version = "0.1.0"
-
-[dependencies.plugins]
-nu_plugin_polars = { source = "nu-core", bin = "nu_plugin_polars" }
+        let nuon = r#"
+{
+  package: { name: "ok", version: "0.1.0" },
+  dependencies: { plugins: { nu_plugin_polars: { source: "nu-core", bin: "nu_plugin_polars" } } },
+}
 "#;
 
-        let manifest = Manifest::from_str(toml).unwrap();
+        let manifest = Manifest::from_str(nuon).unwrap();
         let plugin = manifest
             .dependencies
             .plugins
@@ -615,16 +671,14 @@ nu_plugin_polars = { source = "nu-core", bin = "nu_plugin_polars" }
 
     #[test]
     fn reject_core_plugin_source_with_git_or_refs() {
-        let toml = r#"
-[package]
-name = "bad"
-version = "0.1.0"
-
-[dependencies.plugins]
-nu_plugin_polars = { source = "nu-core", git = "https://example.com/x", tag = "v1.0.0" }
+        let nuon = r#"
+{
+  package: { name: "bad", version: "0.1.0" },
+  dependencies: { plugins: { nu_plugin_polars: { source: "nu-core", git: "https://example.com/x", tag: "v1.0.0" } } },
+}
 "#;
 
-        let err = Manifest::from_str(toml).unwrap_err();
+        let err = Manifest::from_str(nuon).unwrap_err();
         assert!(err.to_string().contains("source = 'nu-core'"));
     }
 
@@ -634,8 +688,8 @@ nu_plugin_polars = { source = "nu-core", git = "https://example.com/x", tag = "v
         let nested = root.join("src").join("commands");
         std::fs::create_dir_all(&nested).unwrap();
         std::fs::write(
-            root.join("nupackage.toml"),
-            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+            root.join("nupackage.nuon"),
+            r#"{ package: { name: "demo", version: "0.1.0" } }"#,
         )
         .unwrap();
 

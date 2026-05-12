@@ -165,7 +165,7 @@ fn resolve_deps(
         );
 
         // Check for transitive dependencies
-        // Export the dep to a temp dir to read its nupackage.toml
+        // Export the dep to a temp dir to read its nupackage.nuon
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos())
