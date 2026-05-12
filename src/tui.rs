@@ -32,9 +32,10 @@ use ratatui::{
 };
 use syntect::{highlighting::ThemeSet, parsing::SyntaxSet};
 
+use crate::config::{self, GlobalConfig};
 use crate::error::{QuiverError, Result};
 use crate::lockfile::{LockedPackageKind, Lockfile};
-use crate::manifest::Manifest;
+use crate::manifest::{DependencySpec, Manifest, PluginDependencySpec};
 use crate::ui::{CapturedLog, LogKind};
 
 const BUILTIN_PLUGINS: &[&str] = &[
@@ -196,6 +197,7 @@ enum FocusRegion {
 struct App {
     cwd: PathBuf,
     project_dir: Option<PathBuf>,
+    global: bool,
     package_name: String,
     package_version: String,
     rows: Vec<DependencyRow>,
@@ -228,6 +230,7 @@ struct App {
 
 pub fn run(
     cwd: &Path,
+    global: bool,
     run_action: impl Fn(TuiAction, Box<dyn FnMut(CapturedLog) + Send>) -> Result<()>
     + Send
     + Sync
@@ -239,7 +242,7 @@ pub fn run(
         ));
     }
 
-    let mut app = App::load(cwd)?;
+    let mut app = App::load(cwd, global)?;
     let run_action = Arc::new(run_action);
 
     enable_raw_mode()?;
@@ -295,11 +298,70 @@ pub fn run(
 }
 
 impl App {
-    fn load(cwd: &Path) -> Result<Self> {
+    fn load(cwd: &Path, global: bool) -> Result<Self> {
+        if global {
+            let global_config = GlobalConfig::load_or_default()?;
+            let lockfile = read_global_lockfile()?;
+            let rows = dependency_rows_from(
+                global_config.modules.iter(),
+                global_config.plugins.iter(),
+                lockfile.as_ref(),
+            );
+            let status = if rows.is_empty() {
+                "Global config is empty. Press a to add a module from GitHub.".to_string()
+            } else {
+                "Editing global config. a adds, r removes, i installs.".to_string()
+            };
+            let modules_dir = global_config.modules_dir().ok();
+            let (local_readme, local_license) = rows
+                .first()
+                .and_then(|row| {
+                    modules_dir
+                        .as_deref()
+                        .map(|dir| load_dist_info_at(dir, row))
+                })
+                .unwrap_or_default();
+            return Ok(Self {
+                cwd: cwd.to_path_buf(),
+                project_dir: None,
+                global: true,
+                package_name: "global config".to_string(),
+                package_version: String::new(),
+                rows,
+                tab: Tab::Dependencies,
+                selected: 0,
+                search_selected: 0,
+                ref_choice_selected: 0,
+                readme_scroll: 0,
+                detail_readme_scroll: 0,
+                graph_scroll: 0,
+                local_readme,
+                local_license,
+                status,
+                input: String::new(),
+                readme_url: String::new(),
+                readme: "Paste a GitHub repository URL, then press Enter to preview its README."
+                    .to_string(),
+                input_mode: InputMode::Normal,
+                action: None,
+                logs: vec![LogLine::Plain("Logs will show here".to_string())],
+                log_scroll: 0,
+                follow_log: true,
+                log_visible: false,
+                command_rx: None,
+                command_running: false,
+                pending_reload: false,
+                focus: FocusRegion::DependencyList,
+                regions: Vec::new(),
+                quit: false,
+            });
+        }
+
         let Some(project_dir) = Manifest::find_project_dir(cwd) else {
             return Ok(Self {
                 cwd: cwd.to_path_buf(),
                 project_dir: None,
+                global: false,
                 package_name: "No quiver project".to_string(),
                 package_version: String::new(),
                 rows: Vec::new(),
@@ -351,6 +413,7 @@ impl App {
         Ok(Self {
             cwd: cwd.to_path_buf(),
             project_dir: Some(project_dir),
+            global: false,
             package_name: manifest.package.name,
             package_version: manifest.package.version,
             rows,
@@ -388,10 +451,25 @@ impl App {
     }
 
     fn can_manage(&self) -> bool {
-        self.project_dir.is_some()
+        self.global || self.project_dir.is_some()
     }
 
     fn reload(&mut self) -> Result<()> {
+        if self.global {
+            let global_config = GlobalConfig::load_or_default()?;
+            let lockfile = read_global_lockfile()?;
+            self.rows = dependency_rows_from(
+                global_config.modules.iter(),
+                global_config.plugins.iter(),
+                lockfile.as_ref(),
+            );
+            if self.selected >= self.rows.len() {
+                self.selected = self.rows.len().saturating_sub(1);
+            }
+            reload_selected_dist_info(self);
+            return Ok(());
+        }
+
         let just_initialized = self.project_dir.is_none();
         if just_initialized {
             self.project_dir = Manifest::find_project_dir(&self.cwd);
@@ -409,9 +487,8 @@ impl App {
         }
         reload_selected_dist_info(self);
         if just_initialized {
-            self.readme =
-                "Paste a GitHub repository URL, then press Enter to preview its README."
-                    .to_string();
+            self.readme = "Paste a GitHub repository URL, then press Enter to preview its README."
+                .to_string();
         }
         Ok(())
     }
@@ -465,7 +542,32 @@ fn read_lockfile(project_dir: &Path) -> Result<Option<Lockfile>> {
     }
 }
 
+fn read_global_lockfile() -> Result<Option<Lockfile>> {
+    let path = config::global_lock_path()?;
+    if path.exists() {
+        Ok(Some(Lockfile::from_path(&path)?))
+    } else {
+        Ok(None)
+    }
+}
+
 fn dependency_rows(manifest: &Manifest, lockfile: Option<&Lockfile>) -> Vec<DependencyRow> {
+    dependency_rows_from(
+        manifest.dependencies.modules.iter(),
+        manifest.dependencies.plugins.iter(),
+        lockfile,
+    )
+}
+
+fn dependency_rows_from<'a, M, P>(
+    modules_iter: M,
+    plugins_iter: P,
+    lockfile: Option<&Lockfile>,
+) -> Vec<DependencyRow>
+where
+    M: IntoIterator<Item = (&'a String, &'a DependencySpec)>,
+    P: IntoIterator<Item = (&'a String, &'a PluginDependencySpec)>,
+{
     let mut locked_by_name = HashMap::new();
     if let Some(lockfile) = lockfile {
         for package in &lockfile.packages {
@@ -476,7 +578,7 @@ fn dependency_rows(manifest: &Manifest, lockfile: Option<&Lockfile>) -> Vec<Depe
     let mut rows = Vec::new();
     let mut direct_names = HashSet::new();
 
-    let mut modules: Vec<_> = manifest.dependencies.modules.iter().collect();
+    let mut modules: Vec<_> = modules_iter.into_iter().collect();
     modules.sort_by(|a, b| a.0.cmp(b.0));
     for (name, spec) in modules {
         direct_names.insert((name.clone(), LockedPackageKind::Module));
@@ -492,7 +594,7 @@ fn dependency_rows(manifest: &Manifest, lockfile: Option<&Lockfile>) -> Vec<Depe
         });
     }
 
-    let mut plugins: Vec<_> = manifest.dependencies.plugins.iter().collect();
+    let mut plugins: Vec<_> = plugins_iter.into_iter().collect();
     plugins.sort_by(|a, b| a.0.cmp(b.0));
     for (name, spec) in plugins {
         direct_names.insert((name.clone(), LockedPackageKind::Plugin));
@@ -1908,8 +2010,15 @@ fn short_rev(rev: &str) -> &str {
 }
 
 fn reload_selected_dist_info(app: &mut App) {
-    if let (Some(project_dir), Some(row)) = (&app.project_dir, app.selected_row()) {
-        let (readme, license) = load_dist_info_for_row(project_dir, row);
+    let base_dir = if app.global {
+        GlobalConfig::load_or_default()
+            .ok()
+            .and_then(|cfg| cfg.modules_dir().ok())
+    } else {
+        app.project_dir.clone()
+    };
+    if let (Some(base_dir), Some(row)) = (base_dir, app.selected_row()) {
+        let (readme, license) = load_dist_info_at(&base_dir, row);
         app.local_readme = readme;
         app.local_license = license;
         app.detail_readme_scroll = 0;
@@ -1921,10 +2030,14 @@ fn reload_selected_dist_info(app: &mut App) {
 }
 
 fn load_dist_info_for_row(project_dir: &Path, row: &DependencyRow) -> (String, String) {
+    load_dist_info_at(&project_dir.join(".nu-env").join("modules"), row)
+}
+
+fn load_dist_info_at(modules_dir: &Path, row: &DependencyRow) -> (String, String) {
     let mut readme = String::new();
     let mut license = String::new();
 
-    if let Some(dist_info) = dist_info_path(project_dir, row) {
+    if let Some(dist_info) = dist_info_path_in(modules_dir, row) {
         readme = read_local_readme(&dist_info);
         license = read_local_license(&dist_info);
     }
@@ -1932,7 +2045,12 @@ fn load_dist_info_for_row(project_dir: &Path, row: &DependencyRow) -> (String, S
     (readme, license)
 }
 
+#[cfg(test)]
 fn dist_info_path(project_dir: &Path, row: &DependencyRow) -> Option<PathBuf> {
+    dist_info_path_in(&project_dir.join(".nu-env").join("modules"), row)
+}
+
+fn dist_info_path_in(modules_dir: &Path, row: &DependencyRow) -> Option<PathBuf> {
     let rev = row.locked_rev.as_ref()?;
     let tag = row
         .locked_tag
@@ -1955,7 +2073,7 @@ fn dist_info_path(project_dir: &Path, row: &DependencyRow) -> Option<PathBuf> {
     }
 
     let dir_name = format!("{}-{version}.dist-info", row.name);
-    Some(project_dir.join(".nu-env").join("modules").join(dir_name))
+    Some(modules_dir.join(dir_name))
 }
 
 fn read_local_readme(dist_info_dir: &Path) -> String {
@@ -2053,6 +2171,7 @@ mod tests {
         App {
             cwd: PathBuf::from("/project"),
             project_dir: Some(PathBuf::from("/project")),
+            global: false,
             package_name: "test".to_string(),
             package_version: "0.1.0".to_string(),
             rows: Vec::new(),
@@ -2338,7 +2457,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
 
-        let app = App::load(&temp).unwrap();
+        let app = App::load(&temp, false).unwrap();
 
         assert!(app.project_dir.is_none());
         assert_eq!(app.input_mode, InputMode::ConfirmInit);

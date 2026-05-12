@@ -33,17 +33,17 @@ pub(crate) static TEST_ENV_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::
 fn main() {
     let cli = cli::parse();
 
-    if let Err(e) = run(cli.command) {
+    if let Err(e) = run(cli) {
         ui::error(format!("{e}"));
         std::process::exit(1);
     }
 }
 
-fn run(command: Option<Commands>) -> Result<()> {
+fn run(cli: cli::Cli) -> Result<()> {
     let cwd = std::env::current_dir()?;
 
-    match command {
-        None => cmd_tui(&cwd),
+    match cli.command {
+        None => cmd_tui(&cwd, cli.global),
         Some(Commands::Init {
             name,
             version,
@@ -124,42 +124,67 @@ fn run(command: Option<Commands>) -> Result<()> {
     }
 }
 
-fn cmd_tui(cwd: &Path) -> Result<()> {
+fn cmd_tui(cwd: &Path, global: bool) -> Result<()> {
     let cwd = cwd.to_path_buf();
     let tui_cwd = cwd.clone();
-    tui::run(&tui_cwd, move |action, emit| {
-        ui::capture_logs_stream(emit, || match action {
-            tui::TuiAction::Init => cmd_init(&cwd, None, "0.1.0".to_string(), None, None),
-            tui::TuiAction::Install => {
-                let project_dir = require_project_dir(&cwd)?;
-                cmd_install(&project_dir, false, false, false)
-            }
-            tui::TuiAction::Update => {
-                let project_dir = require_project_dir(&cwd)?;
-                cmd_update(&project_dir)
-            }
-            tui::TuiAction::Remove { name } => {
-                let project_dir = require_project_dir(&cwd)?;
-                cmd_remove(&project_dir, name)
-            }
-            tui::TuiAction::AddModule {
-                url,
-                tag,
-                rev,
-                branch,
-            } => {
-                let project_dir = require_project_dir(&cwd)?;
-                cmd_add(&project_dir, url, tag, rev, branch)
-            }
-            tui::TuiAction::AddPlugin {
-                url,
-                tag,
-                rev,
-                branch,
-                bin,
-            } => {
-                let project_dir = require_project_dir(&cwd)?;
-                cmd_add_plugin(&project_dir, url, tag, rev, branch, bin)
+    tui::run(&tui_cwd, global, move |action, emit| {
+        ui::capture_logs_stream(emit, || {
+            if global {
+                match action {
+                    tui::TuiAction::Init => Ok(()),
+                    tui::TuiAction::Install | tui::TuiAction::Update => {
+                        cmd_install_global(false, false, false)
+                    }
+                    tui::TuiAction::Remove { name } => cmd_remove_global(name),
+                    tui::TuiAction::AddModule {
+                        url,
+                        tag,
+                        rev,
+                        branch,
+                    } => cmd_add_global(url, tag, rev, branch),
+                    tui::TuiAction::AddPlugin {
+                        url,
+                        tag,
+                        rev,
+                        branch,
+                        bin,
+                    } => cmd_add_global_plugin(url, tag, rev, branch, bin),
+                }
+            } else {
+                match action {
+                    tui::TuiAction::Init => cmd_init(&cwd, None, "0.1.0".to_string(), None, None),
+                    tui::TuiAction::Install => {
+                        let project_dir = require_project_dir(&cwd)?;
+                        cmd_install(&project_dir, false, false, false)
+                    }
+                    tui::TuiAction::Update => {
+                        let project_dir = require_project_dir(&cwd)?;
+                        cmd_update(&project_dir)
+                    }
+                    tui::TuiAction::Remove { name } => {
+                        let project_dir = require_project_dir(&cwd)?;
+                        cmd_remove(&project_dir, name)
+                    }
+                    tui::TuiAction::AddModule {
+                        url,
+                        tag,
+                        rev,
+                        branch,
+                    } => {
+                        let project_dir = require_project_dir(&cwd)?;
+                        cmd_add(&project_dir, url, tag, rev, branch)
+                    }
+                    tui::TuiAction::AddPlugin {
+                        url,
+                        tag,
+                        rev,
+                        branch,
+                        bin,
+                    } => {
+                        let project_dir = require_project_dir(&cwd)?;
+                        cmd_add_plugin(&project_dir, url, tag, rev, branch, bin)
+                    }
+                }
             }
         })
     })

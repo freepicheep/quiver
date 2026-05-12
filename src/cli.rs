@@ -21,6 +21,10 @@ pub struct Cli {
     )]
     pub version: Option<bool>,
 
+    /// Open the TUI for the global config (only when no subcommand is given)
+    #[arg(short = 'g', long = "global")]
+    pub global: bool,
+
     #[command(subcommand)]
     pub command: Option<Commands>,
 }
@@ -231,6 +235,7 @@ pub fn parse() -> Cli {
         let qvx = QvxCli::parse_from(args);
         return Cli {
             version: qvx.version,
+            global: false,
             command: Some(Commands::Qvx {
                 tag: qvx.tag,
                 rev: qvx.rev,
@@ -284,6 +289,14 @@ mod tests {
     fn no_subcommand_parses_for_tui() {
         let cli = Cli::try_parse_from(["quiver"]).unwrap();
         assert!(cli.command.is_none());
+        assert!(!cli.global);
+    }
+
+    #[test]
+    fn global_flag_parses_for_tui() {
+        let cli = Cli::try_parse_from(["quiver", "-g"]).unwrap();
+        assert!(cli.command.is_none());
+        assert!(cli.global);
     }
 
     #[test]
