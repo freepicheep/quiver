@@ -4,8 +4,9 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{QuiverError, Result};
 use crate::manifest::{
-    nu_value_to_json, nuon_key, nuon_string, DependencySpec, PluginDependencySpec,
+    DependencySpec, PluginDependencySpec, nu_value_to_json, nuon_key, nuon_string,
 };
+use crate::ui;
 
 const DEFAULT_GIT_PROVIDER: &str = "github";
 
@@ -129,6 +130,7 @@ impl GlobalConfig {
         let path = global_config_path()?;
 
         if !path.exists() {
+            warn_if_legacy_toml_config(&path);
             let config = GlobalConfig::default();
             config.save()?;
             return Ok(config);
@@ -142,6 +144,7 @@ impl GlobalConfig {
         let path = global_config_path()?;
 
         if !path.exists() {
+            warn_if_legacy_toml_config(&path);
             return Ok(GlobalConfig::default());
         }
 
@@ -150,12 +153,10 @@ impl GlobalConfig {
 
     fn load_from_path(path: &Path) -> Result<Self> {
         let content = std::fs::read_to_string(path)?;
-        let value = nuon::from_nuon(&content, None).map_err(|e| {
-            QuiverError::Config(format!("failed to parse {}: {e}", path.display()))
-        })?;
-        let json = nu_value_to_json(value).map_err(|e| {
-            QuiverError::Config(format!("failed to parse {}: {e}", path.display()))
-        })?;
+        let value = nuon::from_nuon(&content, None)
+            .map_err(|e| QuiverError::Config(format!("failed to parse {}: {e}", path.display())))?;
+        let json = nu_value_to_json(value)
+            .map_err(|e| QuiverError::Config(format!("failed to parse {}: {e}", path.display())))?;
         serde_json::from_value(json)
             .map_err(|e| QuiverError::Config(format!("failed to parse {}: {e}", path.display())))
     }
@@ -251,6 +252,23 @@ impl GlobalConfig {
                 self.default_git_provider
             ))
         })
+    }
+}
+
+fn warn_if_legacy_toml_config(nuon_path: &Path) {
+    let toml_path = nuon_path.with_extension("toml");
+    if toml_path.exists() {
+        ui::warn("config.toml detected but quiver now requires config.nuon. Migrate with:");
+        eprintln!();
+        eprintln!(
+            "  open {} | to nuon --indent 2 | save -f {}",
+            toml_path.display(),
+            nuon_path.display()
+        );
+        eprintln!("  rm {}", toml_path.display());
+        eprintln!("  rm {}", nuon_path.with_file_name("config.lock").display());
+        eprintln!("  qv install -g");
+        eprintln!();
     }
 }
 

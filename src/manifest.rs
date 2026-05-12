@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use crate::error::{QuiverError, Result};
 use crate::nu;
 use crate::safety;
+use crate::ui;
 
 pub const MANIFEST_FILE_NAME: &str = "nupackage.nuon";
 
@@ -234,6 +235,17 @@ impl Manifest {
     pub fn from_dir(dir: &Path) -> Result<Self> {
         let path = dir.join(MANIFEST_FILE_NAME);
         if !path.exists() {
+            if dir.join("nupackage.toml").exists() {
+                ui::warn(
+                    "nupackage.toml detected but quiver now requires nupackage.nuon. Migrate with:",
+                );
+                eprintln!();
+                eprintln!("  open nupackage.toml | to nuon --indent 2 | save -f nupackage.nuon");
+                eprintln!("  rm nupackage.toml");
+                eprintln!("  rm quiver.lock");
+                eprintln!("  qv install");
+                eprintln!();
+            }
             return Err(QuiverError::NoManifest(dir.to_path_buf()));
         }
         let content = std::fs::read_to_string(&path)?;
