@@ -1,5 +1,9 @@
 # Unreleased
 
+## Added
+
+- Running `qv` in a non-project directory will open the TUI and offer to create a new quiver project. Previously it just showed the TUI without any helpful information.
+
 ## Changed
 
 - **BREAKING**: The package manifest is now `nupackage.nuon` instead of `nupackage.toml`. The lockfile is also in `nuon` format. Existing projects must migrate:
