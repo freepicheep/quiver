@@ -1,6 +1,6 @@
 [package]
 name = "quiver"
-version = "0.7.0"
+version = "0.7.1"
 edition = "2024"
 description = "A module manager for Nushell"
 license = "MIT"
@@ -15,7 +15,6 @@ serde_json = "1"
 sha2 = "0.10"
 thiserror = "2"
 nuon = "0.112.2"
-nu-protocol = { version = "0.112.2", default-features = false }
 walkdir = "2"
 indicatif = "0.18.4"
 console = "0.16.2"
@@ -24,8 +23,15 @@ tar = "0.4"
 xz2 = "0.1"
 ratatui = "0.29"
 crossterm = "0.29"
-leaves = { git = "https://github.com/freepicheep/leaves.git", branch = "main" }
 syntect = "5.2"
+
+[dependencies.nu-protocol]
+version = "0.112.2"
+default-features = false
+
+[dependencies.leaves]
+git = "https://github.com/freepicheep/leaves.git"
+branch = "main"
 
 [dependencies.git2]
 version = "0.20"
