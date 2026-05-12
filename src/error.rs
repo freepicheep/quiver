@@ -30,12 +30,6 @@ pub enum QuiverError {
     #[error("nuon parse error: {0}")]
     NuonParse(#[from] nu_protocol::ShellError),
 
-    #[error("toml parse error: {0}")]
-    TomlParse(#[from] toml::de::Error),
-
-    #[error("toml serialize error: {0}")]
-    TomlSerialize(#[from] toml::ser::Error),
-
     #[error("checksum source not found for asset '{asset}': {details}")]
     ChecksumSourceNotFound { asset: String, details: String },
 

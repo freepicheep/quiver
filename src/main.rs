@@ -2097,24 +2097,27 @@ mod tests {
         let lock_path = root_dir.join("config.lock");
         std::fs::write(
             &lock_path,
-            r#"version = 1
-
-[[package]]
-name = "nu-utils"
-git = "https://github.com/example/nu-utils"
-tag = "v1.0.0"
-rev = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-sha256 = "aaa"
-
-[[package]]
-name = "nu_plugin_inc"
-kind = "plugin"
-git = "https://github.com/nushell/nu_plugin_inc"
-tag = "v0.91.0"
-rev = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-path = "nu_plugin_inc"
-sha256 = "bbb"
-"#,
+            r#"{
+  version: 1,
+  packages: [
+    {
+      name: "nu-utils",
+      git: "https://github.com/example/nu-utils",
+      tag: "v1.0.0",
+      rev: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      sha256: "aaa",
+    },
+    {
+      name: "nu_plugin_inc",
+      kind: "plugin",
+      git: "https://github.com/nushell/nu_plugin_inc",
+      tag: "v0.91.0",
+      rev: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      path: "nu_plugin_inc",
+      sha256: "bbb",
+    },
+  ],
+}"#,
         )
         .unwrap();
 

@@ -3,7 +3,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::error::{QuiverError, Result};
-use crate::manifest::{DependencySpec, PluginDependencySpec};
+use crate::manifest::{
+    nu_value_to_json, nuon_key, nuon_string, DependencySpec, PluginDependencySpec,
+};
 
 const DEFAULT_GIT_PROVIDER: &str = "github";
 
@@ -55,21 +57,7 @@ fn normalize_provider_base_url(provider: &str) -> Option<String> {
     None
 }
 
-fn toml_scalar<T: Serialize>(value: &T) -> Result<String> {
-    let scalar = toml::Value::try_from(value)
-        .map_err(|e| QuiverError::Config(format!("failed to encode TOML value: {e}")))?;
-    Ok(scalar.to_string())
-}
-
-fn install_mode_name(mode: InstallMode) -> &'static str {
-    match mode {
-        InstallMode::Clone => "clone",
-        InstallMode::Hardlink => "hardlink",
-        InstallMode::Copy => "copy",
-    }
-}
-
-/// The global quiver config file: `~/.config/quiver/config.toml`.
+/// The global quiver config file: `~/.config/quiver/config.nuon`.
 ///
 /// Tracks globally-installed modules and optional path overrides.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -80,7 +68,7 @@ pub enum InstallMode {
     Copy,
 }
 
-/// The global quiver config file: `~/.config/quiver/config.toml`.
+/// The global quiver config file: `~/.config/quiver/config.nuon`.
 ///
 /// Tracks globally-installed modules/plugins and optional path overrides.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -161,83 +149,73 @@ impl GlobalConfig {
     }
 
     fn load_from_path(path: &Path) -> Result<Self> {
-        let content = std::fs::read_to_string(&path)?;
-        let config: GlobalConfig = toml::from_str(&content)
-            .map_err(|e| QuiverError::Config(format!("failed to parse {}: {e}", path.display())))?;
-        Ok(config)
+        let content = std::fs::read_to_string(path)?;
+        let value = nuon::from_nuon(&content, None).map_err(|e| {
+            QuiverError::Config(format!("failed to parse {}: {e}", path.display()))
+        })?;
+        let json = nu_value_to_json(value).map_err(|e| {
+            QuiverError::Config(format!("failed to parse {}: {e}", path.display()))
+        })?;
+        serde_json::from_value(json)
+            .map_err(|e| QuiverError::Config(format!("failed to parse {}: {e}", path.display())))
     }
 
-    /// Serialize the global config using stable top-level `[modules]` and `[plugins]` tables.
-    pub fn to_toml_string(&self) -> Result<String> {
+    /// Serialize the global config to a NUON string with stable key ordering.
+    pub fn to_nuon_string(&self) -> String {
         let mut out = String::new();
+        out.push_str("{\n");
 
         if let Some(modules_dir) = &self.modules_dir {
-            out.push_str(&format!("modules_dir = {}\n", toml_scalar(modules_dir)?));
+            out.push_str(&format!("  modules_dir: {},\n", nuon_string(modules_dir)));
         }
         out.push_str(&format!(
-            "default_git_provider = {}\n",
-            toml_scalar(&self.default_git_provider)?
+            "  default_git_provider: {},\n",
+            nuon_string(&self.default_git_provider)
         ));
-        out.push_str(&format!(
-            "install_mode = {}\n",
-            toml_scalar(&install_mode_name(self.install_mode))?
-        ));
+        let mode_str = match self.install_mode {
+            InstallMode::Clone => "clone",
+            InstallMode::Hardlink => "hardlink",
+            InstallMode::Copy => "copy",
+        };
+        out.push_str(&format!("  install_mode: {},\n", nuon_string(mode_str)));
 
-        out.push_str("\n[security]\n");
+        out.push_str("  security: {\n");
         out.push_str(&format!(
-            "require_signed_assets = {}\n",
-            toml_scalar(&self.security.require_signed_assets)?
+            "    require_signed_assets: {},\n",
+            self.security.require_signed_assets
         ));
+        out.push_str("  },\n");
 
         if !self.modules.is_empty() {
-            out.push_str("\n[modules]\n");
+            out.push_str("  modules: {\n");
             let mut modules: Vec<_> = self.modules.iter().collect();
             modules.sort_by(|a, b| a.0.cmp(b.0));
             for (name, spec) in modules {
-                out.push_str(&format!("{name} = {{ git = {}, ", toml_scalar(&spec.git)?));
-                if let Some(tag) = &spec.tag {
-                    out.push_str(&format!("tag = {} }}\n", toml_scalar(tag)?));
-                } else if let Some(rev) = &spec.rev {
-                    out.push_str(&format!("rev = {} }}\n", toml_scalar(rev)?));
-                } else if let Some(branch) = &spec.branch {
-                    out.push_str(&format!("branch = {} }}\n", toml_scalar(branch)?));
-                } else {
-                    return Err(QuiverError::Config(format!(
-                        "module dependency '{name}' is missing tag/rev/branch"
-                    )));
-                }
+                out.push_str(&format!(
+                    "    {}: {{ {} }},\n",
+                    nuon_key(name),
+                    spec.to_inline_nuon()
+                ));
             }
+            out.push_str("  },\n");
         }
 
         if !self.plugins.is_empty() {
-            out.push_str("\n[plugins]\n");
+            out.push_str("  plugins: {\n");
             let mut plugins: Vec<_> = self.plugins.iter().collect();
             plugins.sort_by(|a, b| a.0.cmp(b.0));
             for (name, spec) in plugins {
-                let mut parts = Vec::new();
-                if let Some(source) = &spec.source {
-                    parts.push(format!("source = {}", toml_scalar(source)?));
-                }
-                if spec.source.as_deref() != Some("nu-core") {
-                    parts.push(format!("git = {}", toml_scalar(&spec.git)?));
-                }
-                if let Some(tag) = &spec.tag {
-                    parts.push(format!("tag = {}", toml_scalar(tag)?));
-                }
-                if let Some(rev) = &spec.rev {
-                    parts.push(format!("rev = {}", toml_scalar(rev)?));
-                }
-                if let Some(branch) = &spec.branch {
-                    parts.push(format!("branch = {}", toml_scalar(branch)?));
-                }
-                if let Some(bin) = &spec.bin {
-                    parts.push(format!("bin = {}", toml_scalar(bin)?));
-                }
-                out.push_str(&format!("{name} = {{ {} }}\n", parts.join(", ")));
+                out.push_str(&format!(
+                    "    {}: {{ {} }},\n",
+                    nuon_key(name),
+                    spec.to_inline_nuon()
+                ));
             }
+            out.push_str("  },\n");
         }
 
-        Ok(out)
+        out.push_str("}\n");
+        out
     }
 
     /// Save the global config back to disk.
@@ -248,7 +226,7 @@ impl GlobalConfig {
             std::fs::create_dir_all(parent)?;
         }
 
-        let content = self.to_toml_string()?;
+        let content = self.to_nuon_string();
         std::fs::write(&path, content)?;
         Ok(())
     }
@@ -296,7 +274,7 @@ pub fn global_config_dir() -> Result<PathBuf> {
 
 /// Returns the path to the global config file.
 pub fn global_config_path() -> Result<PathBuf> {
-    Ok(global_config_dir()?.join("config.toml"))
+    Ok(global_config_dir()?.join("config.nuon"))
 }
 
 /// Returns the path to the global lockfile.
@@ -369,6 +347,12 @@ pub fn global_modules_dir() -> Result<PathBuf> {
 mod tests {
     use super::*;
 
+    fn parse_nuon(s: &str) -> GlobalConfig {
+        let value = nuon::from_nuon(s, None).expect("nuon parse failed");
+        let json = nu_value_to_json(value).expect("json conversion failed");
+        serde_json::from_value(json).expect("serde_json parse failed")
+    }
+
     #[test]
     fn round_trip() {
         let config = GlobalConfig {
@@ -398,11 +382,11 @@ mod tests {
             )]),
         };
 
-        let serialized = config.to_toml_string().unwrap();
-        let parsed: GlobalConfig = toml::from_str(&serialized).unwrap();
+        let serialized = config.to_nuon_string();
+        let parsed = parse_nuon(&serialized);
 
-        assert!(serialized.contains("[modules]"));
-        assert!(!serialized.contains("[dependencies]"));
+        assert!(serialized.contains("modules:"));
+        assert!(!serialized.contains("dependencies:"));
         assert_eq!(parsed.modules.len(), 1);
         assert!(parsed.modules.contains_key("nu-utils"));
         assert!(parsed.plugins.contains_key("nu_plugin_inc"));
@@ -422,8 +406,8 @@ mod tests {
             plugins: HashMap::new(),
         };
 
-        let serialized = config.to_toml_string().unwrap();
-        let parsed: GlobalConfig = toml::from_str(&serialized).unwrap();
+        let serialized = config.to_nuon_string();
+        let parsed = parse_nuon(&serialized);
 
         assert_eq!(parsed.modules_dir.as_deref(), Some("/custom/path"));
         assert_eq!(parsed.default_git_provider, "gitlab");
@@ -472,7 +456,7 @@ mod tests {
         assert_eq!(dir, expected_dir);
 
         let path = global_config_path().unwrap();
-        assert_eq!(path, expected_dir.join("config.toml"));
+        assert_eq!(path, expected_dir.join("config.nuon"));
 
         let lock = global_lock_path().unwrap();
         assert_eq!(lock, expected_dir.join("config.lock"));
@@ -501,12 +485,12 @@ mod tests {
 
     #[test]
     fn missing_provider_defaults_to_github() {
-        let toml = r#"
-modules_dir = "/tmp/quiver-modules"
-
-[modules]
+        let nuon = r#"
+{
+  modules_dir: "/tmp/quiver-modules",
+}
 "#;
-        let parsed: GlobalConfig = toml::from_str(toml).unwrap();
+        let parsed = parse_nuon(nuon);
         assert_eq!(parsed.default_git_provider, "github");
         assert_eq!(parsed.install_mode, default_install_mode());
         assert!(parsed.security.require_signed_assets);
@@ -514,13 +498,15 @@ modules_dir = "/tmp/quiver-modules"
 
     #[test]
     fn legacy_dependencies_table_still_parses_into_modules() {
-        let toml = r#"
-modules_dir = "/tmp/quiver-modules"
-
-[dependencies]
-nu-utils = { git = "https://github.com/user/nu-utils", tag = "v1.0.0" }
+        let nuon = r#"
+{
+  modules_dir: "/tmp/quiver-modules",
+  dependencies: {
+    "nu-utils": { git: "https://github.com/user/nu-utils", tag: "v1.0.0" },
+  },
+}
 "#;
-        let parsed: GlobalConfig = toml::from_str(toml).unwrap();
+        let parsed = parse_nuon(nuon);
         assert!(parsed.modules.contains_key("nu-utils"));
     }
 
@@ -580,8 +566,8 @@ nu-utils = { git = "https://github.com/user/nu-utils", tag = "v1.0.0" }
             plugins: HashMap::new(),
         };
 
-        let serialized = config.to_toml_string().unwrap();
-        let parsed: GlobalConfig = toml::from_str(&serialized).unwrap();
+        let serialized = config.to_nuon_string();
+        let parsed = parse_nuon(&serialized);
         assert_eq!(parsed.install_mode, InstallMode::Hardlink);
     }
 
@@ -598,8 +584,8 @@ nu-utils = { git = "https://github.com/user/nu-utils", tag = "v1.0.0" }
             plugins: HashMap::new(),
         };
 
-        let serialized = config.to_toml_string().unwrap();
-        let parsed: GlobalConfig = toml::from_str(&serialized).unwrap();
+        let serialized = config.to_nuon_string();
+        let parsed = parse_nuon(&serialized);
         assert!(!parsed.security.require_signed_assets);
     }
 }

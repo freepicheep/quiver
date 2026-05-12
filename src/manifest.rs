@@ -98,7 +98,7 @@ impl DependencySpec {
             .expect("validated: one of tag/rev/branch is set")
     }
 
-    fn to_inline_nuon(&self) -> String {
+    pub(crate) fn to_inline_nuon(&self) -> String {
         let mut parts = vec![format!("git: {}", nuon_string(&self.git))];
         if let Some(tag) = &self.tag {
             parts.push(format!("tag: {}", nuon_string(tag)));
@@ -174,7 +174,7 @@ impl PluginDependencySpec {
             .expect("validated: one of tag/rev/branch is set")
     }
 
-    fn to_inline_nuon(&self) -> String {
+    pub(crate) fn to_inline_nuon(&self) -> String {
         let source = self.source.as_deref().unwrap_or("git");
         let mut parts = Vec::new();
         if self.source.is_some() {
@@ -365,7 +365,7 @@ fn write_nuon_list_field(out: &mut String, indent: usize, key: &str, values: &[S
     out.push_str("],\n");
 }
 
-fn nuon_key(key: &str) -> String {
+pub(crate) fn nuon_key(key: &str) -> String {
     let is_bare = key
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
@@ -376,11 +376,11 @@ fn nuon_key(key: &str) -> String {
     }
 }
 
-fn nuon_string(value: &str) -> String {
+pub(crate) fn nuon_string(value: &str) -> String {
     serde_json::to_string(value).expect("serializing a string cannot fail")
 }
 
-fn nu_value_to_json(value: nu_protocol::Value) -> Result<JsonValue> {
+pub(crate) fn nu_value_to_json(value: nu_protocol::Value) -> Result<JsonValue> {
     match value {
         nu_protocol::Value::Bool { val, .. } => Ok(JsonValue::Bool(val)),
         nu_protocol::Value::Int { val, .. } => Ok(JsonValue::Number(val.into())),

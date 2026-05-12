@@ -4038,15 +4038,18 @@ mod tests {
         )
         .unwrap();
         let lockfile = Lockfile::from_str(
-            r#"version = 1
-
-[[package]]
-name = "other-module"
-git = "https://github.com/example/other"
-tag = "v1.0.0"
-rev = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-sha256 = "aaa"
-"#,
+            r#"{
+  version: 1,
+  packages: [
+    {
+      name: "other-module",
+      git: "https://github.com/example/other",
+      tag: "v1.0.0",
+      rev: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      sha256: "aaa",
+    },
+  ],
+}"#,
         )
         .unwrap();
 
@@ -4060,23 +4063,26 @@ sha256 = "aaa"
         )
         .unwrap();
         let lockfile = Lockfile::from_str(
-            r#"version = 1
-
-[[package]]
-name = "nu-salesforce"
-git = "https://github.com/freepicheep/nu-salesforce"
-tag = "v0.3.0"
-rev = "cccccccccccccccccccccccccccccccccccccccc"
-sha256 = "ccc"
-
-[[package]]
-name = "future"
-kind = "plugin"
-git = "https://github.com/example/future"
-tag = "v1.0.0"
-rev = "dddddddddddddddddddddddddddddddddddddddd"
-sha256 = "ddd"
-"#,
+            r#"{
+  version: 1,
+  packages: [
+    {
+      name: "nu-salesforce",
+      git: "https://github.com/freepicheep/nu-salesforce",
+      tag: "v0.3.0",
+      rev: "cccccccccccccccccccccccccccccccccccccccc",
+      sha256: "ccc",
+    },
+    {
+      name: "future",
+      kind: "plugin",
+      git: "https://github.com/example/future",
+      tag: "v1.0.0",
+      rev: "dddddddddddddddddddddddddddddddddddddddd",
+      sha256: "ddd",
+    },
+  ],
+}"#,
         )
         .unwrap();
 
@@ -4090,15 +4096,18 @@ sha256 = "ddd"
         )
         .unwrap();
         let lockfile = Lockfile::from_str(
-            r#"version = 1
-
-[[package]]
-name = "nu-salesforce"
-git = "https://github.com/freepicheep/nu-salesforce"
-tag = "v0.3.0"
-rev = "cccccccccccccccccccccccccccccccccccccccc"
-sha256 = "ccc"
-"#,
+            r#"{
+  version: 1,
+  packages: [
+    {
+      name: "nu-salesforce",
+      git: "https://github.com/freepicheep/nu-salesforce",
+      tag: "v0.3.0",
+      rev: "cccccccccccccccccccccccccccccccccccccccc",
+      sha256: "ccc",
+    },
+  ],
+}"#,
         )
         .unwrap();
 
@@ -4112,17 +4121,20 @@ sha256 = "ccc"
         )
         .unwrap();
         let lockfile = Lockfile::from_str(
-            r#"version = 1
-
-[[package]]
-name = "nu_plugin_inc"
-kind = "plugin"
-git = "https://github.com/nushell/nu_plugin_inc"
-tag = "v0.91.0"
-rev = "dddddddddddddddddddddddddddddddddddddddd"
-path = "nu_plugin_inc"
-sha256 = "ddd"
-"#,
+            r#"{
+  version: 1,
+  packages: [
+    {
+      name: "nu_plugin_inc",
+      kind: "plugin",
+      git: "https://github.com/nushell/nu_plugin_inc",
+      tag: "v0.91.0",
+      rev: "dddddddddddddddddddddddddddddddddddddddd",
+      path: "nu_plugin_inc",
+      sha256: "ddd",
+    },
+  ],
+}"#,
         )
         .unwrap();
 
@@ -4136,16 +4148,19 @@ sha256 = "ddd"
         )
         .unwrap();
         let lockfile = Lockfile::from_str(
-            r#"version = 1
-
-[[package]]
-name = "nu_plugin_polars"
-kind = "plugin"
-git = "nu-core"
-rev = "nu-0.111.0"
-path = "nu_plugin_polars"
-sha256 = "ddd"
-"#,
+            r#"{
+  version: 1,
+  packages: [
+    {
+      name: "nu_plugin_polars",
+      kind: "plugin",
+      git: "nu-core",
+      rev: "nu-0.111.0",
+      path: "nu_plugin_polars",
+      sha256: "ddd",
+    },
+  ],
+}"#,
         )
         .unwrap();
 
@@ -4159,16 +4174,19 @@ sha256 = "ddd"
         )
         .unwrap();
         let lockfile = Lockfile::from_str(
-            r#"version = 1
-
-[[package]]
-name = "nu_plugin_polars"
-kind = "plugin"
-git = "nu-core"
-rev = "nu-0.111.0"
-path = "nu_plugin_polars"
-sha256 = "ddd"
-"#,
+            r#"{
+  version: 1,
+  packages: [
+    {
+      name: "nu_plugin_polars",
+      kind: "plugin",
+      git: "nu-core",
+      rev: "nu-0.111.0",
+      path: "nu_plugin_polars",
+      sha256: "ddd",
+    },
+  ],
+}"#,
         )
         .unwrap();
 
@@ -4211,15 +4229,18 @@ sha256 = "ddd"
     #[test]
     fn resolved_module_matches_existing_lock_requires_exact_resolved_identity() {
         let lockfile = Lockfile::from_str(
-            r#"version = 1
-
-[[package]]
-name = "nu-salesforce"
-git = "https://github.com/freepicheep/nu-salesforce"
-tag = "v0.1.0"
-rev = "307444896bd7feedfacecafebeef1234567890ab"
-sha256 = "abc"
-"#,
+            r#"{
+  version: 1,
+  packages: [
+    {
+      name: "nu-salesforce",
+      git: "https://github.com/freepicheep/nu-salesforce",
+      tag: "v0.1.0",
+      rev: "307444896bd7feedfacecafebeef1234567890ab",
+      sha256: "abc",
+    },
+  ],
+}"#,
         )
         .unwrap();
         let matching = ResolvedDep {
@@ -4246,17 +4267,20 @@ sha256 = "abc"
     #[test]
     fn resolved_plugin_matches_existing_lock_checks_bin_and_ref() {
         let lockfile = Lockfile::from_str(
-            r#"version = 1
-
-[[package]]
-name = "nu_plugin_file"
-kind = "plugin"
-git = "https://github.com/fdncred/nu_plugin_file"
-tag = "v0.22.0"
-rev = "1234567890abcdef1234567890abcdef12345678"
-path = "nu_plugin_file"
-sha256 = "def"
-"#,
+            r#"{
+  version: 1,
+  packages: [
+    {
+      name: "nu_plugin_file",
+      kind: "plugin",
+      git: "https://github.com/fdncred/nu_plugin_file",
+      tag: "v0.22.0",
+      rev: "1234567890abcdef1234567890abcdef12345678",
+      path: "nu_plugin_file",
+      sha256: "def",
+    },
+  ],
+}"#,
         )
         .unwrap();
         let matching = ResolvedPlugin {
@@ -4292,16 +4316,19 @@ sha256 = "def"
     #[test]
     fn resolved_plugin_matches_existing_lock_allows_nu_core_versioned_lock_entries() {
         let lockfile = Lockfile::from_str(
-            r#"version = 1
-
-[[package]]
-name = "nu_plugin_polars"
-kind = "plugin"
-git = "nu-core"
-rev = "nu-0.111.0"
-path = "nu_plugin_polars"
-sha256 = "ghi"
-"#,
+            r#"{
+  version: 1,
+  packages: [
+    {
+      name: "nu_plugin_polars",
+      kind: "plugin",
+      git: "nu-core",
+      rev: "nu-0.111.0",
+      path: "nu_plugin_polars",
+      sha256: "ghi",
+    },
+  ],
+}"#,
         )
         .unwrap();
         let plugin = ResolvedPlugin {
@@ -4365,16 +4392,18 @@ sha256 = "ghi"
         std::fs::write(
             project_dir.join("quiver.lock"),
             r#"# This file is generated automatically. Do not edit.
-version = 1
-
-[[package]]
-name = "nu-utils"
-kind = "module"
-git = "https://github.com/example/nu-utils"
-tag = "v1.0.0"
-rev = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-sha256 = "aaa"
-"#,
+{
+  version: 1,
+  packages: [
+    {
+      name: "nu-utils",
+      git: "https://github.com/example/nu-utils",
+      tag: "v1.0.0",
+      rev: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      sha256: "aaa",
+    },
+  ],
+}"#,
         )
         .unwrap();
 
@@ -4396,15 +4425,18 @@ sha256 = "aaa"
         let lock_path = root.join("config.lock");
         std::fs::write(
             &lock_path,
-            r#"version = 1
-
-[[package]]
-name = "other"
-git = "https://github.com/example/other"
-tag = "v1.0.0"
-rev = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-sha256 = "aaa"
-"#,
+            r#"{
+  version: 1,
+  packages: [
+    {
+      name: "other",
+      git: "https://github.com/example/other",
+      tag: "v1.0.0",
+      rev: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      sha256: "aaa",
+    },
+  ],
+}"#,
         )
         .unwrap();
 
@@ -4435,15 +4467,18 @@ sha256 = "aaa"
         let lock_path = root.join("config.lock");
         std::fs::write(
             &lock_path,
-            r#"version = 1
-
-[[package]]
-name = "nu-utils"
-git = "https://github.com/example/nu-utils"
-tag = "v1.0.0"
-rev = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-sha256 = "aaa"
-"#,
+            r#"{
+  version: 1,
+  packages: [
+    {
+      name: "nu-utils",
+      git: "https://github.com/example/nu-utils",
+      tag: "v1.0.0",
+      rev: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      sha256: "aaa",
+    },
+  ],
+}"#,
         )
         .unwrap();
 
@@ -4474,15 +4509,18 @@ sha256 = "aaa"
         let lock_path = root.join("config.lock");
         std::fs::write(
             &lock_path,
-            r#"version = 1
-
-[[package]]
-name = "nu-utils"
-git = "https://github.com/example/nu-utils"
-tag = "v1.0.0"
-rev = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-sha256 = "aaa"
-"#,
+            r#"{
+  version: 1,
+  packages: [
+    {
+      name: "nu-utils",
+      git: "https://github.com/example/nu-utils",
+      tag: "v1.0.0",
+      rev: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      sha256: "aaa",
+    },
+  ],
+}"#,
         )
         .unwrap();
 
@@ -4515,17 +4553,20 @@ sha256 = "aaa"
         let lock_path = root.join("config.lock");
         std::fs::write(
             &lock_path,
-            r#"version = 1
-
-[[package]]
-name = "nu_plugin_inc"
-kind = "plugin"
-git = "https://github.com/nushell/nu_plugin_inc"
-tag = "v0.91.0"
-rev = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-path = "nu_plugin_inc"
-sha256 = "aaa"
-"#,
+            r#"{
+  version: 1,
+  packages: [
+    {
+      name: "nu_plugin_inc",
+      kind: "plugin",
+      git: "https://github.com/nushell/nu_plugin_inc",
+      tag: "v0.91.0",
+      rev: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      path: "nu_plugin_inc",
+      sha256: "aaa",
+    },
+  ],
+}"#,
         )
         .unwrap();
 

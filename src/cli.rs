@@ -92,7 +92,7 @@ pub enum Commands {
 
     /// Resolve and install dependencies from nupackage.nuon
     Install {
-        /// Install global modules (from ~/.config/quiver/config.toml)
+        /// Install global modules (from ~/.config/quiver/config.nuon)
         #[arg(short = 'g', long)]
         global: bool,
 
