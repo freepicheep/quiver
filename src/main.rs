@@ -240,7 +240,7 @@ fn cmd_init(
             description: Some(description.unwrap_or_default()),
             license: Some(String::new()),
             authors: detect_git_author_name().map(|author| vec![author]),
-            nu_version: nu_version.or_else(detect_nu_version),
+            nu_version: nu_version.or_else(|| detect_nu_version().map(|v| format!(">={v}"))),
         },
         dependencies: Default::default(),
     };
@@ -2415,6 +2415,27 @@ mod tests {
         assert_eq!(
             manifest.package.nu_version.as_deref(),
             Some(local_nu_version.as_str())
+        );
+
+        let _ = std::fs::remove_dir_all(project_dir);
+        let _ = std::fs::remove_dir_all(store_root);
+    }
+
+    #[test]
+    fn init_writes_detected_nu_version_as_greater_or_equal_range() {
+        let Some(detected) = detect_nu_version() else {
+            return;
+        };
+        let project_dir = make_temp_dir("init_detected_nu_version");
+        let (store_root, _guard) = seed_fake_nu_store(&detected);
+
+        cmd_init(&project_dir, None, "0.1.0".to_string(), None, None).unwrap();
+
+        let manifest_text = std::fs::read_to_string(project_dir.join("nupackage.nuon")).unwrap();
+        let manifest = Manifest::from_str(&manifest_text).unwrap();
+        assert_eq!(
+            manifest.package.nu_version.as_deref(),
+            Some(format!(">={detected}").as_str())
         );
 
         let _ = std::fs::remove_dir_all(project_dir);

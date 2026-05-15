@@ -2,11 +2,14 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use semver::VersionReq;
+
 use crate::checksum;
 use crate::error::{QuiverError, Result};
 use crate::git::{self, RefKind};
 use crate::lockfile::{LockedPackage, LockedPackageKind};
 use crate::manifest::{DependencySpec, Manifest, PluginDependencySpec};
+use crate::nu;
 use crate::safety;
 use crate::ui;
 
@@ -32,12 +35,17 @@ pub struct ResolvedPlugin {
 /// Resolve dependencies from a pre-built dependency map (used by global install).
 ///
 /// Returns a flat list of resolved dependencies, sorted by name.
+/// Pass `root_nu_version` to enable nu-version compatibility warnings for transitive deps.
 pub fn resolve_modules_from_deps(
     deps: &HashMap<String, DependencySpec>,
+    root_nu_version: Option<&str>,
 ) -> Result<Vec<ResolvedDep>> {
+    let root_nu_req = root_nu_version
+        .and_then(|v| nu::parse_nu_version_requirement(v).ok());
+
     let mut resolved: HashMap<String, ResolvedDep> = HashMap::new();
 
-    resolve_deps(deps, &mut resolved)?;
+    resolve_deps(deps, &mut resolved, root_nu_req.as_ref())?;
 
     // Return sorted for deterministic output
     let mut deps: Vec<_> = resolved.into_values().collect();
@@ -125,6 +133,7 @@ pub fn resolve_plugins_from_lock(locked: &[LockedPackage]) -> Vec<ResolvedPlugin
 fn resolve_deps(
     deps: &HashMap<String, DependencySpec>,
     resolved: &mut HashMap<String, ResolvedDep>,
+    root_nu_req: Option<&VersionReq>,
 ) -> Result<()> {
     for (name, spec) in deps {
         safety::validate_dependency_name(name, "module dependency")?;
@@ -179,13 +188,26 @@ fn resolve_deps(
         git::export_to(&repo_path, &rev, &tmp)?;
 
         if let Ok(dep_manifest) = Manifest::from_dir(&tmp) {
+            if let Some(root_req) = root_nu_req {
+                if let Some(dep_nu_version) = dep_manifest.package.nu_version.as_deref() {
+                    if let Ok(dep_req) = nu::parse_nu_version_requirement(dep_nu_version) {
+                        if !nu::nu_version_reqs_compatible(root_req, &dep_req) {
+                            ui::warn(format!(
+                                "dependency '{name}' requires nu-version '{dep_nu_version}', \
+                                 which may be incompatible with your package's nu-version requirement"
+                            ));
+                        }
+                    }
+                }
+            }
+
             if !dep_manifest.dependencies.modules.is_empty() {
                 ui::info(format!(
                     "{} transitive dependencies for {}",
                     ui::keyword("Resolving"),
                     name
                 ));
-                resolve_deps(&dep_manifest.dependencies.modules, resolved)?;
+                resolve_deps(&dep_manifest.dependencies.modules, resolved, root_nu_req)?;
             }
         }
 

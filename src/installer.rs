@@ -138,7 +138,10 @@ pub fn install_with_options(
                 Vec::new()
             } else {
                 ui::info(format!("{} module dependencies", ui::keyword("Resolving")));
-                resolver::resolve_modules_from_deps(&manifest.dependencies.modules)?
+                resolver::resolve_modules_from_deps(
+                    &manifest.dependencies.modules,
+                    manifest.package.nu_version.as_deref(),
+                )?
             };
             let resolved_plugins = if manifest.dependencies.plugins.is_empty() {
                 Vec::new()
@@ -156,7 +159,10 @@ pub fn install_with_options(
             Vec::new()
         } else {
             ui::info(format!("{} module dependencies", ui::keyword("Resolving")));
-            resolver::resolve_modules_from_deps(&manifest.dependencies.modules)?
+            resolver::resolve_modules_from_deps(
+                &manifest.dependencies.modules,
+                manifest.package.nu_version.as_deref(),
+            )?
         };
         let resolved_plugins = if manifest.dependencies.plugins.is_empty() {
             Vec::new()
@@ -257,7 +263,7 @@ pub fn install_global(frozen: bool, allow_unsigned: bool, no_build_fallback: boo
                     "{} global module dependencies",
                     ui::keyword("Resolving")
                 ));
-                resolved_modules.extend(resolver::resolve_modules_from_deps(&unresolved_modules)?);
+                resolved_modules.extend(resolver::resolve_modules_from_deps(&unresolved_modules, None)?);
                 resolved_modules.sort_by(|a, b| a.name.cmp(&b.name));
             }
 
