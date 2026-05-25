@@ -1,5 +1,20 @@
 # Unreleased
 
+# Version 0.7.2 (2026-05-25)
+
+## Added
+
+- Warn users if a dependency requires a `nu-version` incompatible with the package's `nu-version`.
+- Use the `tui-scrollview` crate for scrollviews in the TUI. This fixes a few bugs with the previous implementation.
+
+## Fixed
+
+- A few more situations where the TUI was getting jumbled with `eprintln!` commands.
+
+## Misc
+
+- Updated dependencies.
+
 # Version 0.7.1 (2026-05-12)
 
 ## Fixed
