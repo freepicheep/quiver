@@ -24,6 +24,7 @@ xz2 = "0.1"
 ratatui = "0.29"
 crossterm = "0.29"
 syntect = "5.2"
+tui-scrollview = "0.5"
 
 [dependencies.nu-protocol]
 version = "0.112.2"

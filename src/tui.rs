@@ -22,15 +22,15 @@ use leaves::{
 use ratatui::{
     Terminal,
     backend::CrosstermBackend,
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Rect, Size},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{
-        Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Scrollbar,
-        ScrollbarOrientation, ScrollbarState, Tabs, Wrap,
+        Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Tabs, Wrap,
     },
 };
 use syntect::{highlighting::ThemeSet, parsing::SyntaxSet};
+use tui_scrollview::{ScrollView, ScrollViewState, ScrollbarVisibility};
 
 use crate::config::{self, GlobalConfig};
 use crate::error::{QuiverError, Result};
@@ -205,9 +205,9 @@ struct App {
     selected: usize,
     search_selected: usize,
     ref_choice_selected: usize,
-    readme_scroll: u16,
-    detail_readme_scroll: u16,
-    graph_scroll: u16,
+    readme_scroll: ScrollViewState,
+    detail_readme_scroll: ScrollViewState,
+    graph_scroll: ScrollViewState,
     local_readme: String,
     local_license: String,
     status: String,
@@ -217,7 +217,7 @@ struct App {
     input_mode: InputMode,
     action: Option<TuiAction>,
     logs: Vec<LogLine>,
-    log_scroll: u16,
+    log_scroll: ScrollViewState,
     follow_log: bool,
     log_visible: bool,
     command_rx: Option<mpsc::Receiver<TuiCommandEvent>>,
@@ -332,9 +332,9 @@ impl App {
                 selected: 0,
                 search_selected: 0,
                 ref_choice_selected: 0,
-                readme_scroll: 0,
-                detail_readme_scroll: 0,
-                graph_scroll: 0,
+                readme_scroll: ScrollViewState::new(),
+                detail_readme_scroll: ScrollViewState::new(),
+                graph_scroll: ScrollViewState::new(),
                 local_readme,
                 local_license,
                 status,
@@ -345,7 +345,7 @@ impl App {
                 input_mode: InputMode::Normal,
                 action: None,
                 logs: vec![LogLine::Plain("Logs will show here".to_string())],
-                log_scroll: 0,
+                log_scroll: ScrollViewState::new(),
                 follow_log: true,
                 log_visible: false,
                 command_rx: None,
@@ -369,9 +369,9 @@ impl App {
                 selected: 0,
                 search_selected: 0,
                 ref_choice_selected: 0,
-                readme_scroll: 0,
-                detail_readme_scroll: 0,
-                graph_scroll: 0,
+                readme_scroll: ScrollViewState::new(),
+                detail_readme_scroll: ScrollViewState::new(),
+                graph_scroll: ScrollViewState::new(),
                 local_readme: String::new(),
                 local_license: String::new(),
                 status: "No quiver project here. Enter creates one, Esc quits.".to_string(),
@@ -383,7 +383,7 @@ impl App {
                 logs: vec![LogLine::Plain(
                     "Open a quiver project to run commands here.".to_string(),
                 )],
-                log_scroll: 0,
+                log_scroll: ScrollViewState::new(),
                 follow_log: true,
                 log_visible: false,
                 command_rx: None,
@@ -421,9 +421,9 @@ impl App {
             selected: 0,
             search_selected: 0,
             ref_choice_selected: 0,
-            readme_scroll: 0,
-            detail_readme_scroll: 0,
-            graph_scroll: 0,
+            readme_scroll: ScrollViewState::new(),
+            detail_readme_scroll: ScrollViewState::new(),
+            graph_scroll: ScrollViewState::new(),
             local_readme,
             local_license,
             status,
@@ -434,7 +434,7 @@ impl App {
             input_mode: InputMode::Normal,
             action: None,
             logs: vec![LogLine::Plain("Logs will show here".to_string())],
-            log_scroll: 0,
+            log_scroll: ScrollViewState::new(),
             follow_log: true,
             log_visible: false,
             command_rx: None,
@@ -501,19 +501,21 @@ impl App {
     }
 
     fn scroll_log_to_bottom(&mut self) {
-        let visible_tail = 6usize;
-        self.log_scroll = self.logs.len().saturating_sub(visible_tail) as u16;
+        self.log_scroll.scroll_to_bottom();
         self.follow_log = true;
     }
 
     fn scroll_log_down(&mut self, amount: u16) {
-        let max_scroll = self.logs.len().saturating_sub(1) as u16;
-        self.log_scroll = self.log_scroll.saturating_add(amount).min(max_scroll);
-        self.follow_log = self.log_scroll >= self.logs.len().saturating_sub(6) as u16;
+        for _ in 0..amount {
+            self.log_scroll.scroll_down();
+        }
+        self.follow_log = false;
     }
 
     fn scroll_log_up(&mut self, amount: u16) {
-        self.log_scroll = self.log_scroll.saturating_sub(amount);
+        for _ in 0..amount {
+            self.log_scroll.scroll_up();
+        }
         self.follow_log = false;
     }
 
@@ -866,8 +868,42 @@ fn focused_block<'a>(app: &App, region: FocusRegion, title: impl Into<Line<'a>>)
     }
 }
 
+fn wrapped_line_count(lines: &[Line<'static>], width: u16) -> usize {
+    if width == 0 {
+        return lines.len();
+    }
+    let w = width as usize;
+    lines
+        .iter()
+        .map(|line| {
+            let chars: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
+            if chars == 0 { 1 } else { chars.div_ceil(w) }
+        })
+        .sum()
+}
+
+fn render_markdown_scrollview(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    content: &str,
+    state: &mut ScrollViewState,
+) {
+    let text_width = area.width.saturating_sub(1).max(1);
+    let lines = markdown_lines(content, text_width);
+    let content_height = (wrapped_line_count(&lines, text_width) as u16).max(1);
+
+    let mut scroll_view = ScrollView::new(Size::new(text_width, content_height))
+        .horizontal_scrollbar_visibility(ScrollbarVisibility::Never)
+        .vertical_scrollbar_visibility(ScrollbarVisibility::Automatic);
+    scroll_view.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: false }),
+        Rect::new(0, 0, text_width, content_height),
+    );
+    frame.render_stateful_widget(scroll_view, area, state);
+}
+
 fn markdown_lines(content: &str, width: u16) -> Vec<Line<'static>> {
-    let render_width = usize::from(width.saturating_sub(2)).max(20);
+    let render_width = usize::from(width).max(1);
     let syntect_theme = MARKDOWN_THEME_SET
         .themes
         .get("ansi")
@@ -909,15 +945,9 @@ fn region_rect(app: &App, region: FocusRegion) -> Option<Rect> {
 
 fn scroll_focused(app: &mut App, amount: i16) {
     match app.focus {
-        FocusRegion::DependencyReadme => {
-            app.detail_readme_scroll = offset_scroll(app.detail_readme_scroll, amount);
-        }
-        FocusRegion::Graph => {
-            app.graph_scroll = offset_scroll(app.graph_scroll, amount);
-        }
-        FocusRegion::SearchReadme => {
-            app.readme_scroll = offset_scroll(app.readme_scroll, amount);
-        }
+        FocusRegion::DependencyReadme => offset_scroll(&mut app.detail_readme_scroll, amount),
+        FocusRegion::Graph => offset_scroll(&mut app.graph_scroll, amount),
+        FocusRegion::SearchReadme => offset_scroll(&mut app.readme_scroll, amount),
         FocusRegion::CommandLog => {
             if amount >= 0 {
                 app.scroll_log_down(amount as u16);
@@ -929,11 +959,15 @@ fn scroll_focused(app: &mut App, amount: i16) {
     }
 }
 
-fn offset_scroll(current: u16, amount: i16) -> u16 {
+fn offset_scroll(state: &mut ScrollViewState, amount: i16) {
     if amount >= 0 {
-        current.saturating_add(amount as u16)
+        for _ in 0..amount {
+            state.scroll_down();
+        }
     } else {
-        current.saturating_sub(amount.unsigned_abs())
+        for _ in 0..amount.unsigned_abs() {
+            state.scroll_up();
+        }
     }
 }
 
@@ -1124,20 +1158,14 @@ fn render_dependencies(frame: &mut ratatui::Frame<'_>, app: &mut App, area: Rect
         app.local_readme.as_str()
     };
 
-    let readme_lines = markdown_lines(readme_content, right_chunks[1].width);
-    let content_height = readme_lines.len().saturating_sub(1) as u16;
-    let readme_paragraph = Paragraph::new(readme_lines)
-        .block(focused_block(app, FocusRegion::DependencyReadme, "README"))
-        .scroll((app.detail_readme_scroll, 0))
-        .wrap(Wrap { trim: false });
-    frame.render_widget(readme_paragraph, right_chunks[1]);
-
-    let mut scrollbar_state =
-        ScrollbarState::new(content_height as usize).position(app.detail_readme_scroll as usize);
-    frame.render_stateful_widget(
-        Scrollbar::new(ScrollbarOrientation::VerticalRight),
-        right_chunks[1],
-        &mut scrollbar_state,
+    let block = focused_block(app, FocusRegion::DependencyReadme, "README");
+    let inner_area = block.inner(right_chunks[1]);
+    frame.render_widget(block, right_chunks[1]);
+    render_markdown_scrollview(
+        frame,
+        inner_area,
+        readme_content,
+        &mut app.detail_readme_scroll,
     );
 }
 
@@ -1308,7 +1336,7 @@ fn draw_dep_box(
     (x, y + 2)
 }
 
-fn render_graph(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
+fn render_graph(frame: &mut ratatui::Frame<'_>, app: &mut App, area: Rect) {
     let mut deps = Vec::new();
 
     let direct: Vec<_> = app
@@ -1381,13 +1409,27 @@ fn render_graph(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
 
     let text = canvas.to_string();
 
-    frame.render_widget(
-        Paragraph::new(text)
-            .block(focused_block(app, FocusRegion::Graph, "Dependency Graph"))
-            .scroll((app.graph_scroll, 0))
-            .wrap(Wrap { trim: false }),
-        area,
+    let block = focused_block(app, FocusRegion::Graph, "Dependency Graph");
+    let inner_area = block.inner(area);
+    frame.render_widget(block, area);
+
+    let lines: Vec<&str> = text.lines().collect();
+    let content_width = lines
+        .iter()
+        .map(|line| line.chars().count() as u16)
+        .max()
+        .unwrap_or(0)
+        .max(inner_area.width);
+    let content_height = lines.len() as u16;
+
+    let mut scroll_view = ScrollView::new(Size::new(content_width, content_height))
+        .horizontal_scrollbar_visibility(ScrollbarVisibility::Never)
+        .vertical_scrollbar_visibility(ScrollbarVisibility::Automatic);
+    scroll_view.render_widget(
+        Paragraph::new(text),
+        Rect::new(0, 0, content_width, content_height),
     );
+    frame.render_stateful_widget(scroll_view, inner_area, &mut app.graph_scroll);
 }
 
 fn render_search(frame: &mut ratatui::Frame<'_>, app: &mut App, area: Rect) {
@@ -1412,20 +1454,14 @@ fn render_search(frame: &mut ratatui::Frame<'_>, app: &mut App, area: Rect) {
         chunks[0],
     );
 
-    let readme_lines = markdown_lines(app.readme.as_str(), chunks[1].width);
-    let content_height = readme_lines.len().saturating_sub(1) as u16;
-    let paragraph = Paragraph::new(readme_lines)
-        .block(focused_block(app, FocusRegion::SearchReadme, "README"))
-        .scroll((app.readme_scroll, 0))
-        .wrap(Wrap { trim: false });
-    frame.render_widget(paragraph, chunks[1]);
-
-    let mut scrollbar_state =
-        ScrollbarState::new(content_height as usize).position(app.readme_scroll as usize);
-    frame.render_stateful_widget(
-        Scrollbar::new(ScrollbarOrientation::VerticalRight),
-        chunks[1],
-        &mut scrollbar_state,
+    let block = focused_block(app, FocusRegion::SearchReadme, "README");
+    let inner_area = block.inner(chunks[1]);
+    frame.render_widget(block, chunks[1]);
+    render_markdown_scrollview(
+        frame,
+        inner_area,
+        app.readme.as_str(),
+        &mut app.readme_scroll,
     );
 }
 
@@ -1457,8 +1493,8 @@ fn render_footer(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
     );
 }
 
-fn render_log(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
-    let lines = if app.logs.is_empty() {
+fn render_log(frame: &mut ratatui::Frame<'_>, app: &mut App, area: Rect) {
+    let lines: Vec<Line<'static>> = if app.logs.is_empty() {
         vec![Line::from("No commands run yet.")]
     } else {
         app.logs.iter().map(log_line).collect()
@@ -1468,21 +1504,23 @@ fn render_log(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
     } else {
         "Command Log"
     };
-    frame.render_widget(
-        Paragraph::new(lines)
-            .block(focused_block(app, FocusRegion::CommandLog, title))
-            .scroll((app.log_scroll, 0))
-            .wrap(Wrap { trim: false }),
-        area,
-    );
+    let block = focused_block(app, FocusRegion::CommandLog, title);
+    let inner_area = block.inner(area);
+    frame.render_widget(block, area);
 
-    let content_height = app.logs.len().saturating_sub(1);
-    let mut scrollbar_state = ScrollbarState::new(content_height).position(app.log_scroll as usize);
-    frame.render_stateful_widget(
-        Scrollbar::new(ScrollbarOrientation::VerticalRight),
-        area,
-        &mut scrollbar_state,
-    );
+    let text_width = inner_area.width.saturating_sub(1).max(1);
+    let content_height = wrapped_line_count(&lines, text_width).max(1) as u16;
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+
+    let mut scroll_view = ScrollView::new(Size::new(text_width, content_height))
+        .horizontal_scrollbar_visibility(ScrollbarVisibility::Never)
+        .vertical_scrollbar_visibility(ScrollbarVisibility::Automatic);
+    scroll_view.render_widget(paragraph, Rect::new(0, 0, text_width, content_height));
+
+    if app.follow_log {
+        app.log_scroll.scroll_to_bottom();
+    }
+    frame.render_stateful_widget(scroll_view, inner_area, &mut app.log_scroll);
 }
 
 fn log_line(line: &LogLine) -> Line<'static> {
@@ -1697,7 +1735,7 @@ fn handle_normal_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
                     app.search_selected += 1;
                 }
             } else if app.focus == FocusRegion::Graph {
-                app.graph_scroll = app.graph_scroll.saturating_add(1);
+                app.graph_scroll.scroll_down();
             } else if app.focus == FocusRegion::DependencyList && app.selected + 1 < app.rows.len()
             {
                 app.selected += 1;
@@ -1710,7 +1748,7 @@ fn handle_normal_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
                     app.search_selected -= 1;
                 }
             } else if app.focus == FocusRegion::Graph {
-                app.graph_scroll = app.graph_scroll.saturating_sub(1);
+                app.graph_scroll.scroll_up();
             } else if app.focus == FocusRegion::DependencyList && app.selected > 0 {
                 app.selected -= 1;
                 reload_selected_dist_info(app);
@@ -1730,11 +1768,11 @@ fn handle_normal_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
         }
         KeyCode::Home => {
             if app.focus == FocusRegion::SearchReadme {
-                app.readme_scroll = 0;
+                app.readme_scroll.scroll_to_top();
             } else if app.focus == FocusRegion::DependencyReadme {
-                app.detail_readme_scroll = 0;
+                app.detail_readme_scroll.scroll_to_top();
             } else if app.focus == FocusRegion::Graph {
-                app.graph_scroll = 0;
+                app.graph_scroll.scroll_to_top();
             } else if app.focus == FocusRegion::DependencyList {
                 app.selected = 0;
             }
@@ -1910,7 +1948,7 @@ fn handle_url_key(app: &mut App, code: KeyCode) {
                 match fetch_github_readme(&url) {
                     Ok(readme) => {
                         app.readme = readme;
-                        app.readme_scroll = 0;
+                        app.readme_scroll.scroll_to_top();
                         app.status =
                             "README loaded. Press m to add as module, or p to add as plugin."
                                 .to_string();
@@ -2023,11 +2061,11 @@ fn reload_selected_dist_info(app: &mut App) {
         let (readme, license) = load_dist_info_at(&base_dir, row);
         app.local_readme = readme;
         app.local_license = license;
-        app.detail_readme_scroll = 0;
+        app.detail_readme_scroll.scroll_to_top();
     } else {
         app.local_readme.clear();
         app.local_license.clear();
-        app.detail_readme_scroll = 0;
+        app.detail_readme_scroll.scroll_to_top();
     }
 }
 
@@ -2181,9 +2219,9 @@ mod tests {
             selected: 0,
             search_selected: 0,
             ref_choice_selected: 0,
-            readme_scroll: 0,
-            detail_readme_scroll: 0,
-            graph_scroll: 0,
+            readme_scroll: ScrollViewState::new(),
+            detail_readme_scroll: ScrollViewState::new(),
+            graph_scroll: ScrollViewState::new(),
             local_readme: String::new(),
             local_license: String::new(),
             status: String::new(),
@@ -2193,7 +2231,7 @@ mod tests {
             input_mode: InputMode::Normal,
             action: None,
             logs: Vec::new(),
-            log_scroll: 0,
+            log_scroll: ScrollViewState::new(),
             follow_log: true,
             log_visible: false,
             command_rx: None,

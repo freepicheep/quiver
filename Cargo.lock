@@ -1961,6 +1961,7 @@ dependencies = [
  "syntect",
  "tar",
  "thiserror 2.0.18",
+ "tui-scrollview",
  "walkdir",
  "xz2",
  "zip",
@@ -2592,6 +2593,16 @@ dependencies = [
  "tracing",
  "tracing-core",
  "tracing-serde",
+]
+
+[[package]]
+name = "tui-scrollview"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cea93a4789dc04a89aa6aeda29dd581b18f88cbbcf19702baf8325814b4af394"
+dependencies = [
+ "indoc",
+ "ratatui",
 ]
 
 [[package]]
