@@ -193,7 +193,7 @@ This generates:
 
 ## nupackage.nuon
 
-```nuon
+```nushell
 {
   package: {
     name: "my-module",
@@ -239,23 +239,23 @@ Plugin dependencies support either:
 | `qv version` / `qv -v` / `qv -V` / `qv --version` | Print quiver version |
 | `qv hook` | Print the auto-activate hook for config.nu |
 
-## Global config (`~/.config/quiver/config.toml`)
+## Global config (`~/.config/quiver/config.nuon`)
 
 You can set a default git provider used for `owner/repo` shorthand in `qv add`.
 Global config manages global module dependencies.
 
-```toml
-default_git_provider = "github" # default
-install_mode = "clone"          # default on macOS/Linux; default is "hardlink" on Windows
-
-# optional override
-# modules_dir = "/custom/modules"
-
-[dependencies]
-nu-utils = { git = "https://github.com/user/nu-utils", tag = "v1.0.0" }
-
-[security]
-require_signed_assets = true # default
+```nushell
+{
+  default_git_provider: "github",
+  install_mode: "clone",
+  security: {
+    require_signed_assets: true,
+  },
+  modules: {
+    nu-repl-command-info: { git: "https://github.com/Bahex/nu-repl-command-info.git", branch: "main" },
+    nu-salesforce: { git: "https://github.com/freepicheep/nu-salesforce", tag: "v0.3.2" },
+  },
+}
 ```
 
 Supported provider aliases are `github`, `gitlab`, `codeberg`, and `bitbucket`.
