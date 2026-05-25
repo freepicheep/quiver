@@ -40,8 +40,7 @@ pub fn resolve_modules_from_deps(
     deps: &HashMap<String, DependencySpec>,
     root_nu_version: Option<&str>,
 ) -> Result<Vec<ResolvedDep>> {
-    let root_nu_req = root_nu_version
-        .and_then(|v| nu::parse_nu_version_requirement(v).ok());
+    let root_nu_req = root_nu_version.and_then(|v| nu::parse_nu_version_requirement(v).ok());
 
     let mut resolved: HashMap<String, ResolvedDep> = HashMap::new();
 

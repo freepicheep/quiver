@@ -98,11 +98,17 @@ fn req_to_range(req: &VersionReq) -> Range {
 }
 
 fn inc(v: Version) -> Bound {
-    Bound { version: v, inclusive: true }
+    Bound {
+        version: v,
+        inclusive: true,
+    }
 }
 
 fn exc(v: Version) -> Bound {
-    Bound { version: v, inclusive: false }
+    Bound {
+        version: v,
+        inclusive: false,
+    }
 }
 
 fn comparator_to_range(c: &Comparator) -> Range {

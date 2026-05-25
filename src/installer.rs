@@ -263,7 +263,10 @@ pub fn install_global(frozen: bool, allow_unsigned: bool, no_build_fallback: boo
                     "{} global module dependencies",
                     ui::keyword("Resolving")
                 ));
-                resolved_modules.extend(resolver::resolve_modules_from_deps(&unresolved_modules, None)?);
+                resolved_modules.extend(resolver::resolve_modules_from_deps(
+                    &unresolved_modules,
+                    None,
+                )?);
                 resolved_modules.sort_by(|a, b| a.name.cmp(&b.name));
             }
 
