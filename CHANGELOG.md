@@ -1,5 +1,15 @@
 # Unreleased
 
+# Version 0.7.3 (2026-05-26)
+
+## Added
+
+- Dependency fetching and installation now runs in parallel via `rayon`. Module clones, plugin asset downloads, and module exports all proceed concurrently, significantly reducing install times for projects with multiple dependencies.
+
+## Fixed
+
+- `qv run` now correctly invokes `.nu-env/bin/nu` instead of falling back to the system `nu` binary. Previously, the project-local Nushell binary was ignored, meaning scripts could run against the wrong Nushell version.
+
 # Version 0.7.2 (2026-05-25)
 
 ## Added
