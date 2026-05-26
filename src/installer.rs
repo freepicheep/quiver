@@ -2,9 +2,11 @@ use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use flate2::read::GzDecoder;
+use rayon::prelude::*;
 use semver::{Version, VersionReq};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -33,6 +35,8 @@ const QUIVER_SKIP_NU_INSTALL_ENV: &str = "QUIVER_SKIP_NU_INSTALL";
 const QUIVER_NU_BIN_ENV: &str = "QUIVER_NU_BIN";
 
 static GITHUB_RELEASE_CACHE: OnceLock<Mutex<HashMap<String, Vec<GitHubRelease>>>> = OnceLock::new();
+static INTERACTIVE_PROMPT_LOCK: Mutex<()> = Mutex::new(());
+static STAGING_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Default)]
 struct NupmMetadataHints {
@@ -326,7 +330,6 @@ fn install_resolved_global(
     } else {
         None
     };
-    let mut plugin_targets = Vec::new();
     let changed_module_count = modules
         .iter()
         .filter(|dep| !resolved_module_matches_existing_lock(dep, existing_lockfile.as_ref()))
@@ -336,143 +339,37 @@ fn install_resolved_global(
         .filter(|plugin| !resolved_plugin_matches_existing_lock(plugin, existing_lockfile.as_ref()))
         .count();
 
-    for dep in modules {
-        safety::validate_dependency_name(&dep.name, "module dependency")?;
-        let existing_locked_module = existing_lockfile
-            .as_ref()
-            .and_then(|lock| lock.find_package(&dep.name, LockedPackageKind::Module));
-        let module_is_current =
-            installed_global_module_matches_lock(dep, modules_dir, existing_locked_module)?;
-        if !module_is_current {
-            ui::info(format!(
-                "{} module {}@{}",
-                ui::keyword("Installing"),
-                dep.name,
-                &dep.rev[..12.min(dep.rev.len())]
-            ));
-            install_dep(dep, modules_dir, install_mode)?;
-        }
-
-        let dest = modules_dir.join(&dep.name);
-        let sha256 = if module_is_current {
-            existing_locked_module
-                .map(|locked| locked.sha256.clone())
-                .ok_or_else(|| {
-                    crate::error::QuiverError::Other(format!(
-                        "missing existing lockfile entry for module '{}'",
-                        dep.name
-                    ))
-                })?
-        } else {
-            resolver::compute_checksum(&dest)?
-        };
-        if frozen {
-            verify_frozen_checksum(
+    let module_locks: Vec<LockedPackage> = modules
+        .par_iter()
+        .map(|dep| {
+            install_global_module_and_lock(
+                dep,
+                modules_dir,
+                install_mode,
+                frozen,
                 frozen_lockfile,
-                &dep.name,
-                LockedPackageKind::Module,
-                &sha256,
-            )?;
-        }
+                existing_lockfile.as_ref(),
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    locked_packages.extend(module_locks);
 
-        locked_packages.push(LockedPackage {
-            name: dep.name.clone(),
-            kind: LockedPackageKind::Module,
-            git: dep.git.clone(),
-            tag: dep.tag.clone(),
-            rev: dep.rev.clone(),
-            path: None,
-            sha256,
-            asset_sha256: None,
-            asset_url: None,
-        });
-    }
-
-    for plugin in plugins {
-        safety::validate_dependency_name(&plugin.name, "plugin dependency")?;
-        if let Some(bin) = plugin.bin.as_deref() {
-            safety::validate_binary_name(bin, "plugin dependency bin")?;
-        }
-        let frozen_locked_plugin = frozen_lockfile
-            .and_then(|lock| lock.find_package(&plugin.name, LockedPackageKind::Plugin));
-        let plugin_install = install_plugin(plugin, None, security_policy, frozen_locked_plugin)?;
-        let installed_bin = plugin_install.installed_bin;
-        let bin_name = plugin_install.bin_name;
-        let version_dir = plugin_install.version_dir;
-        if !resolved_plugin_matches_existing_lock(plugin, existing_lockfile.as_ref()) {
-            ui::info(format!(
-                "{} plugin {}@{}",
-                ui::keyword("Installing"),
-                plugin.name,
-                plugin_install_display_ref(plugin, &version_dir)
-            ));
-        }
-        let sha256 = resolver::compute_checksum(&version_dir)?;
-        if frozen {
-            verify_frozen_checksum(
+    let plugin_results: Vec<(LockedPackage, (String, PathBuf))> = plugins
+        .par_iter()
+        .map(|plugin| {
+            install_global_plugin_and_lock(
+                plugin,
+                security_policy,
+                frozen,
                 frozen_lockfile,
-                &plugin.name,
-                LockedPackageKind::Plugin,
-                &sha256,
-            )?;
-        }
-        if frozen
-            && let Some(expected_asset_sha) =
-                frozen_locked_plugin.and_then(|locked| locked.asset_sha256.as_deref())
-        {
-            let actual_asset_sha = plugin_install.asset_metadata.asset_sha256.as_deref().ok_or_else(|| {
-                crate::error::QuiverError::Lockfile(format!(
-                    "frozen install requires downloaded asset_sha256 for plugin '{}' but no verified release asset digest was recorded",
-                    plugin.name
-                ))
-            })?;
-            if expected_asset_sha != actual_asset_sha {
-                return Err(crate::error::QuiverError::Lockfile(format!(
-                    "frozen install asset checksum mismatch for plugin '{}': expected {}, got {}",
-                    plugin.name, expected_asset_sha, actual_asset_sha
-                )));
-            }
-        }
-
-        let existing_metadata = existing_lockfile
-            .as_ref()
-            .and_then(|lock| lock.find_package(&plugin.name, LockedPackageKind::Plugin));
-        let asset_sha256 = plugin_install
-            .asset_metadata
-            .asset_sha256
-            .or_else(|| existing_metadata.and_then(|pkg| pkg.asset_sha256.clone()));
-        let asset_url = plugin_install
-            .asset_metadata
-            .asset_url
-            .or_else(|| existing_metadata.and_then(|pkg| pkg.asset_url.clone()));
-
-        let locked_tag = if plugin.git == "nu-core" {
-            None
-        } else {
-            plugin.tag.clone()
-        };
-        let locked_rev = if plugin.git == "nu-core" {
-            version_dir
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("nu-core")
-                .to_string()
-        } else {
-            plugin.rev.clone()
-        };
-
-        plugin_targets.push((plugin_registry_name(&bin_name), installed_bin));
-        locked_packages.push(LockedPackage {
-            name: plugin.name.clone(),
-            kind: LockedPackageKind::Plugin,
-            git: plugin.git.clone(),
-            tag: locked_tag,
-            rev: locked_rev,
-            path: Some(bin_name),
-            sha256,
-            asset_sha256,
-            asset_url,
-        });
+                existing_lockfile.as_ref(),
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut plugin_targets = Vec::with_capacity(plugin_results.len());
+    for (locked, target) in plugin_results {
+        locked_packages.push(locked);
+        plugin_targets.push(target);
     }
 
     locked_packages.sort_by(|a, b| a.kind.cmp(&b.kind).then(a.name.cmp(&b.name)));
@@ -725,129 +622,27 @@ fn install_resolved(
         None
     };
 
-    for dep in modules {
-        safety::validate_dependency_name(&dep.name, "module dependency")?;
-        ui::info(format!(
-            "{} module {}@{}",
-            ui::keyword("Installing"),
-            dep.name,
-            &dep.rev[..12.min(dep.rev.len())]
-        ));
-        install_dep(dep, modules_dir, install_mode)?;
+    let module_locks: Vec<LockedPackage> = modules
+        .par_iter()
+        .map(|dep| install_module_and_lock(dep, modules_dir, install_mode, frozen, frozen_lockfile))
+        .collect::<Result<Vec<_>>>()?;
+    locked_packages.extend(module_locks);
 
-        let dest = modules_dir.join(&dep.name);
-        let sha256 = resolver::compute_checksum(&dest)?;
-        if frozen {
-            verify_frozen_checksum(
+    let plugin_locks: Vec<LockedPackage> = plugins
+        .par_iter()
+        .map(|plugin| {
+            install_plugin_and_lock(
+                plugin,
+                bin_dir,
+                nu_version_req,
+                security_policy,
+                frozen,
                 frozen_lockfile,
-                &dep.name,
-                LockedPackageKind::Module,
-                &sha256,
-            )?;
-        }
-
-        locked_packages.push(LockedPackage {
-            name: dep.name.clone(),
-            kind: LockedPackageKind::Module,
-            git: dep.git.clone(),
-            tag: dep.tag.clone(),
-            rev: dep.rev.clone(),
-            path: None,
-            sha256,
-            asset_sha256: None,
-            asset_url: None,
-        });
-    }
-
-    for plugin in plugins {
-        safety::validate_dependency_name(&plugin.name, "plugin dependency")?;
-        if let Some(bin) = plugin.bin.as_deref() {
-            safety::validate_binary_name(bin, "plugin dependency bin")?;
-        }
-        let frozen_locked_plugin = frozen_lockfile
-            .and_then(|lock| lock.find_package(&plugin.name, LockedPackageKind::Plugin));
-        let plugin_install = install_plugin(
-            plugin,
-            nu_version_req,
-            security_policy,
-            frozen_locked_plugin,
-        )?;
-        let installed_bin = plugin_install.installed_bin;
-        let bin_name = plugin_install.bin_name;
-        let version_dir = plugin_install.version_dir;
-        ui::info(format!(
-            "{} plugin {}@{}",
-            ui::keyword("Installing"),
-            plugin.name,
-            plugin_install_display_ref(plugin, &version_dir)
-        ));
-        link_plugin_into_env(&installed_bin, bin_dir, &bin_name)?;
-        let sha256 = resolver::compute_checksum(&version_dir)?;
-        if frozen {
-            verify_frozen_checksum(
-                frozen_lockfile,
-                &plugin.name,
-                LockedPackageKind::Plugin,
-                &sha256,
-            )?;
-        }
-        if frozen
-            && let Some(expected_asset_sha) =
-                frozen_locked_plugin.and_then(|locked| locked.asset_sha256.as_deref())
-        {
-            let actual_asset_sha = plugin_install.asset_metadata.asset_sha256.as_deref().ok_or_else(|| {
-                crate::error::QuiverError::Lockfile(format!(
-                    "frozen install requires downloaded asset_sha256 for plugin '{}' but no verified release asset digest was recorded",
-                    plugin.name
-                ))
-            })?;
-            if expected_asset_sha != actual_asset_sha {
-                return Err(crate::error::QuiverError::Lockfile(format!(
-                    "frozen install asset checksum mismatch for plugin '{}': expected {}, got {}",
-                    plugin.name, expected_asset_sha, actual_asset_sha
-                )));
-            }
-        }
-
-        let existing_metadata = existing_lockfile
-            .as_ref()
-            .and_then(|lock| lock.find_package(&plugin.name, LockedPackageKind::Plugin));
-        let asset_sha256 = plugin_install
-            .asset_metadata
-            .asset_sha256
-            .or_else(|| existing_metadata.and_then(|pkg| pkg.asset_sha256.clone()));
-        let asset_url = plugin_install
-            .asset_metadata
-            .asset_url
-            .or_else(|| existing_metadata.and_then(|pkg| pkg.asset_url.clone()));
-
-        let locked_tag = if plugin.git == "nu-core" {
-            None
-        } else {
-            plugin.tag.clone()
-        };
-        let locked_rev = if plugin.git == "nu-core" {
-            version_dir
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("nu-core")
-                .to_string()
-        } else {
-            plugin.rev.clone()
-        };
-
-        locked_packages.push(LockedPackage {
-            name: plugin.name.clone(),
-            kind: LockedPackageKind::Plugin,
-            git: plugin.git.clone(),
-            tag: locked_tag,
-            rev: locked_rev,
-            path: Some(bin_name),
-            sha256,
-            asset_sha256,
-            asset_url,
-        });
-    }
+                existing_lockfile.as_ref(),
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    locked_packages.extend(plugin_locks);
 
     locked_packages.sort_by(|a, b| a.kind.cmp(&b.kind).then(a.name.cmp(&b.name)));
 
@@ -2230,6 +2025,295 @@ struct PluginInstallResult {
     asset_metadata: DownloadVerificationMetadata,
 }
 
+fn install_global_module_and_lock(
+    dep: &ResolvedDep,
+    modules_dir: &Path,
+    install_mode: InstallMode,
+    frozen: bool,
+    frozen_lockfile: Option<&Lockfile>,
+    existing_lockfile: Option<&Lockfile>,
+) -> Result<LockedPackage> {
+    safety::validate_dependency_name(&dep.name, "module dependency")?;
+    let existing_locked_module =
+        existing_lockfile.and_then(|lock| lock.find_package(&dep.name, LockedPackageKind::Module));
+    let module_is_current =
+        installed_global_module_matches_lock(dep, modules_dir, existing_locked_module)?;
+    if !module_is_current {
+        ui::info(format!(
+            "{} module {}@{}",
+            ui::keyword("Installing"),
+            dep.name,
+            &dep.rev[..12.min(dep.rev.len())]
+        ));
+        install_dep(dep, modules_dir, install_mode)?;
+    }
+
+    let dest = modules_dir.join(&dep.name);
+    let sha256 = if module_is_current {
+        existing_locked_module
+            .map(|locked| locked.sha256.clone())
+            .ok_or_else(|| {
+                crate::error::QuiverError::Other(format!(
+                    "missing existing lockfile entry for module '{}'",
+                    dep.name
+                ))
+            })?
+    } else {
+        resolver::compute_checksum(&dest)?
+    };
+    if frozen {
+        verify_frozen_checksum(
+            frozen_lockfile,
+            &dep.name,
+            LockedPackageKind::Module,
+            &sha256,
+        )?;
+    }
+
+    Ok(LockedPackage {
+        name: dep.name.clone(),
+        kind: LockedPackageKind::Module,
+        git: dep.git.clone(),
+        tag: dep.tag.clone(),
+        rev: dep.rev.clone(),
+        path: None,
+        sha256,
+        asset_sha256: None,
+        asset_url: None,
+    })
+}
+
+fn install_global_plugin_and_lock(
+    plugin: &ResolvedPlugin,
+    security_policy: SecurityPolicy,
+    frozen: bool,
+    frozen_lockfile: Option<&Lockfile>,
+    existing_lockfile: Option<&Lockfile>,
+) -> Result<(LockedPackage, (String, PathBuf))> {
+    safety::validate_dependency_name(&plugin.name, "plugin dependency")?;
+    if let Some(bin) = plugin.bin.as_deref() {
+        safety::validate_binary_name(bin, "plugin dependency bin")?;
+    }
+    let frozen_locked_plugin =
+        frozen_lockfile.and_then(|lock| lock.find_package(&plugin.name, LockedPackageKind::Plugin));
+    let plugin_install = install_plugin(plugin, None, security_policy, frozen_locked_plugin)?;
+    let installed_bin = plugin_install.installed_bin;
+    let bin_name = plugin_install.bin_name;
+    let version_dir = plugin_install.version_dir;
+    if !resolved_plugin_matches_existing_lock(plugin, existing_lockfile) {
+        ui::info(format!(
+            "{} plugin {}@{}",
+            ui::keyword("Installing"),
+            plugin.name,
+            plugin_install_display_ref(plugin, &version_dir)
+        ));
+    }
+    let sha256 = resolver::compute_checksum(&version_dir)?;
+    if frozen {
+        verify_frozen_checksum(
+            frozen_lockfile,
+            &plugin.name,
+            LockedPackageKind::Plugin,
+            &sha256,
+        )?;
+    }
+    if frozen
+        && let Some(expected_asset_sha) =
+            frozen_locked_plugin.and_then(|locked| locked.asset_sha256.as_deref())
+    {
+        let actual_asset_sha = plugin_install.asset_metadata.asset_sha256.as_deref().ok_or_else(|| {
+            crate::error::QuiverError::Lockfile(format!(
+                "frozen install requires downloaded asset_sha256 for plugin '{}' but no verified release asset digest was recorded",
+                plugin.name
+            ))
+        })?;
+        if expected_asset_sha != actual_asset_sha {
+            return Err(crate::error::QuiverError::Lockfile(format!(
+                "frozen install asset checksum mismatch for plugin '{}': expected {}, got {}",
+                plugin.name, expected_asset_sha, actual_asset_sha
+            )));
+        }
+    }
+
+    let existing_metadata = existing_lockfile
+        .and_then(|lock| lock.find_package(&plugin.name, LockedPackageKind::Plugin));
+    let asset_sha256 = plugin_install
+        .asset_metadata
+        .asset_sha256
+        .or_else(|| existing_metadata.and_then(|pkg| pkg.asset_sha256.clone()));
+    let asset_url = plugin_install
+        .asset_metadata
+        .asset_url
+        .or_else(|| existing_metadata.and_then(|pkg| pkg.asset_url.clone()));
+
+    let locked_tag = if plugin.git == "nu-core" {
+        None
+    } else {
+        plugin.tag.clone()
+    };
+    let locked_rev = if plugin.git == "nu-core" {
+        version_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("nu-core")
+            .to_string()
+    } else {
+        plugin.rev.clone()
+    };
+
+    let target = (plugin_registry_name(&bin_name), installed_bin);
+    let locked = LockedPackage {
+        name: plugin.name.clone(),
+        kind: LockedPackageKind::Plugin,
+        git: plugin.git.clone(),
+        tag: locked_tag,
+        rev: locked_rev,
+        path: Some(bin_name),
+        sha256,
+        asset_sha256,
+        asset_url,
+    };
+    Ok((locked, target))
+}
+
+fn install_module_and_lock(
+    dep: &ResolvedDep,
+    modules_dir: &Path,
+    install_mode: InstallMode,
+    frozen: bool,
+    frozen_lockfile: Option<&Lockfile>,
+) -> Result<LockedPackage> {
+    safety::validate_dependency_name(&dep.name, "module dependency")?;
+    ui::info(format!(
+        "{} module {}@{}",
+        ui::keyword("Installing"),
+        dep.name,
+        &dep.rev[..12.min(dep.rev.len())]
+    ));
+    install_dep(dep, modules_dir, install_mode)?;
+
+    let dest = modules_dir.join(&dep.name);
+    let sha256 = resolver::compute_checksum(&dest)?;
+    if frozen {
+        verify_frozen_checksum(
+            frozen_lockfile,
+            &dep.name,
+            LockedPackageKind::Module,
+            &sha256,
+        )?;
+    }
+
+    Ok(LockedPackage {
+        name: dep.name.clone(),
+        kind: LockedPackageKind::Module,
+        git: dep.git.clone(),
+        tag: dep.tag.clone(),
+        rev: dep.rev.clone(),
+        path: None,
+        sha256,
+        asset_sha256: None,
+        asset_url: None,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn install_plugin_and_lock(
+    plugin: &ResolvedPlugin,
+    bin_dir: &Path,
+    nu_version_req: Option<&str>,
+    security_policy: SecurityPolicy,
+    frozen: bool,
+    frozen_lockfile: Option<&Lockfile>,
+    existing_lockfile: Option<&Lockfile>,
+) -> Result<LockedPackage> {
+    safety::validate_dependency_name(&plugin.name, "plugin dependency")?;
+    if let Some(bin) = plugin.bin.as_deref() {
+        safety::validate_binary_name(bin, "plugin dependency bin")?;
+    }
+    let frozen_locked_plugin =
+        frozen_lockfile.and_then(|lock| lock.find_package(&plugin.name, LockedPackageKind::Plugin));
+    let plugin_install = install_plugin(
+        plugin,
+        nu_version_req,
+        security_policy,
+        frozen_locked_plugin,
+    )?;
+    let installed_bin = plugin_install.installed_bin;
+    let bin_name = plugin_install.bin_name;
+    let version_dir = plugin_install.version_dir;
+    ui::info(format!(
+        "{} plugin {}@{}",
+        ui::keyword("Installing"),
+        plugin.name,
+        plugin_install_display_ref(plugin, &version_dir)
+    ));
+    link_plugin_into_env(&installed_bin, bin_dir, &bin_name)?;
+    let sha256 = resolver::compute_checksum(&version_dir)?;
+    if frozen {
+        verify_frozen_checksum(
+            frozen_lockfile,
+            &plugin.name,
+            LockedPackageKind::Plugin,
+            &sha256,
+        )?;
+    }
+    if frozen
+        && let Some(expected_asset_sha) =
+            frozen_locked_plugin.and_then(|locked| locked.asset_sha256.as_deref())
+    {
+        let actual_asset_sha = plugin_install.asset_metadata.asset_sha256.as_deref().ok_or_else(|| {
+            crate::error::QuiverError::Lockfile(format!(
+                "frozen install requires downloaded asset_sha256 for plugin '{}' but no verified release asset digest was recorded",
+                plugin.name
+            ))
+        })?;
+        if expected_asset_sha != actual_asset_sha {
+            return Err(crate::error::QuiverError::Lockfile(format!(
+                "frozen install asset checksum mismatch for plugin '{}': expected {}, got {}",
+                plugin.name, expected_asset_sha, actual_asset_sha
+            )));
+        }
+    }
+
+    let existing_metadata = existing_lockfile
+        .and_then(|lock| lock.find_package(&plugin.name, LockedPackageKind::Plugin));
+    let asset_sha256 = plugin_install
+        .asset_metadata
+        .asset_sha256
+        .or_else(|| existing_metadata.and_then(|pkg| pkg.asset_sha256.clone()));
+    let asset_url = plugin_install
+        .asset_metadata
+        .asset_url
+        .or_else(|| existing_metadata.and_then(|pkg| pkg.asset_url.clone()));
+
+    let locked_tag = if plugin.git == "nu-core" {
+        None
+    } else {
+        plugin.tag.clone()
+    };
+    let locked_rev = if plugin.git == "nu-core" {
+        version_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("nu-core")
+            .to_string()
+    } else {
+        plugin.rev.clone()
+    };
+
+    Ok(LockedPackage {
+        name: plugin.name.clone(),
+        kind: LockedPackageKind::Plugin,
+        git: plugin.git.clone(),
+        tag: locked_tag,
+        rev: locked_rev,
+        path: Some(bin_name),
+        sha256,
+        asset_sha256,
+        asset_url,
+    })
+}
+
 fn install_plugin(
     plugin: &ResolvedPlugin,
     nu_version_req: Option<&str>,
@@ -2571,6 +2655,10 @@ fn prompt_for_cargo_fallback_approval(
     plugin: &ResolvedPlugin,
     release_error: &crate::error::QuiverError,
 ) -> Result<bool> {
+    // Serialize so concurrent plugin installs don't interleave their stdin prompts.
+    let _guard = INTERACTIVE_PROMPT_LOCK
+        .lock()
+        .expect("interactive prompt lock poisoned");
     eprintln!("  Release install failed with: {}", release_error);
 
     loop {
@@ -3026,7 +3114,11 @@ fn install_dep(dep: &ResolvedDep, modules_dir: &Path, install_mode: InstallMode)
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let staging = modules_dir.join(format!(".quiver-staging-{}-{unique}", std::process::id()));
+    let counter = STAGING_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let staging = modules_dir.join(format!(
+        ".quiver-staging-{}-{unique}-{counter}",
+        std::process::id()
+    ));
     if staging.exists() {
         std::fs::remove_dir_all(&staging)?;
     }

@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use rayon::prelude::*;
 use semver::VersionReq;
 
 use crate::checksum;
@@ -12,6 +14,8 @@ use crate::manifest::{DependencySpec, Manifest, PluginDependencySpec};
 use crate::nu;
 use crate::safety;
 use crate::ui;
+
+static RESOLVE_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// A fully resolved dependency.
 #[derive(Debug, Clone)]
@@ -70,43 +74,44 @@ pub fn resolve_modules_from_lock(locked: &[LockedPackage]) -> Vec<ResolvedDep> {
 pub fn resolve_plugins_from_deps(
     deps: &HashMap<String, PluginDependencySpec>,
 ) -> Result<Vec<ResolvedPlugin>> {
-    let mut resolved = Vec::new();
+    let entries: Vec<(&String, &PluginDependencySpec)> = deps.iter().collect();
+    let mut resolved: Vec<ResolvedPlugin> = entries
+        .par_iter()
+        .map(|(name, spec)| {
+            safety::validate_dependency_name(name, "plugin dependency")?;
+            if let Some(bin) = spec.bin.as_deref() {
+                safety::validate_binary_name(bin, "plugin dependency bin")?;
+            }
+            let source = spec.source.as_deref().unwrap_or("git");
+            if source == "nu-core" {
+                return Ok(ResolvedPlugin {
+                    name: (*name).clone(),
+                    git: "nu-core".to_string(),
+                    tag: None,
+                    rev: "nu-core".to_string(),
+                    bin: spec.bin.clone(),
+                });
+            }
 
-    for (name, spec) in deps {
-        safety::validate_dependency_name(name, "plugin dependency")?;
-        if let Some(bin) = spec.bin.as_deref() {
-            safety::validate_binary_name(bin, "plugin dependency bin")?;
-        }
-        let source = spec.source.as_deref().unwrap_or("git");
-        if source == "nu-core" {
-            resolved.push(ResolvedPlugin {
-                name: name.clone(),
-                git: "nu-core".to_string(),
-                tag: None,
-                rev: "nu-core".to_string(),
+            ui::info(format!(
+                "{} plugin {} from {}",
+                ui::keyword("Fetching"),
+                name,
+                spec.git
+            ));
+            let repo_path = git::clone_or_fetch(&spec.git)?;
+            let kind = RefKind::from_spec(&spec.tag, &spec.rev, &spec.branch);
+            let rev = git::resolve_ref(&repo_path, spec.ref_spec(), kind)?;
+
+            Ok(ResolvedPlugin {
+                name: (*name).clone(),
+                git: spec.git.clone(),
+                tag: spec.tag.clone(),
+                rev,
                 bin: spec.bin.clone(),
-            });
-            continue;
-        }
-
-        ui::info(format!(
-            "{} plugin {} from {}",
-            ui::keyword("Fetching"),
-            name,
-            spec.git
-        ));
-        let repo_path = git::clone_or_fetch(&spec.git)?;
-        let kind = RefKind::from_spec(&spec.tag, &spec.rev, &spec.branch);
-        let rev = git::resolve_ref(&repo_path, spec.ref_spec(), kind)?;
-
-        resolved.push(ResolvedPlugin {
-            name: name.clone(),
-            git: spec.git.clone(),
-            tag: spec.tag.clone(),
-            rev,
-            bin: spec.bin.clone(),
-        });
-    }
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
 
     resolved.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(resolved)
@@ -134,15 +139,27 @@ fn resolve_deps(
     resolved: &mut HashMap<String, ResolvedDep>,
     root_nu_req: Option<&VersionReq>,
 ) -> Result<()> {
+    // Pre-fetch every sibling repo at this layer in parallel. Each
+    // `clone_or_fetch` is self-locking per URL, so concurrent siblings with
+    // distinct URLs make progress in parallel and same-URL ones serialize
+    // safely. The serial walk below then hits a warm cache.
+    let entries: Vec<(&String, &DependencySpec)> = deps.iter().collect();
+    entries
+        .par_iter()
+        .map(|(name, spec)| {
+            safety::validate_dependency_name(name, "module dependency")?;
+            ui::info(format!(
+                "{} module {} from {}",
+                ui::keyword("Fetching"),
+                name,
+                spec.git
+            ));
+            git::clone_or_fetch(&spec.git)?;
+            Ok::<(), QuiverError>(())
+        })
+        .collect::<Result<Vec<_>>>()?;
+
     for (name, spec) in deps {
-        safety::validate_dependency_name(name, "module dependency")?;
-        // Clone or fetch the repo
-        ui::info(format!(
-            "{} module {} from {}",
-            ui::keyword("Fetching"),
-            name,
-            spec.git
-        ));
         let repo_path = git::clone_or_fetch(&spec.git)?;
 
         // Resolve the ref to a commit SHA
@@ -178,11 +195,12 @@ fn resolve_deps(
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
+        let counter = RESOLVE_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
         let tmp = std::env::temp_dir().join("quiver_resolve").join(format!(
             "dep-{}-{}-{}",
             std::process::id(),
             unique,
-            resolved.len()
+            counter
         ));
         git::export_to(&repo_path, &rev, &tmp)?;
 
