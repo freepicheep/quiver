@@ -1,6 +1,6 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use git2::{FetchOptions, Progress, RemoteCallbacks, Repository, build::RepoBuilder};
 use indicatif::ProgressBar;
@@ -11,6 +11,21 @@ use crate::error::{QuiverError, Result};
 use crate::ui;
 
 static FETCHED_THIS_RUN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+static URL_LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
+
+fn url_locks() -> &'static Mutex<HashMap<String, Arc<Mutex<()>>>> {
+    URL_LOCKS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Acquire a per-URL serialization lock so concurrent callers don't race on the
+/// same cached repo. Returns an owned guard that releases on drop.
+fn lock_for_url(url: &str) -> Arc<Mutex<()>> {
+    let key = normalize_git_url(url);
+    let mut map = url_locks().lock().expect("url lock map poisoned");
+    map.entry(key)
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
+}
 
 /// Returns the global install directory for git repos:
 /// `~/.local/share/quiver/installs/git/` on macOS/Linux.
@@ -72,6 +87,11 @@ pub fn clone_or_fetch(url: &str) -> Result<PathBuf> {
 
     let repo_dir = cache.join(url_to_dirname(url));
     let repo_label = repo_name_from_url(url).unwrap_or_else(|| url.to_string());
+
+    // Serialize concurrent callers for the same URL — git2 operations against a
+    // shared on-disk repo are not safe to overlap.
+    let url_lock = lock_for_url(url);
+    let _url_guard = url_lock.lock().expect("url lock poisoned");
 
     if repo_dir.exists() {
         if was_fetched_this_run(url) {

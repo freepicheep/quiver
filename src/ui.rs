@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::sync::{Mutex, OnceLock};
 
 use console::style;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -17,36 +17,48 @@ pub struct CapturedLog {
     pub message: String,
 }
 
-type LogCapture = Box<dyn FnMut(CapturedLog)>;
+type LogCapture = Box<dyn FnMut(CapturedLog) + Send>;
 
-thread_local! {
-    static LOG_CAPTURE: RefCell<Option<LogCapture>> = const { RefCell::new(None) };
+// Global so parallel workers route through the same capture as the main thread.
+// Emit callbacks must not recursively call into ui::*; doing so will deadlock.
+static LOG_CAPTURE: OnceLock<Mutex<Option<LogCapture>>> = OnceLock::new();
+
+fn log_capture() -> &'static Mutex<Option<LogCapture>> {
+    LOG_CAPTURE.get_or_init(|| Mutex::new(None))
 }
 
-pub fn capture_logs_stream<T>(emit: impl FnMut(CapturedLog) + 'static, f: impl FnOnce() -> T) -> T {
-    LOG_CAPTURE.with(|capture| {
-        let previous = capture.replace(Some(Box::new(emit)));
-        let result = f();
-        let _ = capture.replace(previous);
-        result
-    })
+pub fn capture_logs_stream<T>(
+    emit: impl FnMut(CapturedLog) + Send + 'static,
+    f: impl FnOnce() -> T,
+) -> T {
+    let previous = {
+        let mut guard = log_capture().lock().expect("log capture lock poisoned");
+        guard.replace(Box::new(emit))
+    };
+    let result = f();
+    {
+        let mut guard = log_capture().lock().expect("log capture lock poisoned");
+        *guard = previous;
+    }
+    result
 }
 
 fn capture_line(kind: LogKind, message: String) -> bool {
-    LOG_CAPTURE.with(|capture| {
-        let mut capture = capture.borrow_mut();
-        match capture.as_mut() {
-            Some(emit) => {
-                emit(CapturedLog { kind, message });
-                true
-            }
-            None => false,
+    let mut guard = log_capture().lock().expect("log capture lock poisoned");
+    match guard.as_mut() {
+        Some(emit) => {
+            emit(CapturedLog { kind, message });
+            true
         }
-    })
+        None => false,
+    }
 }
 
 pub fn is_capturing() -> bool {
-    LOG_CAPTURE.with(|capture| capture.borrow().is_some())
+    log_capture()
+        .lock()
+        .map(|guard| guard.is_some())
+        .unwrap_or(false)
 }
 
 pub fn plain(message: impl AsRef<str>) {
