@@ -752,9 +752,14 @@ fn cmd_run(cwd: &Path, command: Vec<String>) -> Result<()> {
 
     let project_dir = require_project_dir(cwd)?;
     let manifest = Manifest::from_dir(&project_dir)?;
-    let config_path = project_dir.join(".nu-env").join("config.nu");
-    let plugin_config_path = project_dir.join(".nu-env").join("plugins.msgpackz");
+    let nu_env_dir = project_dir.join(".nu-env");
+    let config_path = nu_env_dir.join("config.nu");
+    let plugin_config_path = nu_env_dir.join("plugins.msgpackz");
+    let nu_bin_path = installer::nu_env_binary_path(&nu_env_dir);
+    let invokes_nu =
+        is_nushell_command_name(&command[0]) || is_nushell_script_command(&command[0], cwd);
     let needs_install = !config_path.exists()
+        || (invokes_nu && nu_bin_path.symlink_metadata().is_err())
         || (!manifest.dependencies.plugins.is_empty() && !plugin_config_path.exists());
 
     if needs_install {
@@ -768,7 +773,20 @@ fn cmd_run(cwd: &Path, command: Vec<String>) -> Result<()> {
         ));
     }
 
-    let (program, args) = resolve_run_invocation(&command, &config_path, &plugin_config_path, cwd);
+    if invokes_nu && nu_bin_path.symlink_metadata().is_err() {
+        return Err(error::QuiverError::Other(format!(
+            "project nu binary missing at {}; `qv install` did not produce it",
+            nu_bin_path.display()
+        )));
+    }
+
+    let (program, args) = resolve_run_invocation(
+        &command,
+        &config_path,
+        &plugin_config_path,
+        &nu_bin_path,
+        cwd,
+    );
     let status = Command::new(&program)
         .args(&args)
         .current_dir(cwd)
@@ -1061,12 +1079,14 @@ fn resolve_run_invocation(
     command: &[String],
     config_path: &Path,
     plugin_config_path: &Path,
+    nu_bin_path: &Path,
     cwd: &Path,
 ) -> (String, Vec<String>) {
     let executable = command[0].clone();
     let mut args = command[1..].to_vec();
     let config = config_path.to_string_lossy().to_string();
     let plugin_config = plugin_config_path.to_string_lossy().to_string();
+    let nu_bin = nu_bin_path.to_string_lossy().to_string();
 
     if is_nushell_command_name(&executable) {
         if !args.iter().any(|arg| arg == "--plugin-config") {
@@ -1077,7 +1097,7 @@ fn resolve_run_invocation(
             args.insert(0, config);
             args.insert(0, "--config".to_string());
         }
-        return (executable, args);
+        return (nu_bin, args);
     }
 
     if is_nushell_script_command(&executable, cwd) {
@@ -1089,7 +1109,7 @@ fn resolve_run_invocation(
             executable,
         ];
         nu_args.extend(args);
-        return ("nu".to_string(), nu_args);
+        return (nu_bin, nu_args);
     }
 
     (executable, args)
@@ -2167,15 +2187,17 @@ mod tests {
         let cwd = make_temp_dir("run_inject_nu");
         let config = cwd.join(".nu-env").join("config.nu");
         let plugin_config = cwd.join(".nu-env").join("plugins.msgpackz");
+        let nu_bin = cwd.join(".nu-env").join("bin").join("nu");
         let command = vec![
             "nu".to_string(),
             "script.nu".to_string(),
             "--flag".to_string(),
         ];
 
-        let (program, args) = resolve_run_invocation(&command, &config, &plugin_config, &cwd);
+        let (program, args) =
+            resolve_run_invocation(&command, &config, &plugin_config, &nu_bin, &cwd);
 
-        assert_eq!(program, "nu");
+        assert_eq!(program, nu_bin.to_string_lossy());
         assert_eq!(args[0], "--config");
         assert_eq!(args[1], config.to_string_lossy());
         assert_eq!(args[2], "--plugin-config");
@@ -2191,6 +2213,7 @@ mod tests {
         let cwd = make_temp_dir("run_existing_plugin_config");
         let config = cwd.join(".nu-env").join("config.nu");
         let plugin_config = cwd.join(".nu-env").join("plugins.msgpackz");
+        let nu_bin = cwd.join(".nu-env").join("bin").join("nu");
         let custom_plugin_config = cwd.join("custom_plugins.msgpackz");
         let command = vec![
             "nu".to_string(),
@@ -2199,9 +2222,10 @@ mod tests {
             "script.nu".to_string(),
         ];
 
-        let (program, args) = resolve_run_invocation(&command, &config, &plugin_config, &cwd);
+        let (program, args) =
+            resolve_run_invocation(&command, &config, &plugin_config, &nu_bin, &cwd);
 
-        assert_eq!(program, "nu");
+        assert_eq!(program, nu_bin.to_string_lossy());
         assert_eq!(args[0], "--config");
         assert_eq!(args[1], config.to_string_lossy());
         assert_eq!(args[2], "--plugin-config");
@@ -2218,11 +2242,13 @@ mod tests {
         std::fs::write(&script_path, "print 'ok'").unwrap();
         let config = cwd.join(".nu-env").join("config.nu");
         let plugin_config = cwd.join(".nu-env").join("plugins.msgpackz");
+        let nu_bin = cwd.join(".nu-env").join("bin").join("nu");
         let command = vec!["tool.nu".to_string(), "arg1".to_string()];
 
-        let (program, args) = resolve_run_invocation(&command, &config, &plugin_config, &cwd);
+        let (program, args) =
+            resolve_run_invocation(&command, &config, &plugin_config, &nu_bin, &cwd);
 
-        assert_eq!(program, "nu");
+        assert_eq!(program, nu_bin.to_string_lossy());
         assert_eq!(args[0], "--config");
         assert_eq!(args[1], config.to_string_lossy());
         assert_eq!(args[2], "--plugin-config");
@@ -2238,9 +2264,11 @@ mod tests {
         let cwd = make_temp_dir("run_other_cmd");
         let config = cwd.join(".nu-env").join("config.nu");
         let plugin_config = cwd.join(".nu-env").join("plugins.msgpackz");
+        let nu_bin = cwd.join(".nu-env").join("bin").join("nu");
         let command = vec!["echo".to_string(), "hello".to_string()];
 
-        let (program, args) = resolve_run_invocation(&command, &config, &plugin_config, &cwd);
+        let (program, args) =
+            resolve_run_invocation(&command, &config, &plugin_config, &nu_bin, &cwd);
 
         assert_eq!(program, "echo");
         assert_eq!(args, vec!["hello".to_string()]);
