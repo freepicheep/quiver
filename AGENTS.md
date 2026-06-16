@@ -67,6 +67,7 @@ nupackage.toml → resolver (fetches git repos, resolves refs, detects conflicts
 - `cargo build` for development
 - `cargo test` to run all tests
 - Release builds use the `dist` profile (`lto = "thin"`) configured in `dist-workspace.toml`
+- Put release notes for changes in the `CHANGELOG.md` file and follow the standard convention therein.
 
 ### Dependencies (nupackage.toml)
 - Each dependency must specify exactly **one** of `tag`, `branch`, or `rev`
