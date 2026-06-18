@@ -15,10 +15,14 @@ fn default_git_provider() -> String {
 }
 
 fn default_install_mode() -> InstallMode {
-    if cfg!(windows) {
-        InstallMode::Hardlink
-    } else {
+    // Mirrors uv's link-mode defaults: copy-on-write clone on macOS (APFS),
+    // hardlink on Linux and Windows. Hardlinks work on nearly every filesystem
+    // and avoid the spotty reflink support on Linux; clone falls back to copy
+    // automatically where unsupported.
+    if cfg!(target_os = "macos") {
         InstallMode::Clone
+    } else {
+        InstallMode::Hardlink
     }
 }
 

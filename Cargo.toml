@@ -16,6 +16,7 @@ sha2 = "0.10"
 thiserror = "2"
 nuon = "0.112.2"
 walkdir = "2"
+reflink-copy = "0.1.30"
 indicatif = "0.18.4"
 console = "0.16.2"
 flate2 = "1"
@@ -31,7 +32,7 @@ rayon = "1"
 version = "0.112.2"
 default-features = false
 
-[dependencies.leaves]
+[dependencies.leaves-tui]
 git = "https://github.com/freepicheep/leaves.git"
 branch = "main"
 

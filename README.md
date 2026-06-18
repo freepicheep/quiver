@@ -262,9 +262,11 @@ Supported provider aliases are `github`, `gitlab`, `codeberg`, and `bitbucket`.
 You can also set a custom host like `git.example.com` or a full `https://...` base URL.
 
 `install_mode` controls how modules are materialized into the install directory.
-- `clone`: prefers copy-on-write clone behavior when available; falls back to `copy` if clone fails
-- `hardlink`: uses hardlinks for files; falls back to `copy` if hardlinking is unsupported
+- `clone`: copy-on-write clone per file (clonefile on macOS/APFS, FICLONE on Linux, ReFS on Windows). Transparently falls back to a normal copy on filesystems without reflink support (ext4 without reflink, overlayfs, tmpfs — common on CI runners).
+- `hardlink`: uses hardlinks for files; falls back to `copy` if hardlinking is unsupported (e.g. across filesystems)
 - `copy`: always copies files; useful for CI/container filesystems
+
+The defaults mirror [uv](https://github.com/astral-sh/uv)'s link modes: `clone` on macOS, and `hardlink` on Linux and Windows.
 
 ## Plugin Install Behavior
 

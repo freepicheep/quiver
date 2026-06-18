@@ -2889,9 +2889,16 @@ fn ensure_symlink_or_file(link_path: &Path, target: &Path) -> Result<bool> {
     std::os::unix::fs::symlink(target, link_path)?;
     #[cfg(windows)]
     {
-        if let Err(err) = std::os::windows::fs::symlink_file(target, link_path) {
-            ui::warn(format!("symlink failed ({err}); copying file instead"));
-            copy_file(target, link_path)?;
+        // Symlinks on Windows require elevation or Developer Mode (os error 1314).
+        // Hard links don't require that privilege and are fully executable, so try
+        // them first; fall back to a copy when the target is on another volume.
+        if let Err(sym_err) = std::os::windows::fs::symlink_file(target, link_path) {
+            if let Err(link_err) = std::fs::hard_link(target, link_path) {
+                ui::warn(format!(
+                    "symlink failed ({sym_err}) and hard link failed ({link_err}); copying file instead"
+                ));
+                copy_file(target, link_path)?;
+            }
         }
     }
 
@@ -3167,38 +3174,33 @@ fn materialize_module_dir(src: &Path, dest: &Path, mode: InstallMode) -> Result<
 }
 
 fn clone_dir(src: &Path, dest: &Path) -> Result<()> {
-    #[cfg(target_os = "macos")]
+    std::fs::create_dir_all(dest)?;
+    for entry in WalkDir::new(src)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(std::result::Result::ok)
     {
-        copy_with_cp(src, dest, &["-cR"])
+        let relative = entry
+            .path()
+            .strip_prefix(src)
+            .map_err(|e| crate::error::QuiverError::Other(e.to_string()))?;
+        if relative.as_os_str().is_empty() {
+            continue;
+        }
+        let target = dest.join(relative);
+        if entry.file_type().is_dir() {
+            std::fs::create_dir_all(&target)?;
+        } else if entry.file_type().is_file() {
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            // Attempts a copy-on-write clone (clonefile on macOS/APFS, FICLONE
+            // on Linux, ReFS on Windows) and transparently falls back to a
+            // standard copy when the filesystem doesn't support reflinks.
+            reflink_copy::reflink_or_copy(entry.path(), &target)?;
+        }
     }
-
-    #[cfg(target_os = "linux")]
-    {
-        copy_with_cp(src, dest, &["-a", "--reflink=always"])
-    }
-
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        let _ = (src, dest);
-        Err(crate::error::QuiverError::Other(
-            "clone mode is not supported on this platform".to_string(),
-        ))
-    }
-}
-
-fn copy_with_cp(src: &Path, dest: &Path, flags: &[&str]) -> Result<()> {
-    let output = Command::new("cp").args(flags).arg(src).arg(dest).output()?;
-    if output.status.success() {
-        return Ok(());
-    }
-
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    let message = if stderr.is_empty() {
-        "cp failed with unknown error".to_string()
-    } else {
-        stderr
-    };
-    Err(crate::error::QuiverError::Other(message))
+    Ok(())
 }
 
 fn hardlink_dir(src: &Path, dest: &Path) -> Result<()> {
@@ -3869,6 +3871,32 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn clone_dir_materializes_nested_tree() {
+        let src = make_temp_dir("clone_src");
+        let dest = make_temp_dir("clone_dest");
+        // clone_dir creates dest itself; start from a fresh, non-existent path.
+        std::fs::remove_dir_all(&dest).unwrap();
+
+        std::fs::create_dir_all(src.join("nested")).unwrap();
+        std::fs::write(src.join("top.nu"), b"export def main [] { 1 }").unwrap();
+        std::fs::write(src.join("nested").join("inner.nu"), b"inner").unwrap();
+
+        clone_dir(&src, &dest).unwrap();
+
+        assert_eq!(
+            std::fs::read(dest.join("top.nu")).unwrap(),
+            b"export def main [] { 1 }"
+        );
+        assert_eq!(
+            std::fs::read(dest.join("nested").join("inner.nu")).unwrap(),
+            b"inner"
+        );
+
+        std::fs::remove_dir_all(&src).unwrap();
+        std::fs::remove_dir_all(&dest).unwrap();
     }
 
     fn plugin_test_name(base: &str) -> OsString {

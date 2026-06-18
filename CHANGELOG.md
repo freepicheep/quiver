@@ -1,5 +1,14 @@
 # Unreleased
 
+## Fixed
+
+- On Windows, `qv run` no longer fails with `Access is denied. (os error 5)` when the account lacks the symlink-creation privilege. Quiver now creates a hard link for `.nu-env/bin/` entries before falling back to a file copy, so the project-local `nu` binary and plugins are executable without Administrator rights or Developer Mode.
+- `clone` install mode no longer errors with `Operation not supported` on filesystems without copy-on-write support (ext4 without reflink, overlayfs, tmpfs — common on CI runners). Module materialization now reflinks per file via the `reflink-copy` crate and transparently falls back to a standard copy, instead of shelling out to `cp --reflink=always`.
+
+## Changed
+
+- Default `install_mode` now mirrors [uv](https://github.com/astral-sh/uv)'s link modes: `clone` (copy-on-write) on macOS, and `hardlink` on Linux and Windows. Previously Linux defaulted to `clone`, which failed on filesystems without reflink support. Override with `install_mode` in `~/.config/quiver/config.nuon`.
+
 # Version 0.7.3 (2026-05-26)
 
 ## Added
