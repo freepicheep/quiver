@@ -1,5 +1,14 @@
 # Unreleased
 
+## Added
+
+- **Cross-platform lockfiles (schema v2).** `quiver.lock` now pins the Nushell runtime version (when the manifest declares a `nu-version`) and records plugin and nu download artifacts per target triple. At lock time quiver eagerly pins the download URL and `asset_sha256` for *every* platform listed in a release's signed checksums file, so the lockfile is identical no matter which OS runs `qv install` — a Linux install no longer rewrites what a macOS install produced. Each platform additionally records its own extracted-binary `sha256` for local cache-tamper detection. Plugins whose releases lack a multi-platform checksums file fall back to pinning the current platform only.
+- `qv install --frozen` can now install the pinned Nushell version and plugin binaries on a fresh platform using the per-platform artifacts recorded in the lockfile, verifying each download against its pinned, signed `asset_sha256`.
+
+## Changed
+
+- The lockfile schema is now version 2. Existing v1 lockfiles are read transparently and rewritten to v2 on the next `qv install`; the per-platform security hash for plugins (`asset_sha256`) remains the verification anchor.
+
 ## Fixed
 
 - On Windows, `qv run` no longer fails with `Access is denied. (os error 5)` when the account lacks the symlink-creation privilege. Quiver now creates a hard link for `.nu-env/bin/` entries before falling back to a file copy, so the project-local `nu` binary and plugins are executable without Administrator rights or Developer Mode.
