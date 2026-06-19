@@ -2363,7 +2363,8 @@ fn install_global_plugin_and_lock(
     }
     let frozen_locked_plugin =
         frozen_lockfile.and_then(|lock| lock.find_package(&plugin.name, LockedPackageKind::Plugin));
-    let plugin_install = install_plugin(plugin, None, security_policy, frozen_locked_plugin)?;
+    let plugin_install =
+        install_plugin(plugin, None, security_policy, frozen, frozen_locked_plugin)?;
     let installed_bin = plugin_install.installed_bin;
     let bin_name = plugin_install.bin_name;
     let version_dir = plugin_install.version_dir;
@@ -2477,6 +2478,7 @@ fn install_plugin_and_lock(
         plugin,
         nu_version_req,
         security_policy,
+        frozen,
         frozen_locked_plugin,
     )?;
     let installed_bin = plugin_install.installed_bin;
@@ -2530,10 +2532,27 @@ fn install_plugin_and_lock(
     })
 }
 
+/// Whether an already-cached plugin binary may be reused as-is.
+///
+/// Non-frozen installs always reuse the cache: they recompute the checksum and
+/// rewrite the lockfile anyway. A frozen install may only reuse the cache when
+/// the lock records an extracted `sha256` for this platform to verify the
+/// cached binary against; otherwise we force a fresh, signed download so a
+/// cached file is never trusted blindly.
+fn can_reuse_cached_plugin(frozen: bool, frozen_locked_plugin: Option<&LockedPackage>) -> bool {
+    if !frozen {
+        return true;
+    }
+    frozen_locked_plugin
+        .and_then(LockedPackage::current_artifact)
+        .is_some_and(|artifact| artifact.sha256.is_some())
+}
+
 fn install_plugin(
     plugin: &ResolvedPlugin,
     nu_version_req: Option<&str>,
     security_policy: SecurityPolicy,
+    frozen: bool,
     frozen_locked_plugin: Option<&LockedPackage>,
 ) -> Result<PluginInstallResult> {
     safety::validate_dependency_name(&plugin.name, "plugin dependency")?;
@@ -2549,7 +2568,7 @@ fn install_plugin(
         .join(&plugin.name)
         .join(version);
     let installed_bin = version_dir.join("bin").join(&binary_filename);
-    if installed_bin.is_file() {
+    if installed_bin.is_file() && can_reuse_cached_plugin(frozen, frozen_locked_plugin) {
         return Ok(PluginInstallResult {
             installed_bin,
             bin_name: binary_filename,
@@ -5681,6 +5700,49 @@ mod tests {
             merged[&triple].asset_sha256.as_deref(),
             Some("currentassetsha")
         );
+    }
+
+    #[test]
+    fn can_reuse_cached_plugin_rules() {
+        let triple = current_target_triple().expect("supported test platform");
+
+        let make = |sha256: Option<&str>| {
+            let mut artifacts = BTreeMap::new();
+            artifacts.insert(
+                triple.clone(),
+                PlatformArtifact {
+                    asset_url: Some("https://example.com/current.tar.gz".to_string()),
+                    asset_sha256: Some("currentassetsha".to_string()),
+                    sha256: sha256.map(|s| s.to_string()),
+                },
+            );
+            LockedPackage {
+                name: "nu_plugin_inc".to_string(),
+                kind: LockedPackageKind::Plugin,
+                git: "https://github.com/nushell/nu_plugin_inc".to_string(),
+                tag: Some("v0.91.0".to_string()),
+                rev: "abc".to_string(),
+                path: Some("nu_plugin_inc".to_string()),
+                sha256: String::new(),
+                artifacts,
+            }
+        };
+
+        // Non-frozen always reuses the warm cache (lock gets rewritten anyway).
+        assert!(can_reuse_cached_plugin(false, None));
+
+        // Frozen with a recorded extracted hash for this platform: reusable,
+        // because verify_frozen_plugin will re-hash and compare it.
+        let with_sha = make(Some("recordedextractedsha"));
+        assert!(can_reuse_cached_plugin(true, Some(&with_sha)));
+
+        // Frozen with an artifact but no extracted hash: NOT reusable, force a
+        // fresh signed download so the cached binary is never trusted blindly.
+        let without_sha = make(None);
+        assert!(!can_reuse_cached_plugin(true, Some(&without_sha)));
+
+        // Frozen with no artifact for this platform at all: NOT reusable.
+        assert!(!can_reuse_cached_plugin(true, None));
     }
 
     #[test]

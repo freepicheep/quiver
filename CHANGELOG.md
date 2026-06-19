@@ -11,6 +11,7 @@
 
 ## Fixed
 
+- `qv install --frozen` no longer reuses an already-cached plugin binary without verification when the lockfile has no recorded extracted `sha256` for the current platform (e.g. when the lock was generated on a different OS). In that case it now forces a fresh, signed download and verifies it against the pinned `asset_sha256`, so a cached binary is never trusted blindly. Frozen installs are now strictly verified on every platform.
 - On Windows, `qv run` no longer fails with `Access is denied. (os error 5)` when the account lacks the symlink-creation privilege. Quiver now creates a hard link for `.nu-env/bin/` entries before falling back to a file copy, so the project-local `nu` binary and plugins are executable without Administrator rights or Developer Mode.
 - `clone` install mode no longer errors with `Operation not supported` on filesystems without copy-on-write support (ext4 without reflink, overlayfs, tmpfs — common on CI runners). Module materialization now reflinks per file via the `reflink-copy` crate and transparently falls back to a standard copy, instead of shelling out to `cp --reflink=always`.
 
