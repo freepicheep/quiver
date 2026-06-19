@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -17,7 +17,10 @@ use zip::ZipArchive;
 use crate::config::{self, GlobalConfig, InstallMode};
 use crate::error::Result;
 use crate::git;
-use crate::lockfile::{LockedPackage, LockedPackageKind, Lockfile};
+use crate::lockfile::{
+    LOCKFILE_VERSION, LockedNu, LockedPackage, LockedPackageKind, Lockfile, PlatformArtifact,
+    current_target_triple,
+};
 use crate::manifest::{DependencySpec, Manifest, PluginDependencySpec};
 use crate::nu;
 use crate::resolver::{self, ResolvedDep, ResolvedPlugin};
@@ -53,9 +56,25 @@ struct SecurityPolicy {
 
 #[derive(Debug, Default, Clone)]
 struct DownloadVerificationMetadata {
+    /// The verified SHA-256 of the archive downloaded for the current platform.
     asset_sha256: Option<String>,
+    /// The download URL used for the current platform.
     asset_url: Option<String>,
+    /// Per-target-triple artifacts pinned eagerly from the release checksums
+    /// file, so the lockfile is identical regardless of which platform locks it.
+    artifacts: BTreeMap<String, PlatformArtifact>,
 }
+
+/// All target triples quiver knows how to install for, used to populate
+/// per-platform artifact maps eagerly at lock time.
+const KNOWN_TARGET_TRIPLES: &[&str] = &[
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-pc-windows-msvc",
+    "x86_64-pc-windows-msvc",
+];
 
 #[derive(Debug, Clone)]
 struct GitHubReleaseAssetCandidate {
@@ -376,7 +395,8 @@ fn install_resolved_global(
 
     if !frozen {
         let lockfile = Lockfile {
-            version: 1,
+            version: LOCKFILE_VERSION,
+            nu: None,
             packages: locked_packages,
         };
         lockfile.write_to(lock_path)?;
@@ -646,10 +666,19 @@ fn install_resolved(
 
     locked_packages.sort_by(|a, b| a.kind.cmp(&b.kind).then(a.name.cmp(&b.name)));
 
+    // Pin the nu runtime (only when the manifest declares a nu-version).
+    let existing_nu = if frozen {
+        frozen_lockfile.and_then(|lock| lock.nu.as_ref())
+    } else {
+        existing_lockfile.as_ref().and_then(|lock| lock.nu.as_ref())
+    };
+    let nu_pin = resolve_nu_pin(nu_version_req, existing_nu, frozen)?;
+
     // Write lockfile
     if !frozen {
         let lockfile = Lockfile {
-            version: 1,
+            version: LOCKFILE_VERSION,
+            nu: nu_pin.clone(),
             packages: locked_packages,
         };
         lockfile.write_to(lock_path)?;
@@ -678,7 +707,11 @@ fn install_resolved(
     let project_dir = nu_env_dir.parent().unwrap_or(nu_env_dir);
 
     write_config_nu(nu_env_dir, modules_dir)?;
-    create_nu_symlink_with_policy(nu_env_dir, nu_version_req, security_policy)?;
+    if let Some(locked_nu) = &nu_pin {
+        install_pinned_nu_symlink(nu_env_dir, locked_nu, security_policy, frozen)?;
+    } else {
+        create_nu_symlink_with_policy(nu_env_dir, nu_version_req, security_policy)?;
+    }
     sync_plugin_registry(nu_env_dir, plugins)?;
     write_activate_overlay(nu_env_dir, project_dir)?;
     Ok(())
@@ -885,6 +918,177 @@ fn create_nu_symlink_with_policy(
     if ensure_symlink_or_file(&symlink_path, &nu_path)? {
         ui::success(format!(
             "Linked .nu-env/bin/{env_binary_name} -> {}",
+            nu_path.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Determine the nu runtime pin to record in the lockfile.
+///
+/// Returns `None` when the manifest declares no `nu-version` (nu stays
+/// PATH-resolved as before). Otherwise pins an exact version plus per-platform
+/// artifacts. Frozen installs reuse the existing pin verbatim; non-frozen
+/// installs reuse it when it still satisfies the requirement (keeping the common
+/// path offline) and re-resolve otherwise.
+fn resolve_nu_pin(
+    nu_version_req: Option<&str>,
+    existing_nu: Option<&LockedNu>,
+    frozen: bool,
+) -> Result<Option<LockedNu>> {
+    let Some(req_str) = nu_version_req else {
+        return Ok(None);
+    };
+    let requirement = nu::parse_nu_version_requirement(req_str).map_err(|err| {
+        crate::error::QuiverError::Manifest(format!(
+            "package nu-version '{req_str}' is invalid: {err}"
+        ))
+    })?;
+
+    if frozen {
+        let pin = existing_nu.ok_or_else(|| {
+            crate::error::QuiverError::Lockfile(
+                "quiver.lock has no pinned nu (required with --frozen); run `qv install` to generate it"
+                    .to_string(),
+            )
+        })?;
+        return Ok(Some(pin.clone()));
+    }
+
+    if let Some(existing) = existing_nu
+        && Version::parse(&existing.version).is_ok_and(|v| requirement.matches(&v))
+        && !existing.artifacts.is_empty()
+    {
+        return Ok(Some(existing.clone()));
+    }
+
+    let version = match existing_nu.and_then(|nu| Version::parse(&nu.version).ok()) {
+        Some(v) if requirement.matches(&v) => v,
+        _ => select_nu_version_to_install(&requirement)?,
+    };
+    let artifacts = collect_nu_release_artifacts(&version)?;
+    Ok(Some(LockedNu {
+        version: version.to_string(),
+        artifacts,
+    }))
+}
+
+/// Build the per-platform artifact map for a Nushell release. nu asset names are
+/// fully predictable (`nu-<version>-<triple>.{tar.gz,zip}`), so every supported
+/// triple is pinned from the release's signed checksums.
+fn collect_nu_release_artifacts(version: &Version) -> Result<BTreeMap<String, PlatformArtifact>> {
+    let releases = fetch_nu_github_releases()?;
+    let release = releases
+        .iter()
+        .find(|release| {
+            !release.draft
+                && !release.prerelease
+                && parse_version_from_release_tag(&release.tag_name).as_ref() == Some(version)
+        })
+        .ok_or_else(|| {
+            crate::error::QuiverError::Other(format!(
+                "could not find a published Nushell release for version {version}"
+            ))
+        })?;
+
+    let mut artifacts = BTreeMap::new();
+    let mut cached_checksums: Option<String> = None;
+    for triple in KNOWN_TARGET_TRIPLES {
+        let ext = if triple.contains("windows") {
+            "zip"
+        } else {
+            "tar.gz"
+        };
+        let asset_name = format!("nu-{version}-{triple}.{ext}");
+        let Some(asset) = release.assets.iter().find(|asset| asset.name == asset_name) else {
+            continue;
+        };
+        if asset.browser_download_url.trim().is_empty() {
+            continue;
+        }
+
+        // Reuse a previously-downloaded multi-file SHA256SUMS when it covers this
+        // asset; otherwise fetch this asset's checksum source.
+        let mut asset_sha256 = cached_checksums
+            .as_deref()
+            .and_then(|text| parse_expected_sha256(text, &asset_name).ok());
+        if asset_sha256.is_none()
+            && let Ok(text) = download_release_checksums(
+                &release.assets,
+                &asset_name,
+                &format!("Nushell release {}", release.tag_name),
+            )
+        {
+            asset_sha256 = parse_expected_sha256(&text, &asset_name).ok();
+            cached_checksums = Some(text);
+        }
+
+        artifacts.insert(
+            (*triple).to_string(),
+            PlatformArtifact {
+                asset_url: Some(asset.browser_download_url.clone()),
+                asset_sha256,
+                sha256: None,
+            },
+        );
+    }
+    Ok(artifacts)
+}
+
+/// Install and symlink the pinned nu runtime for the current platform.
+fn install_pinned_nu_symlink(
+    nu_env_dir: &Path,
+    locked_nu: &LockedNu,
+    security_policy: SecurityPolicy,
+    frozen: bool,
+) -> Result<()> {
+    if env_var_is_truthy(QUIVER_SKIP_NU_INSTALL_ENV) {
+        ui::info(format!(
+            "{} .nu-env/bin/nu because {} is set",
+            ui::keyword("Skipping"),
+            QUIVER_SKIP_NU_INSTALL_ENV
+        ));
+        return Ok(());
+    }
+
+    let bin_dir = nu_env_dir.join(BIN_SUBDIR);
+    std::fs::create_dir_all(&bin_dir)?;
+    let symlink_path = nu_env_binary_path(nu_env_dir);
+    let env_binary_name = nu_env_binary_name();
+
+    let triple = current_target_triple().ok_or_else(|| {
+        crate::error::QuiverError::Other(format!(
+            "unsupported platform for pinned Nushell {}: {}/{}",
+            locked_nu.version,
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        ))
+    })?;
+    if frozen && !locked_nu.artifacts.contains_key(&triple) {
+        return Err(crate::error::QuiverError::Lockfile(format!(
+            "quiver.lock pins nu {} but has no artifact for this platform ({triple}); re-run `qv install` (without --frozen) on this platform to add it",
+            locked_nu.version
+        )));
+    }
+
+    let version = Version::parse(&locked_nu.version).map_err(|err| {
+        crate::error::QuiverError::Lockfile(format!(
+            "invalid pinned nu version '{}': {err}",
+            locked_nu.version
+        ))
+    })?;
+    let exact_req = VersionReq::parse(&format!("={version}")).map_err(|err| {
+        crate::error::QuiverError::Other(format!("could not build nu version requirement: {err}"))
+    })?;
+    let nu_path = resolve_nu_binary(Some(&exact_req), security_policy)?.ok_or_else(|| {
+        crate::error::QuiverError::Other(format!(
+            "could not obtain Nushell {version} for this platform"
+        ))
+    })?;
+
+    if ensure_symlink_or_file(&symlink_path, &nu_path)? {
+        ui::success(format!(
+            "Linked .nu-env/bin/{env_binary_name} -> {} (pinned nu {version})",
             nu_path.display()
         ));
     }
@@ -1759,20 +1963,13 @@ fn install_nu_version_from_github_release(
 }
 
 fn nu_release_target_triple() -> Result<String> {
-    let triple = match (std::env::consts::OS, std::env::consts::ARCH) {
-        ("macos", "aarch64") => "aarch64-apple-darwin",
-        ("macos", "x86_64") => "x86_64-apple-darwin",
-        ("linux", "aarch64") => "aarch64-unknown-linux-gnu",
-        ("linux", "x86_64") => "x86_64-unknown-linux-gnu",
-        ("windows", "aarch64") => "aarch64-pc-windows-msvc",
-        ("windows", "x86_64") => "x86_64-pc-windows-msvc",
-        (os, arch) => {
-            return Err(crate::error::QuiverError::Other(format!(
-                "unsupported platform for Nushell release downloads: {os}/{arch}"
-            )));
-        }
-    };
-    Ok(triple.to_string())
+    current_target_triple().ok_or_else(|| {
+        crate::error::QuiverError::Other(format!(
+            "unsupported platform for Nushell release downloads: {}/{}",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        ))
+    })
 }
 
 fn nu_release_asset_suffix() -> Result<String> {
@@ -2078,9 +2275,79 @@ fn install_global_module_and_lock(
         rev: dep.rev.clone(),
         path: None,
         sha256,
-        asset_sha256: None,
-        asset_url: None,
+        artifacts: BTreeMap::new(),
     })
+}
+
+/// Assemble a plugin's per-platform `artifacts` map: freshly collected
+/// cross-platform entries, field-merged with what other platforms previously
+/// locked, plus this platform's extracted-dir hash.
+fn build_plugin_artifacts(
+    metadata: &DownloadVerificationMetadata,
+    existing: Option<&LockedPackage>,
+    extracted_sha: &str,
+) -> BTreeMap<String, PlatformArtifact> {
+    let mut artifacts = metadata.artifacts.clone();
+
+    if let Some(existing) = existing {
+        for (triple, art) in &existing.artifacts {
+            let entry = artifacts.entry(triple.clone()).or_default();
+            if entry.asset_url.is_none() {
+                entry.asset_url = art.asset_url.clone();
+            }
+            if entry.asset_sha256.is_none() {
+                entry.asset_sha256 = art.asset_sha256.clone();
+            }
+            if entry.sha256.is_none() {
+                entry.sha256 = art.sha256.clone();
+            }
+        }
+    }
+
+    if let Some(triple) = current_target_triple() {
+        let entry = artifacts.entry(triple).or_default();
+        entry.sha256 = Some(extracted_sha.to_string());
+        if entry.asset_url.is_none() {
+            entry.asset_url = metadata.asset_url.clone();
+        }
+        if entry.asset_sha256.is_none() {
+            entry.asset_sha256 = metadata.asset_sha256.clone();
+        }
+    }
+
+    artifacts
+}
+
+/// Verify a plugin against its frozen lock entry for the current platform.
+/// The archive `asset_sha256` (verified vs the signed checksums at download) is
+/// the security anchor; the extracted-dir `sha256` is re-checked when recorded,
+/// which also covers warm-cache installs that skip a fresh download.
+fn verify_frozen_plugin(
+    frozen_locked: Option<&LockedPackage>,
+    name: &str,
+    extracted_sha: &str,
+    metadata: &DownloadVerificationMetadata,
+) -> Result<()> {
+    let Some(artifact) = frozen_locked.and_then(LockedPackage::current_artifact) else {
+        return Ok(());
+    };
+    if let Some(expected) = artifact.sha256.as_deref()
+        && expected != extracted_sha
+    {
+        return Err(crate::error::QuiverError::Lockfile(format!(
+            "frozen install checksum mismatch for plugin '{name}': expected {expected}, got {extracted_sha}"
+        )));
+    }
+    if let (Some(expected), Some(actual)) = (
+        artifact.asset_sha256.as_deref(),
+        metadata.asset_sha256.as_deref(),
+    ) && expected != actual
+    {
+        return Err(crate::error::QuiverError::Lockfile(format!(
+            "frozen install asset checksum mismatch for plugin '{name}': expected {expected}, got {actual}"
+        )));
+    }
+    Ok(())
 }
 
 fn install_global_plugin_and_lock(
@@ -2096,7 +2363,8 @@ fn install_global_plugin_and_lock(
     }
     let frozen_locked_plugin =
         frozen_lockfile.and_then(|lock| lock.find_package(&plugin.name, LockedPackageKind::Plugin));
-    let plugin_install = install_plugin(plugin, None, security_policy, frozen_locked_plugin)?;
+    let plugin_install =
+        install_plugin(plugin, None, security_policy, frozen, frozen_locked_plugin)?;
     let installed_bin = plugin_install.installed_bin;
     let bin_name = plugin_install.bin_name;
     let version_dir = plugin_install.version_dir;
@@ -2110,41 +2378,17 @@ fn install_global_plugin_and_lock(
     }
     let sha256 = resolver::compute_checksum(&version_dir)?;
     if frozen {
-        verify_frozen_checksum(
-            frozen_lockfile,
+        verify_frozen_plugin(
+            frozen_locked_plugin,
             &plugin.name,
-            LockedPackageKind::Plugin,
             &sha256,
+            &plugin_install.asset_metadata,
         )?;
     }
-    if frozen
-        && let Some(expected_asset_sha) =
-            frozen_locked_plugin.and_then(|locked| locked.asset_sha256.as_deref())
-    {
-        let actual_asset_sha = plugin_install.asset_metadata.asset_sha256.as_deref().ok_or_else(|| {
-            crate::error::QuiverError::Lockfile(format!(
-                "frozen install requires downloaded asset_sha256 for plugin '{}' but no verified release asset digest was recorded",
-                plugin.name
-            ))
-        })?;
-        if expected_asset_sha != actual_asset_sha {
-            return Err(crate::error::QuiverError::Lockfile(format!(
-                "frozen install asset checksum mismatch for plugin '{}': expected {}, got {}",
-                plugin.name, expected_asset_sha, actual_asset_sha
-            )));
-        }
-    }
 
-    let existing_metadata = existing_lockfile
-        .and_then(|lock| lock.find_package(&plugin.name, LockedPackageKind::Plugin));
-    let asset_sha256 = plugin_install
-        .asset_metadata
-        .asset_sha256
-        .or_else(|| existing_metadata.and_then(|pkg| pkg.asset_sha256.clone()));
-    let asset_url = plugin_install
-        .asset_metadata
-        .asset_url
-        .or_else(|| existing_metadata.and_then(|pkg| pkg.asset_url.clone()));
+    let existing_metadata =
+        existing_lockfile.and_then(|lock| lock.find_package(&plugin.name, LockedPackageKind::Plugin));
+    let artifacts = build_plugin_artifacts(&plugin_install.asset_metadata, existing_metadata, &sha256);
 
     let locked_tag = if plugin.git == "nu-core" {
         None
@@ -2169,9 +2413,8 @@ fn install_global_plugin_and_lock(
         tag: locked_tag,
         rev: locked_rev,
         path: Some(bin_name),
-        sha256,
-        asset_sha256,
-        asset_url,
+        sha256: String::new(),
+        artifacts,
     };
     Ok((locked, target))
 }
@@ -2211,8 +2454,7 @@ fn install_module_and_lock(
         rev: dep.rev.clone(),
         path: None,
         sha256,
-        asset_sha256: None,
-        asset_url: None,
+        artifacts: BTreeMap::new(),
     })
 }
 
@@ -2236,6 +2478,7 @@ fn install_plugin_and_lock(
         plugin,
         nu_version_req,
         security_policy,
+        frozen,
         frozen_locked_plugin,
     )?;
     let installed_bin = plugin_install.installed_bin;
@@ -2250,41 +2493,17 @@ fn install_plugin_and_lock(
     link_plugin_into_env(&installed_bin, bin_dir, &bin_name)?;
     let sha256 = resolver::compute_checksum(&version_dir)?;
     if frozen {
-        verify_frozen_checksum(
-            frozen_lockfile,
+        verify_frozen_plugin(
+            frozen_locked_plugin,
             &plugin.name,
-            LockedPackageKind::Plugin,
             &sha256,
+            &plugin_install.asset_metadata,
         )?;
     }
-    if frozen
-        && let Some(expected_asset_sha) =
-            frozen_locked_plugin.and_then(|locked| locked.asset_sha256.as_deref())
-    {
-        let actual_asset_sha = plugin_install.asset_metadata.asset_sha256.as_deref().ok_or_else(|| {
-            crate::error::QuiverError::Lockfile(format!(
-                "frozen install requires downloaded asset_sha256 for plugin '{}' but no verified release asset digest was recorded",
-                plugin.name
-            ))
-        })?;
-        if expected_asset_sha != actual_asset_sha {
-            return Err(crate::error::QuiverError::Lockfile(format!(
-                "frozen install asset checksum mismatch for plugin '{}': expected {}, got {}",
-                plugin.name, expected_asset_sha, actual_asset_sha
-            )));
-        }
-    }
 
-    let existing_metadata = existing_lockfile
-        .and_then(|lock| lock.find_package(&plugin.name, LockedPackageKind::Plugin));
-    let asset_sha256 = plugin_install
-        .asset_metadata
-        .asset_sha256
-        .or_else(|| existing_metadata.and_then(|pkg| pkg.asset_sha256.clone()));
-    let asset_url = plugin_install
-        .asset_metadata
-        .asset_url
-        .or_else(|| existing_metadata.and_then(|pkg| pkg.asset_url.clone()));
+    let existing_metadata =
+        existing_lockfile.and_then(|lock| lock.find_package(&plugin.name, LockedPackageKind::Plugin));
+    let artifacts = build_plugin_artifacts(&plugin_install.asset_metadata, existing_metadata, &sha256);
 
     let locked_tag = if plugin.git == "nu-core" {
         None
@@ -2308,16 +2527,32 @@ fn install_plugin_and_lock(
         tag: locked_tag,
         rev: locked_rev,
         path: Some(bin_name),
-        sha256,
-        asset_sha256,
-        asset_url,
+        sha256: String::new(),
+        artifacts,
     })
+}
+
+/// Whether an already-cached plugin binary may be reused as-is.
+///
+/// Non-frozen installs always reuse the cache: they recompute the checksum and
+/// rewrite the lockfile anyway. A frozen install may only reuse the cache when
+/// the lock records an extracted `sha256` for this platform to verify the
+/// cached binary against; otherwise we force a fresh, signed download so a
+/// cached file is never trusted blindly.
+fn can_reuse_cached_plugin(frozen: bool, frozen_locked_plugin: Option<&LockedPackage>) -> bool {
+    if !frozen {
+        return true;
+    }
+    frozen_locked_plugin
+        .and_then(LockedPackage::current_artifact)
+        .is_some_and(|artifact| artifact.sha256.is_some())
 }
 
 fn install_plugin(
     plugin: &ResolvedPlugin,
     nu_version_req: Option<&str>,
     security_policy: SecurityPolicy,
+    frozen: bool,
     frozen_locked_plugin: Option<&LockedPackage>,
 ) -> Result<PluginInstallResult> {
     safety::validate_dependency_name(&plugin.name, "plugin dependency")?;
@@ -2333,7 +2568,7 @@ fn install_plugin(
         .join(&plugin.name)
         .join(version);
     let installed_bin = version_dir.join("bin").join(&binary_filename);
-    if installed_bin.is_file() {
+    if installed_bin.is_file() && can_reuse_cached_plugin(frozen, frozen_locked_plugin) {
         return Ok(PluginInstallResult {
             installed_bin,
             bin_name: binary_filename,
@@ -2533,14 +2768,24 @@ fn install_plugin_from_github_release(
     let mut asset_metadata = DownloadVerificationMetadata {
         asset_sha256: None,
         asset_url: Some(selected.asset.browser_download_url.clone()),
+        artifacts: BTreeMap::new(),
     };
+    // Download the checksums once; used both to verify the current platform's
+    // asset and to pin every other platform's artifact (eager universal lock).
+    let checksums_text = download_release_checksums(
+        &selected.release_assets,
+        &selected.asset.name,
+        &format!("plugin {} release {}", plugin.name, selected.release_tag),
+    )
+    .ok();
     let verification_result: Result<String> = (|| {
-        let checksum_text = download_release_checksums(
-            &selected.release_assets,
-            &selected.asset.name,
-            &format!("plugin {} release {}", plugin.name, selected.release_tag),
-        )?;
-        let expected_sha256 = parse_expected_sha256(&checksum_text, &selected.asset.name)?;
+        let checksum_text = checksums_text.as_deref().ok_or_else(|| {
+            crate::error::QuiverError::ChecksumSourceNotFound {
+                asset: selected.asset.name.clone(),
+                details: "no checksum source available for release".to_string(),
+            }
+        })?;
+        let expected_sha256 = parse_expected_sha256(checksum_text, &selected.asset.name)?;
         verify_downloaded_asset(&downloaded_path, &selected.asset.name, &expected_sha256)?;
         sha256_file(&downloaded_path)
     })();
@@ -2557,6 +2802,21 @@ fn install_plugin_from_github_release(
                 "SECURITY WARNING: plugin '{}' release asset '{}' could not be verified ({err}); continuing because --allow-unsigned/config override is active",
                 plugin.name, selected.asset.name
             ));
+        }
+    }
+
+    // Pin per-platform artifacts from the checksums file for cross-platform
+    // lockfile stability.
+    if let Some(text) = checksums_text.as_deref() {
+        asset_metadata.artifacts = collect_plugin_release_artifacts(&selected.release_assets, text);
+    }
+    // Ensure the current platform reflects the asset we actually downloaded and
+    // verified, even when only a single-asset checksum was available.
+    if let Some(triple) = current_target_triple() {
+        let entry = asset_metadata.artifacts.entry(triple).or_default();
+        entry.asset_url = Some(selected.asset.browser_download_url.clone());
+        if asset_metadata.asset_sha256.is_some() {
+            entry.asset_sha256 = asset_metadata.asset_sha256.clone();
         }
     }
 
@@ -3009,38 +3269,133 @@ fn release_tag_matches(actual: &str, expected: &str) -> bool {
     actual == expected || actual.trim_start_matches('v') == expected.trim_start_matches('v')
 }
 
+/// Whether `lower_asset_name` names an asset for the given `os` token
+/// (`macos`/`linux`/`windows`).
+fn asset_name_matches_os(lower_asset_name: &str, os: &str) -> bool {
+    match os {
+        "macos" => {
+            lower_asset_name.contains("apple-darwin")
+                || lower_asset_name.contains("darwin")
+                || lower_asset_name.contains("macos")
+                || lower_asset_name.contains("osx")
+        }
+        "linux" => lower_asset_name.contains("linux"),
+        "windows" => {
+            lower_asset_name.contains("pc-windows")
+                || lower_asset_name.contains("windows")
+                || lower_asset_name.contains("win32")
+                || lower_asset_name.contains("win64")
+        }
+        _ => false,
+    }
+}
+
+/// Whether `lower_asset_name` names an asset for the given `arch` token
+/// (`aarch64`/`x86_64`).
+fn asset_name_matches_arch(lower_asset_name: &str, arch: &str) -> bool {
+    match arch {
+        "aarch64" => lower_asset_name.contains("aarch64") || lower_asset_name.contains("arm64"),
+        "x86_64" => lower_asset_name.contains("x86_64") || lower_asset_name.contains("amd64"),
+        _ => false,
+    }
+}
+
+/// The (os, arch) pair for a known target triple.
+fn triple_os_arch(triple: &str) -> Option<(&'static str, &'static str)> {
+    match triple {
+        "aarch64-apple-darwin" => Some(("macos", "aarch64")),
+        "x86_64-apple-darwin" => Some(("macos", "x86_64")),
+        "aarch64-unknown-linux-gnu" => Some(("linux", "aarch64")),
+        "x86_64-unknown-linux-gnu" => Some(("linux", "x86_64")),
+        "aarch64-pc-windows-msvc" => Some(("windows", "aarch64")),
+        "x86_64-pc-windows-msvc" => Some(("windows", "x86_64")),
+        _ => None,
+    }
+}
+
+/// Map an arbitrary release-asset filename to one of quiver's known target
+/// triples, or `None` if it is not an installable artifact for a known platform.
+///
+/// Prefers an exact full-triple substring match (which correctly excludes e.g.
+/// musl assets from the gnu triple); otherwise falls back to os+arch token
+/// detection, skipping musl assets we do not track.
+fn classify_asset_triple(asset_name: &str) -> Option<String> {
+    let lower = asset_name.to_ascii_lowercase();
+    if is_non_executable_release_asset(&lower) {
+        return None;
+    }
+
+    for triple in KNOWN_TARGET_TRIPLES {
+        if lower.contains(triple) {
+            return Some((*triple).to_string());
+        }
+    }
+
+    // Loose fallback for assets that don't embed the full triple.
+    if lower.contains("musl") {
+        return None;
+    }
+    for triple in KNOWN_TARGET_TRIPLES {
+        let Some((os, arch)) = triple_os_arch(triple) else {
+            continue;
+        };
+        if asset_name_matches_os(&lower, os) && asset_name_matches_arch(&lower, arch) {
+            return Some((*triple).to_string());
+        }
+    }
+    None
+}
+
+/// Build a per-target-triple artifact map from a release's asset list and its
+/// checksums file. Only assets with a verifiable SHA-256 entry are pinned, so
+/// the security guarantee carries to every platform. Plugins whose release ships
+/// only a single per-asset `.sha256` will pin just the current platform.
+fn collect_plugin_release_artifacts(
+    release_assets: &[GitHubReleaseAsset],
+    checksums_text: &str,
+) -> BTreeMap<String, PlatformArtifact> {
+    let mut map: BTreeMap<String, PlatformArtifact> = BTreeMap::new();
+    for asset in release_assets {
+        let Some(triple) = classify_asset_triple(&asset.name) else {
+            continue;
+        };
+        if asset.browser_download_url.trim().is_empty() {
+            continue;
+        }
+        let Ok(asset_sha256) = parse_expected_sha256(checksums_text, &asset.name) else {
+            continue;
+        };
+        let candidate = PlatformArtifact {
+            asset_url: Some(asset.browser_download_url.clone()),
+            asset_sha256: Some(asset_sha256),
+            sha256: None,
+        };
+        // Prefer archive assets when several map to the same triple.
+        match map.get(&triple) {
+            Some(existing)
+                if existing
+                    .asset_url
+                    .as_deref()
+                    .is_some_and(|url| is_supported_archive_asset_name(&url.to_ascii_lowercase()))
+                    && !is_supported_archive_asset_name(&asset.name.to_ascii_lowercase()) => {}
+            _ => {
+                map.insert(triple, candidate);
+            }
+        }
+    }
+    map
+}
+
 fn score_plugin_asset_name(asset_name: &str, binary_filename: &str) -> Option<i32> {
     let lower = asset_name.to_ascii_lowercase();
     if is_non_executable_release_asset(&lower) {
         return None;
     }
 
-    let os_ok = match std::env::consts::OS {
-        "macos" => {
-            lower.contains("apple-darwin")
-                || lower.contains("darwin")
-                || lower.contains("macos")
-                || lower.contains("osx")
-        }
-        "linux" => lower.contains("linux"),
-        "windows" => {
-            lower.contains("pc-windows")
-                || lower.contains("windows")
-                || lower.contains("win32")
-                || lower.contains("win64")
-        }
-        _ => false,
-    };
-    if !os_ok {
+    if !asset_name_matches_os(&lower, std::env::consts::OS) {
         return None;
     }
-
-    let arch_ok = match std::env::consts::ARCH {
-        "aarch64" => lower.contains("aarch64") || lower.contains("arm64"),
-        "x86_64" => lower.contains("x86_64") || lower.contains("amd64"),
-        _ => false,
-    };
-    if !arch_ok {
+    if !asset_name_matches_arch(&lower, std::env::consts::ARCH) {
         return None;
     }
 
@@ -3655,6 +4010,24 @@ fn path_to_forward_slashes(path: &Path) -> String {
 
 /// Determine whether the module section is stale relative to the local lockfile.
 fn local_lockfile_is_stale(manifest: &Manifest, lockfile: &Lockfile) -> bool {
+    // A declared nu-version must have a pin that still satisfies it. Per-platform
+    // artifact differences never count as stale (that is the point of the v2
+    // lockfile) — only the pinned version matters here.
+    if let Some(req_str) = manifest.package.nu_version.as_deref() {
+        match lockfile.nu.as_ref() {
+            None => return true,
+            Some(nu) => {
+                let satisfied = nu::parse_nu_version_requirement(req_str)
+                    .ok()
+                    .zip(Version::parse(&nu.version).ok())
+                    .is_some_and(|(req, version)| req.matches(&version));
+                if !satisfied {
+                    return true;
+                }
+            }
+        }
+    }
+
     // Check if all manifest module deps are in the lockfile
     for (name, spec) in &manifest.dependencies.modules {
         let Some(locked) = lockfile.find_package(name, LockedPackageKind::Module) else {
@@ -4310,7 +4683,8 @@ mod tests {
         .unwrap();
         let lockfile = Lockfile::from_str(
             r#"{
-  version: 1,
+  version: 2,
+  nu: { version: "0.111.0" },
   packages: [
     {
       name: "nu_plugin_polars",
@@ -4545,7 +4919,7 @@ mod tests {
         install(&project_dir, false, false, false).unwrap();
 
         let lock = Lockfile::from_path(&project_dir.join("quiver.lock")).unwrap();
-        assert_eq!(lock.version, 1);
+        assert_eq!(lock.version, LOCKFILE_VERSION);
         assert!(lock.packages.is_empty());
 
         let _ = std::fs::remove_dir_all(project_dir);
@@ -4732,6 +5106,7 @@ mod tests {
     fn partition_global_dependencies_reuses_matching_lock_entries() {
         let lockfile = Lockfile {
             version: 1,
+            nu: None,
             packages: vec![
                 LockedPackage {
                     name: "nu-salesforce".to_string(),
@@ -4741,8 +5116,7 @@ mod tests {
                     rev: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
                     path: None,
                     sha256: "module-sha".to_string(),
-                    asset_sha256: None,
-                    asset_url: None,
+                    artifacts: BTreeMap::new(),
                 },
                 LockedPackage {
                     name: "nu_plugin_file".to_string(),
@@ -4752,8 +5126,7 @@ mod tests {
                     rev: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
                     path: Some("nu_plugin_file".to_string()),
                     sha256: "plugin-sha".to_string(),
-                    asset_sha256: None,
-                    asset_url: None,
+                    artifacts: BTreeMap::new(),
                 },
             ],
         };
@@ -4845,8 +5218,7 @@ mod tests {
             rev: dep.rev.clone(),
             path: None,
             sha256: resolver::compute_checksum(&module_dir).unwrap(),
-            asset_sha256: None,
-            asset_url: None,
+            artifacts: BTreeMap::new(),
         };
 
         assert!(!installed_global_module_matches_lock(&dep, &modules_dir, Some(&locked)).unwrap());
@@ -4876,6 +5248,7 @@ mod tests {
 
         let lockfile = Lockfile {
             version: 1,
+            nu: None,
             packages: vec![
                 LockedPackage {
                     name: stale_name.to_string(),
@@ -4885,8 +5258,7 @@ mod tests {
                     rev: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
                     path: None,
                     sha256: "stale-sha".to_string(),
-                    asset_sha256: None,
-                    asset_url: None,
+                    artifacts: BTreeMap::new(),
                 },
                 LockedPackage {
                     name: kept_name.to_string(),
@@ -4896,8 +5268,7 @@ mod tests {
                     rev: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
                     path: None,
                     sha256: "kept-sha".to_string(),
-                    asset_sha256: None,
-                    asset_url: None,
+                    artifacts: BTreeMap::new(),
                 },
             ],
         };
@@ -5100,6 +5471,7 @@ mod tests {
 
         let lockfile = Lockfile {
             version: 1,
+            nu: None,
             packages: vec![LockedPackage {
                 name: "nu-utils".to_string(),
                 kind: LockedPackageKind::Module,
@@ -5108,8 +5480,7 @@ mod tests {
                 rev: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
                 path: None,
                 sha256: "aaa".to_string(),
-                asset_sha256: None,
-                asset_url: None,
+                artifacts: BTreeMap::new(),
             }],
         };
 
@@ -5178,6 +5549,220 @@ mod tests {
 
         let selected = select_plugin_release_asset(&releases, Some("v0.91.0"), &binary).unwrap();
         assert_eq!(selected.asset.name, target_asset);
+    }
+
+    #[test]
+    fn classify_asset_triple_maps_known_platforms_and_skips_others() {
+        assert_eq!(
+            classify_asset_triple("nu_plugin_inc-aarch64-apple-darwin.tar.gz").as_deref(),
+            Some("aarch64-apple-darwin")
+        );
+        assert_eq!(
+            classify_asset_triple("nu_plugin_inc-x86_64-pc-windows-msvc.zip").as_deref(),
+            Some("x86_64-pc-windows-msvc")
+        );
+        // Loose, non-full-triple names fall back to os+arch detection.
+        assert_eq!(
+            classify_asset_triple("nu_plugin_inc-linux-amd64.tar.gz").as_deref(),
+            Some("x86_64-unknown-linux-gnu")
+        );
+        // musl is not tracked and must not be mislabelled as gnu.
+        assert_eq!(
+            classify_asset_triple("nu_plugin_inc-x86_64-unknown-linux-musl.tar.gz"),
+            None
+        );
+        // Checksum/signature assets are never artifacts.
+        assert_eq!(classify_asset_triple("SHA256SUMS"), None);
+        assert_eq!(
+            classify_asset_triple("nu_plugin_inc-x86_64-unknown-linux-gnu.tar.gz.sha256"),
+            None
+        );
+    }
+
+    #[test]
+    fn collect_plugin_release_artifacts_is_platform_independent() {
+        // Same inputs must yield the same lockfile artifacts on every platform.
+        let assets = vec![
+            GitHubReleaseAsset {
+                name: "nu_plugin_inc-aarch64-apple-darwin.tar.gz".to_string(),
+                browser_download_url: "https://example.com/darwin.tar.gz".to_string(),
+            },
+            GitHubReleaseAsset {
+                name: "nu_plugin_inc-x86_64-unknown-linux-gnu.tar.gz".to_string(),
+                browser_download_url: "https://example.com/linux.tar.gz".to_string(),
+            },
+            GitHubReleaseAsset {
+                name: "SHA256SUMS".to_string(),
+                browser_download_url: "https://example.com/SHA256SUMS".to_string(),
+            },
+        ];
+        let checksums = "\
+1111111111111111111111111111111111111111111111111111111111111111  nu_plugin_inc-aarch64-apple-darwin.tar.gz
+2222222222222222222222222222222222222222222222222222222222222222  nu_plugin_inc-x86_64-unknown-linux-gnu.tar.gz
+";
+
+        let map = collect_plugin_release_artifacts(&assets, checksums);
+        assert_eq!(map.len(), 2);
+        assert_eq!(
+            map["aarch64-apple-darwin"].asset_sha256.as_deref(),
+            Some("1111111111111111111111111111111111111111111111111111111111111111")
+        );
+        assert_eq!(
+            map["aarch64-apple-darwin"].asset_url.as_deref(),
+            Some("https://example.com/darwin.tar.gz")
+        );
+        assert_eq!(
+            map["x86_64-unknown-linux-gnu"].asset_sha256.as_deref(),
+            Some("2222222222222222222222222222222222222222222222222222222222222222")
+        );
+        // No extracted-dir hash is recorded for eager cross-platform entries.
+        assert!(map["aarch64-apple-darwin"].sha256.is_none());
+    }
+
+    #[test]
+    fn collect_plugin_release_artifacts_skips_assets_without_a_checksum() {
+        let assets = vec![GitHubReleaseAsset {
+            name: "nu_plugin_inc-x86_64-unknown-linux-gnu.tar.gz".to_string(),
+            browser_download_url: "https://example.com/linux.tar.gz".to_string(),
+        }];
+        // Checksums file does not list this asset -> nothing is pinned (security).
+        let map = collect_plugin_release_artifacts(&assets, "# empty\n");
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn build_plugin_artifacts_preserves_other_platforms_and_records_current() {
+        let triple = current_target_triple().expect("supported test platform");
+        let other = if triple == "x86_64-unknown-linux-gnu" {
+            "aarch64-apple-darwin"
+        } else {
+            "x86_64-unknown-linux-gnu"
+        };
+
+        // A previous lock from another platform recorded its own extracted hash.
+        let mut existing_artifacts = BTreeMap::new();
+        existing_artifacts.insert(
+            other.to_string(),
+            PlatformArtifact {
+                asset_url: Some("https://example.com/other.tar.gz".to_string()),
+                asset_sha256: Some("otherassetsha".to_string()),
+                sha256: Some("otherextractedsha".to_string()),
+            },
+        );
+        let existing = LockedPackage {
+            name: "nu_plugin_inc".to_string(),
+            kind: LockedPackageKind::Plugin,
+            git: "https://github.com/nushell/nu_plugin_inc".to_string(),
+            tag: Some("v0.91.0".to_string()),
+            rev: "abc".to_string(),
+            path: Some("nu_plugin_inc".to_string()),
+            sha256: String::new(),
+            artifacts: existing_artifacts,
+        };
+
+        // This run freshly collected eager artifacts for both platforms.
+        let mut collected = BTreeMap::new();
+        collected.insert(
+            triple.clone(),
+            PlatformArtifact {
+                asset_url: Some("https://example.com/current.tar.gz".to_string()),
+                asset_sha256: Some("currentassetsha".to_string()),
+                sha256: None,
+            },
+        );
+        collected.insert(
+            other.to_string(),
+            PlatformArtifact {
+                asset_url: Some("https://example.com/other.tar.gz".to_string()),
+                asset_sha256: Some("otherassetsha".to_string()),
+                sha256: None,
+            },
+        );
+        let metadata = DownloadVerificationMetadata {
+            asset_sha256: Some("currentassetsha".to_string()),
+            asset_url: Some("https://example.com/current.tar.gz".to_string()),
+            artifacts: collected,
+        };
+
+        let merged = build_plugin_artifacts(&metadata, Some(&existing), "currentextractedsha");
+
+        // The other platform's recorded extracted hash survives untouched.
+        assert_eq!(
+            merged[other].sha256.as_deref(),
+            Some("otherextractedsha")
+        );
+        // The current platform records its freshly computed extracted hash.
+        assert_eq!(
+            merged[&triple].sha256.as_deref(),
+            Some("currentextractedsha")
+        );
+        assert_eq!(
+            merged[&triple].asset_sha256.as_deref(),
+            Some("currentassetsha")
+        );
+    }
+
+    #[test]
+    fn can_reuse_cached_plugin_rules() {
+        let triple = current_target_triple().expect("supported test platform");
+
+        let make = |sha256: Option<&str>| {
+            let mut artifacts = BTreeMap::new();
+            artifacts.insert(
+                triple.clone(),
+                PlatformArtifact {
+                    asset_url: Some("https://example.com/current.tar.gz".to_string()),
+                    asset_sha256: Some("currentassetsha".to_string()),
+                    sha256: sha256.map(|s| s.to_string()),
+                },
+            );
+            LockedPackage {
+                name: "nu_plugin_inc".to_string(),
+                kind: LockedPackageKind::Plugin,
+                git: "https://github.com/nushell/nu_plugin_inc".to_string(),
+                tag: Some("v0.91.0".to_string()),
+                rev: "abc".to_string(),
+                path: Some("nu_plugin_inc".to_string()),
+                sha256: String::new(),
+                artifacts,
+            }
+        };
+
+        // Non-frozen always reuses the warm cache (lock gets rewritten anyway).
+        assert!(can_reuse_cached_plugin(false, None));
+
+        // Frozen with a recorded extracted hash for this platform: reusable,
+        // because verify_frozen_plugin will re-hash and compare it.
+        let with_sha = make(Some("recordedextractedsha"));
+        assert!(can_reuse_cached_plugin(true, Some(&with_sha)));
+
+        // Frozen with an artifact but no extracted hash: NOT reusable, force a
+        // fresh signed download so the cached binary is never trusted blindly.
+        let without_sha = make(None);
+        assert!(!can_reuse_cached_plugin(true, Some(&without_sha)));
+
+        // Frozen with no artifact for this platform at all: NOT reusable.
+        assert!(!can_reuse_cached_plugin(true, None));
+    }
+
+    #[test]
+    fn local_lockfile_stale_when_nu_version_declared_but_unpinned() {
+        let manifest = Manifest::from_str(
+            r#"{ package: { name: "demo", version: "0.1.0", nu-version: ">=0.110.0, <0.112.0" } }"#,
+        )
+        .unwrap();
+        let unpinned = Lockfile::from_str("{ version: 2, packages: [] }").unwrap();
+        assert!(local_lockfile_is_stale(&manifest, &unpinned));
+
+        let satisfied =
+            Lockfile::from_str(r#"{ version: 2, nu: { version: "0.111.0" }, packages: [] }"#)
+                .unwrap();
+        assert!(!local_lockfile_is_stale(&manifest, &satisfied));
+
+        let unsatisfied =
+            Lockfile::from_str(r#"{ version: 2, nu: { version: "0.120.0" }, packages: [] }"#)
+                .unwrap();
+        assert!(local_lockfile_is_stale(&manifest, &unsatisfied));
     }
 
     #[test]
@@ -5543,6 +6128,7 @@ mod tests {
     fn frozen_checksum_verification_requires_matching_sha() {
         let lock = Lockfile {
             version: 1,
+            nu: None,
             packages: vec![LockedPackage {
                 name: "nu-utils".to_string(),
                 kind: LockedPackageKind::Module,
@@ -5551,8 +6137,7 @@ mod tests {
                 rev: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
                 path: None,
                 sha256: "deadbeef".to_string(),
-                asset_sha256: None,
-                asset_url: None,
+                artifacts: BTreeMap::new(),
             }],
         };
 

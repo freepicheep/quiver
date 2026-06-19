@@ -1,7 +1,17 @@
 # Unreleased
 
+## Added
+
+- **Cross-platform lockfiles (schema v2).** `quiver.lock` now pins the Nushell runtime version (when the manifest declares a `nu-version`) and records plugin and nu download artifacts per target triple. At lock time quiver eagerly pins the download URL and `asset_sha256` for *every* platform listed in a release's signed checksums file, so the lockfile is identical no matter which OS runs `qv install` — a Linux install no longer rewrites what a macOS install produced. Each platform additionally records its own extracted-binary `sha256` for local cache-tamper detection. Plugins whose releases lack a multi-platform checksums file fall back to pinning the current platform only.
+- `qv install --frozen` can now install the pinned Nushell version and plugin binaries on a fresh platform using the per-platform artifacts recorded in the lockfile, verifying each download against its pinned, signed `asset_sha256`.
+
+## Changed
+
+- The lockfile schema is now version 2. Existing v1 lockfiles are read transparently and rewritten to v2 on the next `qv install`; the per-platform security hash for plugins (`asset_sha256`) remains the verification anchor.
+
 ## Fixed
 
+- `qv install --frozen` no longer reuses an already-cached plugin binary without verification when the lockfile has no recorded extracted `sha256` for the current platform (e.g. when the lock was generated on a different OS). In that case it now forces a fresh, signed download and verifies it against the pinned `asset_sha256`, so a cached binary is never trusted blindly. Frozen installs are now strictly verified on every platform.
 - On Windows, `qv run` no longer fails with `Access is denied. (os error 5)` when the account lacks the symlink-creation privilege. Quiver now creates a hard link for `.nu-env/bin/` entries before falling back to a file copy, so the project-local `nu` binary and plugins are executable without Administrator rights or Developer Mode.
 - `clone` install mode no longer errors with `Operation not supported` on filesystems without copy-on-write support (ext4 without reflink, overlayfs, tmpfs — common on CI runners). Module materialization now reflinks per file via the `reflink-copy` crate and transparently falls back to a standard copy, instead of shelling out to `cp --reflink=always`.
 
