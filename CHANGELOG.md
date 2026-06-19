@@ -1,5 +1,7 @@
 # Unreleased
 
+# Version 0.8.0 (2026-06-19)
+
 ## Added
 
 - **Cross-platform lockfiles (schema v2).** `quiver.lock` now pins the Nushell runtime version (when the manifest declares a `nu-version`) and records plugin and nu download artifacts per target triple. At lock time quiver eagerly pins the download URL and `asset_sha256` for *every* platform listed in a release's signed checksums file, so the lockfile is identical no matter which OS runs `qv install` — a Linux install no longer rewrites what a macOS install produced. Each platform additionally records its own extracted-binary `sha256` for local cache-tamper detection. Plugins whose releases lack a multi-platform checksums file fall back to pinning the current platform only.
