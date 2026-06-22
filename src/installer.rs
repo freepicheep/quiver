@@ -2386,9 +2386,10 @@ fn install_global_plugin_and_lock(
         )?;
     }
 
-    let existing_metadata =
-        existing_lockfile.and_then(|lock| lock.find_package(&plugin.name, LockedPackageKind::Plugin));
-    let artifacts = build_plugin_artifacts(&plugin_install.asset_metadata, existing_metadata, &sha256);
+    let existing_metadata = existing_lockfile
+        .and_then(|lock| lock.find_package(&plugin.name, LockedPackageKind::Plugin));
+    let artifacts =
+        build_plugin_artifacts(&plugin_install.asset_metadata, existing_metadata, &sha256);
 
     let locked_tag = if plugin.git == "nu-core" {
         None
@@ -2501,9 +2502,10 @@ fn install_plugin_and_lock(
         )?;
     }
 
-    let existing_metadata =
-        existing_lockfile.and_then(|lock| lock.find_package(&plugin.name, LockedPackageKind::Plugin));
-    let artifacts = build_plugin_artifacts(&plugin_install.asset_metadata, existing_metadata, &sha256);
+    let existing_metadata = existing_lockfile
+        .and_then(|lock| lock.find_package(&plugin.name, LockedPackageKind::Plugin));
+    let artifacts =
+        build_plugin_artifacts(&plugin_install.asset_metadata, existing_metadata, &sha256);
 
     let locked_tag = if plugin.git == "nu-core" {
         None
@@ -3373,11 +3375,9 @@ fn collect_plugin_release_artifacts(
         // Prefer archive assets when several map to the same triple.
         match map.get(&triple) {
             Some(existing)
-                if existing
-                    .asset_url
-                    .as_deref()
-                    .is_some_and(|url| is_supported_archive_asset_name(&url.to_ascii_lowercase()))
-                    && !is_supported_archive_asset_name(&asset.name.to_ascii_lowercase()) => {}
+                if existing.asset_url.as_deref().is_some_and(|url| {
+                    is_supported_archive_asset_name(&url.to_ascii_lowercase())
+                }) && !is_supported_archive_asset_name(&asset.name.to_ascii_lowercase()) => {}
             _ => {
                 map.insert(triple, candidate);
             }
@@ -5687,10 +5687,7 @@ mod tests {
         let merged = build_plugin_artifacts(&metadata, Some(&existing), "currentextractedsha");
 
         // The other platform's recorded extracted hash survives untouched.
-        assert_eq!(
-            merged[other].sha256.as_deref(),
-            Some("otherextractedsha")
-        );
+        assert_eq!(merged[other].sha256.as_deref(), Some("otherextractedsha"));
         // The current platform records its freshly computed extracted hash.
         assert_eq!(
             merged[&triple].sha256.as_deref(),

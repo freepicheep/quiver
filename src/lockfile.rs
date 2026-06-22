@@ -338,7 +338,9 @@ mod tests {
                             artifact(
                                 "https://github.com/nushell/nu_plugin_inc/releases/download/v0.91.0/nu_plugin_inc-aarch64-apple-darwin.tar.gz",
                                 "1111111111111111111111111111111111111111111111111111111111111111",
-                                Some("cafebabecafebabecafebabecafebabecafebabecafebabecafebabecafebabe"),
+                                Some(
+                                    "cafebabecafebabecafebabecafebabecafebabecafebabecafebabecafebabe",
+                                ),
                             ),
                         ),
                         (
@@ -435,7 +437,9 @@ mod tests {
         let nu = lock.nu.unwrap();
         assert_eq!(nu.version, "0.107.0");
         assert_eq!(
-            nu.artifacts["x86_64-unknown-linux-gnu"].asset_url.as_deref(),
+            nu.artifacts["x86_64-unknown-linux-gnu"]
+                .asset_url
+                .as_deref(),
             Some("https://example.com/nu.tar.gz")
         );
     }
@@ -497,7 +501,10 @@ mod tests {
         let triple = current_target_triple().expect("supported test platform");
         let artifact = plugin.find_artifact(&triple).unwrap();
         assert_eq!(artifact.asset_sha256.as_deref(), Some("archivehash"));
-        assert_eq!(artifact.asset_url.as_deref(), Some("https://example.com/plugin.tar.gz"));
+        assert_eq!(
+            artifact.asset_url.as_deref(),
+            Some("https://example.com/plugin.tar.gz")
+        );
         assert_eq!(artifact.sha256.as_deref(), Some("extractedhash"));
     }
 
