@@ -330,6 +330,7 @@ fn global_autoload_config_hint() -> &'static str {
 }
 
 /// Install resolved global dependencies and write `config.lock`.
+#[expect(clippy::too_many_arguments)]
 fn install_resolved_global(
     modules: &[ResolvedDep],
     plugins: &[ResolvedPlugin],
@@ -620,6 +621,7 @@ fn remove_module_dist_info_dirs(modules_dir: &Path, module_name: &str) -> Result
 }
 
 /// Install a list of resolved dependencies into a target directory and write the lockfile.
+#[expect(clippy::too_many_arguments)]
 fn install_resolved(
     modules: &[ResolvedDep],
     plugins: &[ResolvedPlugin],
@@ -3232,9 +3234,10 @@ fn select_plugin_release_asset(
             continue;
         }
         if let Some(tag) = preferred_tag
-            && !release_tag_matches(&release.tag_name, tag) {
-                continue;
-            }
+            && !release_tag_matches(&release.tag_name, tag)
+        {
+            continue;
+        }
 
         let mut candidates: Vec<(i32, GitHubReleaseAsset)> = release
             .assets
@@ -3244,7 +3247,7 @@ fn select_plugin_release_asset(
                 Some((score, asset.clone()))
             })
             .collect();
-        candidates.sort_by(|a, b| b.0.cmp(&a.0));
+        candidates.sort_by_key(|b| std::cmp::Reverse(b.0));
         if let Some((_, asset)) = candidates.into_iter().next() {
             return Some(GitHubReleaseAssetCandidate {
                 release_tag: release.tag_name.clone(),
@@ -3756,15 +3759,17 @@ fn select_module_subdir(module_root: &Path, dep_name: &str) -> Result<PathBuf> {
     let mut seen = HashSet::new();
 
     if let Some(entry_hint) = metadata.entry_hint.as_deref()
-        && let Some(subdir) = module_subpath_from_hint(module_root, entry_hint) {
-            push_unique_path(&mut candidates, &mut seen, subdir);
-        }
+        && let Some(subdir) = module_subpath_from_hint(module_root, entry_hint)
+    {
+        push_unique_path(&mut candidates, &mut seen, subdir);
+    }
 
     if let Some(package_name) = metadata.package_name.as_deref()
         && let Some(subdir) = safety::normalized_relative_path(Path::new(package_name))
-            && module_root.join(&subdir).join("mod.nu").is_file() {
-                push_unique_path(&mut candidates, &mut seen, subdir);
-            }
+        && module_root.join(&subdir).join("mod.nu").is_file()
+    {
+        push_unique_path(&mut candidates, &mut seen, subdir);
+    }
 
     if module_root.join("mod.nu").is_file() {
         push_unique_path(&mut candidates, &mut seen, PathBuf::new());
@@ -3836,9 +3841,10 @@ fn extract_nuon_value(content: &str, keys: &[&str]) -> Option<String> {
                 if keys
                     .iter()
                     .any(|expected| key.eq_ignore_ascii_case(expected))
-                    && let Some(value) = parse_nuon_scalar(rhs) {
-                        return Some(value);
-                    }
+                    && let Some(value) = parse_nuon_scalar(rhs)
+                {
+                    return Some(value);
+                }
             }
         }
     }

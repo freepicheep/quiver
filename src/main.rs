@@ -799,6 +799,7 @@ fn cmd_run(cwd: &Path, command: Vec<String>) -> Result<()> {
     Ok(())
 }
 
+#[expect(clippy::too_many_arguments)]
 fn cmd_qvx(
     cwd: &Path,
     source: String,
@@ -1379,10 +1380,11 @@ fn write_vscode_lsp_config(project_dir: &Path) -> Result<()> {
     let mut settings = serde_json::json!({});
     if config_path.exists()
         && let Ok(content) = std::fs::read_to_string(&config_path)
-            && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&content)
-                && parsed.is_object() {
-                    settings = parsed;
-                }
+        && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&content)
+        && parsed.is_object()
+    {
+        settings = parsed;
+    }
 
     if let Some(obj) = settings.as_object_mut() {
         obj.insert(

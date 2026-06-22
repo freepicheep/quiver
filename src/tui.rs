@@ -1213,6 +1213,22 @@ struct Canvas {
     height: usize,
 }
 
+impl std::fmt::Display for Canvas {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}",
+            self.grid
+                .iter()
+                .map(|row| row.iter().collect::<String>())
+                .map(|s| s.trim_end().to_string())
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+    }
+}
+
 impl Canvas {
     fn new(width: usize, height: usize) -> Self {
         Self {
@@ -1231,16 +1247,6 @@ impl Canvas {
                 self.grid[y][x + i] = c;
             }
         }
-    }
-
-    fn to_string(&self) -> String {
-        self.grid
-            .iter()
-            .map(|row| row.iter().collect::<String>())
-            .map(|s| s.trim_end().to_string())
-            .filter(|s| !s.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n")
     }
 }
 
@@ -2125,9 +2131,10 @@ fn read_local_readme(dist_info_dir: &Path) -> String {
         let name = entry.file_name().to_string_lossy().to_lowercase();
         let base = name.split('.').next().unwrap_or(&name);
         if base == "readme"
-            && let Ok(content) = std::fs::read_to_string(entry.path()) {
-                return content;
-            }
+            && let Ok(content) = std::fs::read_to_string(entry.path())
+        {
+            return content;
+        }
     }
     String::new()
 }
@@ -2136,12 +2143,13 @@ fn read_local_license(dist_info_dir: &Path) -> String {
     let manifest_path = dist_info_dir.join("nupackage.nuon");
     if let Ok(content) = std::fs::read_to_string(&manifest_path)
         && let Ok(manifest) = crate::manifest::Manifest::from_str(&content)
-            && let Some(license) = manifest.package.license {
-                let trimmed = license.trim();
-                if !trimmed.is_empty() {
-                    return trimmed.to_string();
-                }
-            }
+        && let Some(license) = manifest.package.license
+    {
+        let trimmed = license.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
 
     for entry in std::fs::read_dir(dist_info_dir)
         .into_iter()
@@ -2151,22 +2159,23 @@ fn read_local_license(dist_info_dir: &Path) -> String {
         let name = entry.file_name().to_string_lossy().to_lowercase();
         let base = name.split('.').next().unwrap_or(&name);
         if matches!(base, "license" | "licenses" | "copying")
-            && let Ok(content) = std::fs::read_to_string(entry.path()) {
-                let upper = content.to_ascii_uppercase();
-                if upper.contains("MIT") {
-                    return "MIT".to_string();
-                }
-                if upper.contains("APACHE") {
-                    return "Apache-2.0".to_string();
-                }
-                if upper.contains("GPL") {
-                    return "GPL".to_string();
-                }
-                if upper.contains("BSD") {
-                    return "BSD".to_string();
-                }
-                return "Unknown".to_string();
+            && let Ok(content) = std::fs::read_to_string(entry.path())
+        {
+            let upper = content.to_ascii_uppercase();
+            if upper.contains("MIT") {
+                return "MIT".to_string();
             }
+            if upper.contains("APACHE") {
+                return "Apache-2.0".to_string();
+            }
+            if upper.contains("GPL") {
+                return "GPL".to_string();
+            }
+            if upper.contains("BSD") {
+                return "BSD".to_string();
+            }
+            return "Unknown".to_string();
+        }
     }
 
     String::new()
