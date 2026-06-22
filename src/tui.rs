@@ -2124,27 +2124,24 @@ fn read_local_readme(dist_info_dir: &Path) -> String {
     {
         let name = entry.file_name().to_string_lossy().to_lowercase();
         let base = name.split('.').next().unwrap_or(&name);
-        if base == "readme" {
-            if let Ok(content) = std::fs::read_to_string(entry.path()) {
+        if base == "readme"
+            && let Ok(content) = std::fs::read_to_string(entry.path()) {
                 return content;
             }
-        }
     }
     String::new()
 }
 
 fn read_local_license(dist_info_dir: &Path) -> String {
     let manifest_path = dist_info_dir.join("nupackage.nuon");
-    if let Ok(content) = std::fs::read_to_string(&manifest_path) {
-        if let Ok(manifest) = crate::manifest::Manifest::from_str(&content) {
-            if let Some(license) = manifest.package.license {
+    if let Ok(content) = std::fs::read_to_string(&manifest_path)
+        && let Ok(manifest) = crate::manifest::Manifest::from_str(&content)
+            && let Some(license) = manifest.package.license {
                 let trimmed = license.trim();
                 if !trimmed.is_empty() {
                     return trimmed.to_string();
                 }
             }
-        }
-    }
 
     for entry in std::fs::read_dir(dist_info_dir)
         .into_iter()
@@ -2153,8 +2150,8 @@ fn read_local_license(dist_info_dir: &Path) -> String {
     {
         let name = entry.file_name().to_string_lossy().to_lowercase();
         let base = name.split('.').next().unwrap_or(&name);
-        if matches!(base, "license" | "licenses" | "copying") {
-            if let Ok(content) = std::fs::read_to_string(entry.path()) {
+        if matches!(base, "license" | "licenses" | "copying")
+            && let Ok(content) = std::fs::read_to_string(entry.path()) {
                 let upper = content.to_ascii_uppercase();
                 if upper.contains("MIT") {
                     return "MIT".to_string();
@@ -2170,7 +2167,6 @@ fn read_local_license(dist_info_dir: &Path) -> String {
                 }
                 return "Unknown".to_string();
             }
-        }
     }
 
     String::new()

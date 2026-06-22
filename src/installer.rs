@@ -1651,8 +1651,7 @@ fn download_release_checksums(
         crate::error::QuiverError::ChecksumSourceNotFound {
             asset: asset_name.to_string(),
             details: format!(
-                "no checksum asset found in {release_label}; expected SHA256SUMS/checksums.txt or {}.sha256",
-                asset_name
+                "no checksum asset found in {release_label}; expected SHA256SUMS/checksums.txt or {asset_name}.sha256"
             ),
         }
     })?;
@@ -1816,8 +1815,7 @@ fn verify_downloaded_asset(path: &Path, asset_name: &str, expected_sha256: &str)
         crate::error::QuiverError::ChecksumParse {
             asset: asset_name.to_string(),
             details: format!(
-                "expected SHA-256 digest for asset '{}' was malformed: '{}'",
-                asset_name, expected_sha256
+                "expected SHA-256 digest for asset '{asset_name}' was malformed: '{expected_sha256}'"
             ),
         }
     })?;
@@ -1858,8 +1856,7 @@ fn install_nu_version_from_github_release(
         })
         .ok_or_else(|| {
             crate::error::QuiverError::Other(format!(
-                "could not find Nushell release asset '{}' for version {}",
-                asset_name, version
+                "could not find Nushell release asset '{asset_name}' for version {version}"
             ))
         })?;
     let asset = selected_release
@@ -1898,8 +1895,7 @@ fn install_nu_version_from_github_release(
     ) {
         let _ = std::fs::remove_dir_all(&temp_root);
         return Err(crate::error::QuiverError::Other(format!(
-            "failed to download Nushell {} release artifact '{}' from GitHub: {}",
-            version, asset_name, err
+            "failed to download Nushell {version} release artifact '{asset_name}' from GitHub: {err}"
         )));
     }
 
@@ -1919,8 +1915,7 @@ fn install_nu_version_from_github_release(
             return Err(err);
         }
         ui::warn(format!(
-            "SECURITY WARNING: Nushell release asset '{}' could not be verified ({err}); continuing because --allow-unsigned/config override is active",
-            asset_name
+            "SECURITY WARNING: Nushell release asset '{asset_name}' could not be verified ({err}); continuing because --allow-unsigned/config override is active"
         ));
     }
 
@@ -1930,8 +1925,7 @@ fn install_nu_version_from_github_release(
 
     let extracted_binary = find_extracted_nu_binary(&extract_dir).ok_or_else(|| {
         crate::error::QuiverError::Other(format!(
-            "downloaded Nushell archive did not contain '{}'",
-            binary_name
+            "downloaded Nushell archive did not contain '{binary_name}'"
         ))
     })?;
 
@@ -2087,12 +2081,11 @@ fn extract_zip_archive(archive_path: &Path, extract_dir: &Path) -> Result<()> {
         })?;
         let raw_name = entry.name().to_string();
         let enclosed = entry.enclosed_name().ok_or_else(|| {
-            crate::error::QuiverError::Other(format!("archive contains unsafe path '{}'", raw_name))
+            crate::error::QuiverError::Other(format!("archive contains unsafe path '{raw_name}'"))
         })?;
         let Some(safe_relative) = safety::normalized_relative_path(&enclosed) else {
             return Err(crate::error::QuiverError::Other(format!(
-                "archive contains unsafe path '{}'",
-                raw_name
+                "archive contains unsafe path '{raw_name}'"
             )));
         };
 
@@ -2104,8 +2097,7 @@ fn extract_zip_archive(archive_path: &Path, extract_dir: &Path) -> Result<()> {
             && (mode & 0o170000) == 0o120000
         {
             return Err(crate::error::QuiverError::Other(format!(
-                "archive contains unsupported symlink entry '{}'",
-                raw_name
+                "archive contains unsupported symlink entry '{raw_name}'"
             )));
         }
 
@@ -2900,13 +2892,11 @@ fn ensure_cargo_available(plugin_name: &str) -> Result<()> {
     {
         Ok(status) if status.success() => Ok(()),
         Ok(_) => Err(crate::error::QuiverError::Other(format!(
-            "cargo is required for plugin '{}' source-build fallback, but `cargo --version` failed",
-            plugin_name
+            "cargo is required for plugin '{plugin_name}' source-build fallback, but `cargo --version` failed"
         ))),
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
             Err(crate::error::QuiverError::Other(format!(
-                "cargo is not installed or not on PATH; cannot source-build plugin '{}'",
-                plugin_name
+                "cargo is not installed or not on PATH; cannot source-build plugin '{plugin_name}'"
             )))
         }
         Err(err) => Err(err.into()),
@@ -2921,7 +2911,7 @@ fn prompt_for_cargo_fallback_approval(
     let _guard = INTERACTIVE_PROMPT_LOCK
         .lock()
         .expect("interactive prompt lock poisoned");
-    eprintln!("  Release install failed with: {}", release_error);
+    eprintln!("  Release install failed with: {release_error}");
 
     loop {
         eprint!(
@@ -3241,11 +3231,10 @@ fn select_plugin_release_asset(
         if release.draft || release.prerelease {
             continue;
         }
-        if let Some(tag) = preferred_tag {
-            if !release_tag_matches(&release.tag_name, tag) {
+        if let Some(tag) = preferred_tag
+            && !release_tag_matches(&release.tag_name, tag) {
                 continue;
             }
-        }
 
         let mut candidates: Vec<(i32, GitHubReleaseAsset)> = release
             .assets
@@ -3766,19 +3755,16 @@ fn select_module_subdir(module_root: &Path, dep_name: &str) -> Result<PathBuf> {
     let mut candidates = Vec::new();
     let mut seen = HashSet::new();
 
-    if let Some(entry_hint) = metadata.entry_hint.as_deref() {
-        if let Some(subdir) = module_subpath_from_hint(module_root, entry_hint) {
+    if let Some(entry_hint) = metadata.entry_hint.as_deref()
+        && let Some(subdir) = module_subpath_from_hint(module_root, entry_hint) {
             push_unique_path(&mut candidates, &mut seen, subdir);
         }
-    }
 
-    if let Some(package_name) = metadata.package_name.as_deref() {
-        if let Some(subdir) = safety::normalized_relative_path(Path::new(package_name)) {
-            if module_root.join(&subdir).join("mod.nu").is_file() {
+    if let Some(package_name) = metadata.package_name.as_deref()
+        && let Some(subdir) = safety::normalized_relative_path(Path::new(package_name))
+            && module_root.join(&subdir).join("mod.nu").is_file() {
                 push_unique_path(&mut candidates, &mut seen, subdir);
             }
-        }
-    }
 
     if module_root.join("mod.nu").is_file() {
         push_unique_path(&mut candidates, &mut seen, PathBuf::new());
@@ -3850,11 +3836,9 @@ fn extract_nuon_value(content: &str, keys: &[&str]) -> Option<String> {
                 if keys
                     .iter()
                     .any(|expected| key.eq_ignore_ascii_case(expected))
-                {
-                    if let Some(value) = parse_nuon_scalar(rhs) {
+                    && let Some(value) = parse_nuon_scalar(rhs) {
                         return Some(value);
                     }
-                }
             }
         }
     }

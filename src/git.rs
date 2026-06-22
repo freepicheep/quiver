@@ -74,8 +74,7 @@ fn ensure_origin_matches(repo: &Repository, expected_url: &str) -> Result<()> {
         return Ok(());
     }
     Err(QuiverError::Other(format!(
-        "cached repository origin mismatch: expected '{}', found '{}'. Remove cache directory and retry.",
-        expected_url, actual
+        "cached repository origin mismatch: expected '{expected_url}', found '{actual}'. Remove cache directory and retry."
     )))
 }
 
@@ -303,11 +302,10 @@ pub fn latest_tag(repo_path: &Path) -> Result<Option<String>> {
     let mut tags: Vec<String> = Vec::new();
 
     repo.tag_foreach(|_oid, name| {
-        if let Ok(name_str) = std::str::from_utf8(name) {
-            if let Some(tag_name) = name_str.strip_prefix("refs/tags/") {
+        if let Ok(name_str) = std::str::from_utf8(name)
+            && let Some(tag_name) = name_str.strip_prefix("refs/tags/") {
                 tags.push(tag_name.to_string());
             }
-        }
         true // continue iterating
     })?;
 

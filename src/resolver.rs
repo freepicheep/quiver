@@ -205,18 +205,15 @@ fn resolve_deps(
         git::export_to(&repo_path, &rev, &tmp)?;
 
         if let Ok(dep_manifest) = Manifest::from_dir(&tmp) {
-            if let Some(root_req) = root_nu_req {
-                if let Some(dep_nu_version) = dep_manifest.package.nu_version.as_deref() {
-                    if let Ok(dep_req) = nu::parse_nu_version_requirement(dep_nu_version) {
-                        if !nu::nu_version_reqs_compatible(root_req, &dep_req) {
+            if let Some(root_req) = root_nu_req
+                && let Some(dep_nu_version) = dep_manifest.package.nu_version.as_deref()
+                    && let Ok(dep_req) = nu::parse_nu_version_requirement(dep_nu_version)
+                        && !nu::nu_version_reqs_compatible(root_req, &dep_req) {
                             ui::warn(format!(
                                 "dependency '{name}' requires nu-version '{dep_nu_version}', \
                                  which may be incompatible with your package's nu-version requirement"
                             ));
                         }
-                    }
-                }
-            }
 
             if !dep_manifest.dependencies.modules.is_empty() {
                 ui::info(format!(
