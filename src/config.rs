@@ -325,11 +325,11 @@ pub fn installs_root_dir() -> Result<PathBuf> {
     {
         let home = dirs::home_dir()
             .ok_or_else(|| QuiverError::Config("could not determine home directory".to_string()))?;
-        return Ok(home
+        Ok(home
             .join(".local")
             .join("share")
             .join("quiver")
-            .join("installs"));
+            .join("installs"))
     }
 }
 

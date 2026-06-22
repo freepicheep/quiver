@@ -289,7 +289,7 @@ plugin use <name>
 
 Quiver verifies SHA-256 checksums for downloaded release artifacts (Nushell archives and plugin release assets) before extraction or install.
 
-- Default behavior is fail-closed: installs stop if checksum data is missing, unparseable, or mismatched.
+- Default behavior is fail-closed: installs stop if checksum data is missing, unparsable, or mismatched.
 - Quiver looks for checksum assets in the same release:
   - preferred: `SHA256SUMS` or `checksums.txt`
   - fallback: `<asset>.sha256`

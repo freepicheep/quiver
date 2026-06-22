@@ -179,7 +179,7 @@ impl PluginDependencySpec {
         let source = self.source.as_deref().unwrap_or("git");
         let mut parts = Vec::new();
         if self.source.is_some() {
-            parts.push(format!("source: {}", nuon_string(&source)));
+            parts.push(format!("source: {}", nuon_string(source)));
         }
         if source != "nu-core" {
             parts.push(format!("git: {}", nuon_string(&self.git)));

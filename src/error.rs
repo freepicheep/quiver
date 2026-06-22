@@ -28,7 +28,7 @@ pub enum QuiverError {
     Io(#[from] std::io::Error),
 
     #[error("nuon parse error: {0}")]
-    NuonParse(#[from] nu_protocol::ShellError),
+    NuonParse(Box<nu_protocol::ShellError>),
 
     #[error("checksum source not found for asset '{asset}': {details}")]
     ChecksumSourceNotFound { asset: String, details: String },
@@ -47,6 +47,12 @@ pub enum QuiverError {
 
     #[error("{0}")]
     Other(String),
+}
+
+impl From<nu_protocol::ShellError> for QuiverError {
+    fn from(value: nu_protocol::ShellError) -> Self {
+        Self::NuonParse(Box::new(value))
+    }
 }
 
 pub type Result<T> = std::result::Result<T, QuiverError>;

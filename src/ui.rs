@@ -64,7 +64,7 @@ pub fn is_capturing() -> bool {
 pub fn plain(message: impl AsRef<str>) {
     let message = message.as_ref();
     if !capture_line(LogKind::Info, message.to_string()) {
-        eprintln!("{}", message);
+        eprintln!("{message}");
     }
 }
 
